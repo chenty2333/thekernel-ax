@@ -1,7 +1,7 @@
 # Release process
 
 The packages have independent names and version histories even when they are
-released from one workspace. The first release checkpoint is `0.1.0` for both
+released from one workspace. The first release checkpoint is `0.1.0` for all three
 packages. User-visible changes for that checkpoint are recorded in
 [`releases/0.1.0.md`](releases/0.1.0.md).
 
@@ -21,8 +21,7 @@ Run with the repository's pinned MSRV and again with stable:
 ```sh
 cargo fmt --all -- --check
 python3 scripts/check_registry_dependencies.py
-cargo test --workspace --all-targets --locked
-cargo clippy --workspace --all-targets --locked -- -D warnings
+scripts/ci.sh
 scripts/package-unpack.sh
 ```
 
@@ -31,6 +30,7 @@ Inspect the contents explicitly:
 ```sh
 cargo package --locked --list -p thekernel-axsched
 cargo package --locked --list -p thekernel-axpoll
+cargo +nightly-2025-05-20 package --locked --list -p thekernel-axtask
 ```
 
 The unpack test is a release gate: it proves dependencies resolve from the
@@ -40,12 +40,14 @@ TheKernel's `[patch.crates-io]` environment.
 ## Publish
 
 1. Run `cargo publish --locked --dry-run -p <package>`.
-2. Publish only after the dry run and CI pass for the exact release commit.
-3. Create a package-specific tag such as `thekernel-axsched-v0.1.0` or
-   `thekernel-axpoll-v0.1.0`.
-4. Attach release notes that summarize the maintained delta and any public API
+2. Publish `thekernel-axsched` and `thekernel-axpoll` before the dependent
+   `thekernel-axtask`, all from the same verified commit.
+3. Publish only after the dry run and CI pass for the exact release commit.
+4. Create an exact-commit repository tag `v0.1.0`; its release record lists all
+   three package checksums.
+5. Attach release notes that summarize the maintained delta and any public API
    migration.
-5. Verify the registry checksum and docs.rs build after publication.
+6. Verify the registry checksum and docs.rs build after publication.
 
 Publishing and pushing tags are deliberate maintainer actions; local release
 preparation does not imply authorization to perform either action.

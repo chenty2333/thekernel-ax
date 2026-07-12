@@ -171,8 +171,12 @@ impl<T> BaseScheduler for FifoScheduler<T> {
         false
     }
 
-    fn set_priority(&mut self, _task: &Self::SchedItem, _prio: isize) -> bool {
-        false
+    fn set_priority(
+        &mut self,
+        _task: &Self::SchedItem,
+        _prio: isize,
+    ) -> Result<(), SchedulerError> {
+        Err(SchedulerError::UnsupportedOperation)
     }
 }
 

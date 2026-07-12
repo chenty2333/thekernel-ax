@@ -72,7 +72,10 @@ ignoring a foreign link.
 configuration claim so an enqueue cannot race the parameter transaction. A
 ready task is updated with `CFScheduler::set_task_params`, which removes,
 reconfigures, and reinserts it under the scheduler's exclusive borrow without
-mutating an intrusive-tree key in place.
+mutating an intrusive-tree key in place. Configuration, fair-child vruntime
+seeding, and runtime priority updates return `SchedulerError`; unsupported
+schedulers, invalid values, incompatible classes, busy tasks, and foreign
+queues are therefore distinguishable.
 
 Round-robin counters use saturating unsigned arithmetic. A zero const time
 slice is representable but every enqueue rejects it with

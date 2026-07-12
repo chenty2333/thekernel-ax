@@ -1,37 +1,88 @@
 name: CI
 
 on:
-  push:
   pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  verify:
-    name: Rust ${{ matrix.toolchain }}
+  governance:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        toolchain: [stable, 1.85.0]
-
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust toolchain
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2025-05-20
+          components: rustfmt
+      - name: Formatting, registry graph, and provenance
         run: |
-          rustup toolchain install "${{ matrix.toolchain }}" \
-            --profile minimal \
-            --component clippy \
-            --component rustfmt
-          rustup override set "${{ matrix.toolchain }}"
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-      - name: Check registry-only dependency graph
-        run: python3 scripts/check_registry_dependencies.py
-      - name: Test workspace
-        run: cargo test --workspace --all-targets --locked
-      - name: Lint workspace
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Test unpacked package artifacts
+          cargo +nightly-2025-05-20 fmt --all -- --check
+          python3 scripts/check_registry_dependencies.py
+          scripts/check-provenance.sh
+
+  axsched-msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2025-05-20
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.76.0
+          components: clippy
+          targets: riscv64gc-unknown-none-elf,loongarch64-unknown-none
+      - uses: Swatinem/rust-cache@v2
+      - name: Test unpacked axsched artifact at MSRV
+        run: scripts/test-axsched-msrv.sh
+
+  axpoll-msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.85.0
+          components: clippy
+          targets: riscv64gc-unknown-none-elf,loongarch64-unknown-none
+      - uses: Swatinem/rust-cache@v2
+      - name: Test, lint, document, and cross-check axpoll
+        run: |
+          cargo +1.85.0 test -p thekernel-axpoll --all-targets --locked
+          cargo +1.85.0 clippy -p thekernel-axpoll --all-targets --locked -- -D warnings
+          RUSTDOCFLAGS='-D warnings' cargo +1.85.0 doc -p thekernel-axpoll --no-deps --locked
+          cargo +1.85.0 check -p thekernel-axpoll --locked --target riscv64gc-unknown-none-elf
+          cargo +1.85.0 check -p thekernel-axpoll --locked --target loongarch64-unknown-none
+
+  axtask-nightly:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2025-05-20
+          components: clippy,rustfmt
+          targets: riscv64gc-unknown-none-elf,loongarch64-unknown-none
+      - uses: Swatinem/rust-cache@v2
+      - name: Test axtask feature and architecture matrix
+        run: |
+          features='multitask irq preempt smp sched-cfs task-ext'
+          test_features='test multitask irq preempt smp sched-cfs'
+          cargo +nightly-2025-05-20 check -p thekernel-axtask --no-default-features --locked
+          cargo +nightly-2025-05-20 test -p thekernel-axtask --all-targets --locked --features "$test_features"
+          cargo +nightly-2025-05-20 clippy -p thekernel-axtask --all-targets --locked --features "$test_features" -- -D warnings
+          RUSTDOCFLAGS='-D warnings' cargo +nightly-2025-05-20 doc -p thekernel-axtask --no-deps --locked --features "$features"
+          for scheduler in sched-fifo sched-rr sched-cfs; do
+            cargo +nightly-2025-05-20 check -p thekernel-axtask --locked --features "multitask irq preempt smp task-ext $scheduler"
+          done
+          for target in riscv64gc-unknown-none-elf loongarch64-unknown-none; do
+            cargo +nightly-2025-05-20 check -p thekernel-axtask --locked --target "$target" --features "$features"
+          done
+      - name: Test unpacked release artifacts
+        env:
+          CARGO_TOOLCHAIN: nightly-2025-05-20
         run: scripts/package-unpack.sh

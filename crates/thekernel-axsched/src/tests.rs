@@ -105,6 +105,85 @@ def_test_sched!(fifo, FifoScheduler::<usize>, FifoTask::<usize>);
 def_test_sched!(rr, RRScheduler::<usize, 5>, RRTask::<usize, 5>);
 def_test_sched!(cfs, CFScheduler::<usize>, CFSTask::<usize>);
 
+mod typed_runtime_updates {
+    use alloc::sync::Arc;
+
+    use crate::*;
+
+    #[test]
+    fn unsupported_and_invalid_priority_updates_are_distinct() {
+        let fifo_task = Arc::new(FifoTask::new(1));
+        assert_eq!(
+            FifoScheduler::new().set_priority(&fifo_task, 0),
+            Err(SchedulerError::UnsupportedOperation)
+        );
+
+        let rr_task = Arc::new(RRTask::<_, 5>::new(1));
+        assert_eq!(
+            RRScheduler::<_, 5>::new().set_priority(&rr_task, 0),
+            Err(SchedulerError::UnsupportedOperation)
+        );
+
+        let task = Arc::new(CFSTask::new(1));
+        let mut cfs = CFScheduler::new();
+        assert_eq!(
+            cfs.set_priority(&task, 20),
+            Err(SchedulerError::InvalidParameters)
+        );
+        cfs.set_priority(&task, 5).unwrap();
+        assert_eq!(task.sched_params().nice, 5);
+    }
+
+    #[test]
+    fn priority_update_preserves_foreign_owner_and_class_errors() {
+        let task = Arc::new(CFSTask::new(1));
+        let mut owner = CFScheduler::new();
+        let mut other = CFScheduler::new();
+        owner.add_task(task.clone()).unwrap();
+        assert_eq!(
+            other.set_priority(&task, 1),
+            Err(SchedulerError::ForeignQueue)
+        );
+
+        let rt = Arc::new(CFSTask::new(2));
+        rt.configure(CfsTaskParams {
+            class: CfsTaskClass::Fifo,
+            rt_priority: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            other.set_priority(&rt, 1),
+            Err(SchedulerError::IncompatibleClass)
+        );
+    }
+
+    #[test]
+    fn fair_vruntime_inheritance_reports_class_and_queue_ownership() {
+        let parent = Arc::new(CFSTask::new(1));
+        parent
+            .configure(CfsTaskParams {
+                class: CfsTaskClass::Fifo,
+                rt_priority: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        let child = Arc::new(CFSTask::new(2));
+        assert_eq!(
+            child.inherit_fair_vruntime_from(&parent),
+            Err(SchedulerError::IncompatibleClass)
+        );
+
+        let fair_parent = Arc::new(CFSTask::new(3));
+        let mut scheduler = CFScheduler::new();
+        scheduler.add_task(child.clone()).unwrap();
+        assert_eq!(
+            child.inherit_fair_vruntime_from(&fair_parent),
+            Err(SchedulerError::AlreadyQueued)
+        );
+    }
+}
+
 mod cfs_rt {
     use alloc::sync::Arc;
 
@@ -115,11 +194,12 @@ mod cfs_rt {
         let mut scheduler = CFScheduler::<usize>::new();
         let fair = Arc::new(CFSTask::new(1));
         let rt = Arc::new(CFSTask::new(2));
-        assert!(rt.configure(CfsTaskParams {
+        rt.configure(CfsTaskParams {
             class: CfsTaskClass::Fifo,
             nice: 0,
             rt_priority: 10,
-        }));
+        })
+        .unwrap();
         scheduler.add_task(fair.clone()).unwrap();
         scheduler.add_task(rt.clone()).unwrap();
 
@@ -136,11 +216,12 @@ mod cfs_rt {
         let mut scheduler = CFScheduler::<usize>::new();
         let fair = Arc::new(CFSTask::new(1));
         let rt = Arc::new(CFSTask::new(2));
-        assert!(rt.configure(CfsTaskParams {
+        rt.configure(CfsTaskParams {
             class: CfsTaskClass::Fifo,
             nice: 0,
             rt_priority: 50,
-        }));
+        })
+        .unwrap();
 
         scheduler.add_task(fair.clone()).unwrap();
         let running = scheduler.pick_next_task().unwrap();
@@ -155,16 +236,18 @@ mod cfs_rt {
         let mut scheduler = CFScheduler::<usize>::new();
         let low = Arc::new(CFSTask::new(1));
         let high = Arc::new(CFSTask::new(2));
-        assert!(low.configure(CfsTaskParams {
+        low.configure(CfsTaskParams {
             class: CfsTaskClass::Fifo,
             nice: 0,
             rt_priority: 10,
-        }));
-        assert!(high.configure(CfsTaskParams {
+        })
+        .unwrap();
+        high.configure(CfsTaskParams {
             class: CfsTaskClass::Fifo,
             nice: 0,
             rt_priority: 20,
-        }));
+        })
+        .unwrap();
         scheduler.add_task(low).unwrap();
         scheduler.add_task(high).unwrap();
 
@@ -178,11 +261,12 @@ mod cfs_rt {
         let a = Arc::new(CFSTask::new(1));
         let b = Arc::new(CFSTask::new(2));
         for task in [&a, &b] {
-            assert!(task.configure(CfsTaskParams {
+            task.configure(CfsTaskParams {
                 class: CfsTaskClass::RoundRobin,
                 nice: 0,
                 rt_priority: 42,
-            }));
+            })
+            .unwrap();
             scheduler.add_task(task.clone()).unwrap();
         }
 
@@ -203,11 +287,12 @@ mod cfs_rt {
         let a = Arc::new(CFSTask::new(1));
         let b = Arc::new(CFSTask::new(2));
         for task in [&a, &b] {
-            assert!(task.configure(CfsTaskParams {
+            task.configure(CfsTaskParams {
                 class: CfsTaskClass::RoundRobin,
                 nice: 0,
                 rt_priority: 42,
-            }));
+            })
+            .unwrap();
             scheduler.add_task(task.clone()).unwrap();
         }
 
@@ -232,11 +317,12 @@ mod cfs_rt {
         let a = Arc::new(CFSTask::new(1));
         let b = Arc::new(CFSTask::new(2));
         for task in [&a, &b] {
-            assert!(task.configure(CfsTaskParams {
+            task.configure(CfsTaskParams {
                 class: CfsTaskClass::Fifo,
                 nice: 0,
                 rt_priority: 200,
-            }));
+            })
+            .unwrap();
             scheduler.add_task(task.clone()).unwrap();
         }
 
@@ -263,11 +349,12 @@ mod cfs_rt {
         let mut scheduler = CFScheduler::<usize>::new();
         let fair = Arc::new(CFSTask::new(1));
         let rt = Arc::new(CFSTask::new(2));
-        assert!(rt.configure(CfsTaskParams {
+        rt.configure(CfsTaskParams {
             class: CfsTaskClass::Fifo,
             nice: 0,
             rt_priority: 200,
-        }));
+        })
+        .unwrap();
         scheduler.add_task(fair).unwrap();
         scheduler.add_task(rt).unwrap();
 
@@ -296,11 +383,12 @@ mod cfs_rt {
         let rt_a = Arc::new(CFSTask::new(2));
         let rt_b = Arc::new(CFSTask::new(3));
         for task in [&rt_a, &rt_b] {
-            assert!(task.configure(CfsTaskParams {
+            task.configure(CfsTaskParams {
                 class: CfsTaskClass::Fifo,
                 nice: 0,
                 rt_priority: 200,
-            }));
+            })
+            .unwrap();
             scheduler.add_task(task.clone()).unwrap();
         }
         scheduler.add_task(fair).unwrap();
@@ -326,11 +414,12 @@ mod cfs_rt {
         let mut scheduler = CFScheduler::<usize>::new();
         let fair = Arc::new(CFSTask::new(1));
         let rt = Arc::new(CFSTask::new(2));
-        assert!(rt.configure(CfsTaskParams {
+        rt.configure(CfsTaskParams {
             class: CfsTaskClass::Fifo,
             nice: 0,
             rt_priority: 200,
-        }));
+        })
+        .unwrap();
         scheduler.add_task(rt).unwrap();
 
         assert!(
@@ -349,16 +438,20 @@ mod cfs_rt {
         let maximum = Arc::new(CFSTask::new(1));
         let lower = Arc::new(CFSTask::new(2));
 
-        assert!(maximum.configure(CfsTaskParams {
-            class: CfsTaskClass::Fifo,
-            nice: 0,
-            rt_priority: u8::MAX,
-        }));
-        assert!(lower.configure(CfsTaskParams {
-            class: CfsTaskClass::Fifo,
-            nice: 0,
-            rt_priority: u8::MAX - 1,
-        }));
+        maximum
+            .configure(CfsTaskParams {
+                class: CfsTaskClass::Fifo,
+                nice: 0,
+                rt_priority: u8::MAX,
+            })
+            .unwrap();
+        lower
+            .configure(CfsTaskParams {
+                class: CfsTaskClass::Fifo,
+                nice: 0,
+                rt_priority: u8::MAX - 1,
+            })
+            .unwrap();
         scheduler.add_task(lower).unwrap();
         scheduler.add_task(maximum).unwrap();
 
@@ -374,14 +467,17 @@ mod cfs_rt {
             nice: 0,
             rt_priority: 42,
         };
-        assert!(task.configure(original));
+        task.configure(original).unwrap();
         scheduler.add_task(task.clone()).unwrap();
 
-        assert!(!task.configure(CfsTaskParams {
-            class: CfsTaskClass::RoundRobin,
-            nice: 0,
-            rt_priority: 0,
-        }));
+        assert_eq!(
+            task.configure(CfsTaskParams {
+                class: CfsTaskClass::RoundRobin,
+                nice: 0,
+                rt_priority: 0,
+            }),
+            Err(SchedulerError::InvalidParameters)
+        );
         assert_eq!(task.sched_params(), original);
 
         let selected = scheduler.pick_next_task().unwrap();
@@ -409,7 +505,7 @@ mod cfs_child_spawn {
         }
 
         let child = Arc::new(CFSTask::new(2));
-        assert!(child.inherit_fair_vruntime_from(&running));
+        child.inherit_fair_vruntime_from(&running).unwrap();
         scheduler.add_task(child).unwrap();
 
         assert!(
@@ -428,7 +524,7 @@ mod cfs_child_spawn {
         assert_eq!(*running.inner(), 1);
 
         let child = Arc::new(CFSTask::new(2));
-        assert!(child.inherit_fair_vruntime_from(&running));
+        child.inherit_fair_vruntime_from(&running).unwrap();
         scheduler.add_task(child).unwrap();
 
         scheduler
@@ -506,11 +602,14 @@ mod cfs_intrusive_membership {
         // This direct low-level mutation is deliberately stronger than the
         // axtask API, which removes a ready task before reconfiguration. It
         // must not mutate a key already embedded in the intrusive tree.
-        assert!(!task.configure(CfsTaskParams {
-            class: CfsTaskClass::Fifo,
-            rt_priority: 200,
-            ..Default::default()
-        }));
+        assert_eq!(
+            task.configure(CfsTaskParams {
+                class: CfsTaskClass::Fifo,
+                rt_priority: 200,
+                ..Default::default()
+            }),
+            Err(SchedulerError::AlreadyQueued)
+        );
         scheduler
             .set_task_params(
                 &task,

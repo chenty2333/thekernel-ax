@@ -37,8 +37,9 @@ is the tested diff from the verified registry archive.
   ranges themselves.
 - Make foreign-scheduler removal safe for FIFO and round-robin queues rather
   than exposing an unchecked linked-list removal through a safe trait method.
-- Make every enqueue/remove/requeue operation return typed ownership,
-  identifier, sequence, parameter, and configuration failures.
+- Make every enqueue/remove/requeue, task configuration, fair-child seed, and
+  priority update return typed unsupported, ownership, class, identifier,
+  sequence, parameter, and configuration failures.
 - Add an atomic per-task queue owner to FIFO, RR, and CFS, reject duplicate or
   foreign publication, and release every surviving owner when a scheduler is
   dropped.

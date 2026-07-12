@@ -31,9 +31,11 @@ fn allocate_scheduler_id() -> Result<usize, SchedulerError> {
         .map_err(|_| SchedulerError::IdentifierExhausted)
 }
 
-/// Failure returned by a scheduler queue operation.
+/// Failure returned by a scheduler mechanism operation.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum SchedulerError {
+    /// The selected scheduler does not implement this operation.
+    UnsupportedOperation,
     /// The task is already queued in this scheduler.
     AlreadyQueued,
     /// The task is currently owned by another scheduler instance.
@@ -46,6 +48,8 @@ pub enum SchedulerError {
     TaskBusy,
     /// Scheduling parameters were outside the mechanism's accepted domain.
     InvalidParameters,
+    /// The requested operation is not defined for this scheduling class.
+    IncompatibleClass,
     /// A round-robin scheduler was instantiated with a zero tick budget.
     InvalidTimeSlice,
     /// Private queue membership metadata disagreed with the queue contents.
@@ -130,7 +134,7 @@ pub trait BaseScheduler {
 
     /// Sets the scheduler-specific priority of a task.
     ///
-    /// Returns `false` when this scheduler does not support runtime priority
-    /// changes or the value is outside its generic mechanism range.
-    fn set_priority(&mut self, task: &Self::SchedItem, prio: isize) -> bool;
+    /// Returns a typed error when runtime updates are unsupported, the value is
+    /// invalid, or the task cannot participate in the scheduler transaction.
+    fn set_priority(&mut self, task: &Self::SchedItem, prio: isize) -> Result<(), SchedulerError>;
 }

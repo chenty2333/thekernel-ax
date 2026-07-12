@@ -1,59 +1,218 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PACKAGES=(thekernel-axsched thekernel-axpoll)
-TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+toolchain=${CARGO_TOOLCHAIN:-nightly-2025-05-20}
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+run_cargo() {
+    cargo "+$toolchain" "$@"
+}
 
 allow_dirty=()
-if ! git -C "$ROOT" diff --quiet \
-    || ! git -C "$ROOT" diff --cached --quiet \
-    || [[ -n "$(git -C "$ROOT" ls-files --others --exclude-standard)" ]]; then
+if ! git -C "$root" diff --quiet \
+    || ! git -C "$root" diff --cached --quiet \
+    || [[ -n "$(git -C "$root" ls-files --others --exclude-standard)" ]]; then
+    if [[ "${PACKAGE_ALLOW_DIRTY:-0}" != 1 ]]; then
+        printf 'package-unpack requires a clean release worktree; set PACKAGE_ALLOW_DIRTY=1 only for development checks\n' >&2
+        exit 1
+    fi
     allow_dirty=(--allow-dirty)
 fi
 
-export CARGO_TARGET_DIR="$TMP/package-target"
+export CARGO_TARGET_DIR="$tmp/package-target"
 
-for package in "${PACKAGES[@]}"; do
-    cargo package \
-        --manifest-path "$ROOT/Cargo.toml" \
-        --locked \
-        -p "$package" \
-        "${allow_dirty[@]}"
+# axtask depends on the two sibling 0.1.0 packages, which intentionally do not
+# exist in the registry before the atomic first release. Nightly's workspace
+# packager assembles the exact release set; unpacked tests below replace its
+# staging verifier and patch only to those freshly produced artifacts.
+run_cargo -Z package-workspace package \
+    --locked \
+    --no-verify \
+    -p thekernel-axsched \
+    -p thekernel-axpoll \
+    -p thekernel-axtask \
+    "${allow_dirty[@]}"
 
-    archive="$(find "$CARGO_TARGET_DIR/package" -maxdepth 1 -type f \
-        -name "${package}-*.crate" -print -quit)"
-    if [[ -z "$archive" ]]; then
-        echo "package archive not found for $package" >&2
+packages=(thekernel-axsched thekernel-axpoll thekernel-axtask)
+for package in "${packages[@]}"; do
+    archive="$CARGO_TARGET_DIR/package/$package-0.1.0.crate"
+    [[ -f "$archive" ]] || {
+        printf 'package archive not found: %s\n' "$archive" >&2
         exit 1
-    fi
+    }
 
-    unpack="$TMP/unpacked/$package"
+    unpack="$tmp/unpacked/$package"
     mkdir -p "$unpack"
     tar -xzf "$archive" -C "$unpack"
-    crate_dir="$(find "$unpack" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+    crate_dir="$unpack/$package-0.1.0"
 
-    archived_manifest="$ROOT/crates/$package/Cargo.toml.orig"
-    if [[ -f "$crate_dir/Cargo.toml.orig" ]] \
-        && cmp -s "$crate_dir/Cargo.toml.orig" "$archived_manifest"; then
-        echo "preserved upstream Cargo.toml.orig leaked into $package archive" >&2
+    for required in \
+        Cargo.toml Cargo.toml.orig CHANGELOG.md PATCHES.md README.md VENDOR.md \
+        LICENSES/Apache-2.0.txt LICENSES/GPL-3.0-or-later.txt \
+        LICENSES/MulanPSL-2.0.txt; do
+        [[ -f "$crate_dir/$required" ]] || {
+            printf '%s packaged file missing: %s\n' "$package" "$required" >&2
+            exit 1
+        }
+    done
+
+    preserved="$root/crates/$package"
+    if cmp -s "$crate_dir/Cargo.toml.orig" "$preserved/Cargo.toml.orig"; then
+        printf 'preserved upstream Cargo.toml.orig leaked into %s archive\n' \
+            "$package" >&2
         exit 1
     fi
-
-    archived_vcs="$ROOT/crates/$package/.cargo_vcs_info.json"
     if [[ -f "$crate_dir/.cargo_vcs_info.json" ]] \
-        && cmp -s "$crate_dir/.cargo_vcs_info.json" "$archived_vcs"; then
-        echo "preserved upstream .cargo_vcs_info.json leaked into $package archive" >&2
+        && cmp -s "$crate_dir/.cargo_vcs_info.json" "$preserved/.cargo_vcs_info.json"; then
+        printf 'preserved upstream VCS record leaked into %s archive\n' \
+            "$package" >&2
         exit 1
     fi
+    grep -Fq "name = \"$package\"" "$crate_dir/Cargo.toml"
+    grep -Fq 'version = "0.1.0"' "$crate_dir/Cargo.toml"
+    grep -Fq 'repository = "https://github.com/chenty2333/thekernel-ax"' \
+        "$crate_dir/Cargo.toml"
+    python3 - "$crate_dir/Cargo.toml" "$package" <<'PY'
+import pathlib
+import sys
+import tomllib
 
-    CARGO_TARGET_DIR="$TMP/test-target/$package" \
-        cargo test \
-        --manifest-path "$crate_dir/Cargo.toml" \
-        --all-targets \
-        --locked
+manifest = tomllib.loads(pathlib.Path(sys.argv[1]).read_text())
+package = sys.argv[2]
+tables = []
+for name in ("dependencies", "dev-dependencies", "build-dependencies"):
+    tables.append(manifest.get(name, {}))
+for target in manifest.get("target", {}).values():
+    for name in ("dependencies", "dev-dependencies", "build-dependencies"):
+        tables.append(target.get(name, {}))
+for table in tables:
+    for dependency, specification in table.items():
+        if isinstance(specification, dict) and "path" in specification:
+            raise SystemExit(
+                f"{package}: packaged dependency {dependency!r} retained path "
+                f"{specification['path']!r}"
+            )
+PY
 done
 
-echo "package unpack tests passed for ${#PACKAGES[@]} packages"
+axsched="$tmp/unpacked/thekernel-axsched/thekernel-axsched-0.1.0"
+axpoll="$tmp/unpacked/thekernel-axpoll/thekernel-axpoll-0.1.0"
+axtask="$tmp/unpacked/thekernel-axtask/thekernel-axtask-0.1.0"
 
+# `cargo -Z package-workspace` writes the two not-yet-published sibling crates
+# into axtask's release lock as crates.io packages whose checksums are the exact
+# archives produced by this invocation. Verify that byte identity before using
+# local artifacts for the pre-publication compile.
+for sibling in thekernel-axsched thekernel-axpoll; do
+    archive="$CARGO_TARGET_DIR/package/$sibling-0.1.0.crate"
+    python3 - "$axtask/Cargo.lock" "$sibling" "$archive" <<'PY'
+import hashlib
+import pathlib
+import sys
+import tomllib
+
+lock_path = pathlib.Path(sys.argv[1])
+package_name = sys.argv[2]
+archive_path = pathlib.Path(sys.argv[3])
+lock = tomllib.loads(lock_path.read_text())
+matches = [
+    package
+    for package in lock.get("package", [])
+    if package.get("name") == package_name and package.get("version") == "0.1.0"
+]
+if len(matches) != 1:
+    raise SystemExit(
+        f"{lock_path}: expected one locked {package_name} 0.1.0, found {len(matches)}"
+    )
+package = matches[0]
+expected_source = "registry+https://github.com/rust-lang/crates.io-index"
+if package.get("source") != expected_source:
+    raise SystemExit(
+        f"{package_name}: release lock source is {package.get('source')!r}, "
+        f"expected {expected_source!r}"
+    )
+archive_checksum = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+if package.get("checksum") != archive_checksum:
+    raise SystemExit(
+        f"{package_name}: release lock checksum {package.get('checksum')!r} "
+        f"does not match archive {archive_checksum}"
+    )
+PY
+done
+
+CARGO_TARGET_DIR="$tmp/test-target/axsched" \
+    run_cargo test --manifest-path "$axsched/Cargo.toml" --all-targets --locked
+CARGO_TARGET_DIR="$tmp/test-target/axpoll" \
+    run_cargo test --manifest-path "$axpoll/Cargo.toml" --all-targets --locked
+
+patches=(
+    --config "patch.crates-io.thekernel-axsched.path=\"$axsched\""
+    --config "patch.crates-io.thekernel-axpoll.path=\"$axpoll\""
+)
+
+# crates.io cannot serve the sibling 0.1.0 packages before their first atomic
+# publication. Create a pre-publication test lock in this temporary unpacked
+# directory, replacing only those two checksum-verified archives with their
+# exact extracted paths. Every compile below remains `--locked`.
+package_lock="$tmp/axtask-package.lock"
+cp "$axtask/Cargo.lock" "$package_lock"
+run_cargo update \
+    --manifest-path "$axtask/Cargo.toml" \
+    --offline \
+    -p thekernel-axsched \
+    -p thekernel-axpoll \
+    "${patches[@]}"
+
+python3 - "$package_lock" "$axtask/Cargo.lock" <<'PY'
+import pathlib
+import sys
+import tomllib
+
+targets = {("thekernel-axsched", "0.1.0"), ("thekernel-axpoll", "0.1.0")}
+
+def normalized(path: str):
+    data = tomllib.loads(pathlib.Path(path).read_text())
+    lock_version = data.pop("version", None)
+    found = set()
+    for package in data.get("package", []):
+        identity = (package.get("name"), package.get("version"))
+        if identity in targets:
+            found.add(identity)
+            package.pop("source", None)
+            package.pop("checksum", None)
+    if found != targets:
+        raise SystemExit(f"{path}: missing expected sibling lock entries: {targets - found}")
+    return lock_version, data
+
+before_version, before = normalized(sys.argv[1])
+after_version, after = normalized(sys.argv[2])
+if before_version != after_version and (before_version, after_version) != (3, 4):
+    raise SystemExit(
+        f"unexpected pre-publication lock format change: {before_version} -> {after_version}"
+    )
+if before != after:
+    raise SystemExit(
+        "pre-publication artifact patch changed lock data beyond sibling source/checksum"
+    )
+PY
+
+CARGO_TARGET_DIR="$tmp/test-target/axtask" \
+    run_cargo test \
+        --manifest-path "$axtask/Cargo.toml" \
+        --all-targets \
+        --locked \
+        --offline \
+        --features "test multitask irq preempt smp sched-cfs" \
+        "${patches[@]}"
+CARGO_TARGET_DIR="$tmp/test-target/axtask-minimal" \
+    run_cargo check \
+        --manifest-path "$axtask/Cargo.toml" \
+        --no-default-features \
+        --lib \
+        --locked \
+        --offline \
+        "${patches[@]}"
+
+printf 'package-unpack: PASS (%s packages)\n' "${#packages[@]}"

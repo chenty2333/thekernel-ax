@@ -1,0 +1,83 @@
+[package]
+name = "thekernel-axtask"
+version = "0.1.0"
+edition = "2024"
+authors = ["Yuekai Jia <equation618@gmail.com>"]
+description = "Maintained bounded task, run-queue, wait, and timer mechanisms for no_std kernels"
+license = "GPL-3.0-or-later OR Apache-2.0 OR MulanPSL-2.0"
+homepage = "https://github.com/chenty2333/thekernel-ax"
+repository = "https://github.com/chenty2333/thekernel-ax"
+documentation = "https://docs.rs/thekernel-axtask"
+readme = "README.md"
+exclude = ["Cargo.toml.orig", ".cargo_vcs_info.json", "README.upstream.md"]
+
+[lib]
+name = "axtask"
+path = "src/lib.rs"
+
+[features]
+default = []
+multitask = [
+    "dep:axconfig",
+    "dep:axpoll",
+    "dep:axsched",
+    "dep:cpumask",
+    "dep:crate_interface",
+    "dep:event-listener",
+    "dep:futures-util",
+    "dep:kernel_guard",
+    "dep:kspin",
+    "dep:lazyinit",
+    "dep:memory_addr",
+    "dep:percpu",
+    "dep:spin",
+]
+task-ext = ["dep:extern-trait"]
+irq = ["axhal/irq"]
+tls = ["axhal/tls"]
+preempt = ["irq", "percpu?/preempt", "kernel_guard/preempt"]
+smp = ["kspin/smp"]
+sched-fifo = ["multitask"]
+sched-rr = ["multitask", "preempt"]
+sched-cfs = ["multitask", "preempt"]
+test = ["percpu?/sp-naive"]
+
+[dependencies]
+axconfig = { version = "=0.3.0-preview.2", optional = true }
+axerrno = "0.2"
+axhal = "=0.3.0-preview.2"
+axpoll = { package = "thekernel-axpoll", path = "../thekernel-axpoll", version = "0.1.0", optional = true }
+axsched = { package = "thekernel-axsched", path = "../thekernel-axsched", version = "0.1.0", optional = true }
+cfg-if = "1.0"
+cpumask = { version = "0.1", optional = true }
+crate_interface = { version = "0.1", optional = true }
+event-listener = { version = "5.4.0", default-features = false, optional = true }
+extern-trait = { version = "0.4", optional = true }
+futures-util = { version = "0.3", default-features = false, optional = true, features = [
+    "alloc",
+    "async-await-macro",
+] }
+kernel_guard = { version = "0.1", optional = true }
+kspin = { version = "0.1", features = ["smp"], optional = true }
+lazyinit = { version = "0.2", optional = true }
+log = "0.4"
+memory_addr = { version = "0.4", optional = true }
+percpu = { version = "0.2.3-preview.1", features = ["non-zero-vma"], optional = true }
+spin = { version = "0.10", optional = true }
+
+[dev-dependencies]
+axhal = { version = "=0.3.0-preview.2", features = ["fp-simd"] }
+
+# axhal accepts the 0.15 line, but 0.15.5 implements a newer nightly `Step`
+# contract than the release toolchain. Pin the compatible source explicitly so
+# fresh and unpacked resolution cannot drift.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+x86_64 = { version = "=0.15.4", default-features = false }
+
+[package.metadata.docs.rs]
+features = ["multitask", "sched-fifo", "task-ext"]
+default-target = "x86_64-unknown-none"
+
+[package.metadata.thekernel]
+toolchain = "nightly-2025-05-20"
+nightly-features = ["allocator_api", "doc_cfg", "linkage"]

@@ -1,17 +1,18 @@
 # thekernel-ax
 
 `thekernel-ax` is the independent home of reusable operating-system mechanism
-crates maintained by TheKernel. The repository starts with two crates:
+crates maintained by TheKernel. The 0.1.0 line contains three crates:
 
 | Package | Rust crate name | Purpose |
 | --- | --- | --- |
 | `thekernel-axsched` | `axsched` | FIFO, round-robin, fair, and real-time scheduling mechanisms |
 | `thekernel-axpoll` | `axpoll` | bounded I/O readiness registration and wakeup primitives |
+| `thekernel-axtask` | `axtask` | bounded task, run-queue, wait, timer, and IRQ-wake mechanisms |
 
 The package names are new so releases cannot be confused with the upstream
-`axsched` and `axpoll` packages. The Rust library names stay unchanged, which
-lets downstream code continue to write `use axsched::...` and
-`use axpoll::...` after changing only its dependency declaration.
+`axsched`, `axpoll`, and `axtask` packages. The Rust library names stay
+unchanged, which lets downstream code continue to use the established crate
+paths after changing only its dependency declaration.
 
 ## Scope
 
@@ -31,8 +32,10 @@ The workspace is intentionally self-contained and has no root
 `[patch.crates-io]` table.
 
 ```sh
-cargo test --workspace --all-targets --locked
-cargo clippy --workspace --all-targets --locked -- -D warnings
+scripts/test-axsched-msrv.sh
+cargo +1.85.0 test -p thekernel-axpoll --all-targets --locked
+cargo +nightly-2025-05-20 test -p thekernel-axtask --all-targets --locked \
+  --features "multitask irq preempt smp sched-cfs task-ext"
 python3 scripts/check_registry_dependencies.py
 scripts/package-unpack.sh
 ```

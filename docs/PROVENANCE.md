@@ -12,6 +12,8 @@ The initial standalone source was copied from TheKernel commit
   `crates/thekernel-axsched`;
 - `third_party/rust-patches/axpoll` became
   `crates/thekernel-axpoll`.
+- the active `axtask` source selected by that checkout became
+  `crates/thekernel-axtask`.
 
 The copied crate paths were clean at that commit. The unrelated TheKernel root
 `README.md` working-tree modification was not copied or modified.
@@ -22,6 +24,7 @@ The copied crate paths were clean at that commit. The unrelated TheKernel root
 | --- | --- | --- | --- |
 | `thekernel-axsched` | `axsched` `0.3.1` | `cad6b7b0b8d9ad1d52a834d8b7721114413da8cf3430af928b1c8651f911287a` | `4d86c55dce4c87dde52792515ce188081323ac07` |
 | `thekernel-axpoll` | `axpoll` `0.1.2` | `36b92f85c6903350f5146216ccb7d7a7e7b4dbd6f5927a1279db03ba52a53ae7` | `86f20f6bc1b470fc21894721e72b721f49aa20b7` |
+| `thekernel-axtask` | `axtask` `0.3.0-preview.2` | `bc45120776afddf28b19bb7aba87e379c5779cf28a8f7884943a4821caeec774` | `6c6765c05df0550e31edb0ca82d468199f108b3f` |
 
 Each crate contains:
 
@@ -62,4 +65,3 @@ Treat the registry archive checksum as the immutable baseline. A Git commit is
 supporting context, not a substitute for a potentially dirty published source
 tree. Rebase work must begin from the verified archive, preserve its authors and
 license expression, and reapply every item in `PATCHES.md` with tests.
-

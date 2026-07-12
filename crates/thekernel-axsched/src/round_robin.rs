@@ -205,8 +205,12 @@ impl<T, const S: usize> BaseScheduler for RRScheduler<T, S> {
         old_slice <= 1
     }
 
-    fn set_priority(&mut self, _task: &Self::SchedItem, _prio: isize) -> bool {
-        false
+    fn set_priority(
+        &mut self,
+        _task: &Self::SchedItem,
+        _prio: isize,
+    ) -> Result<(), SchedulerError> {
+        Err(SchedulerError::UnsupportedOperation)
     }
 }
 

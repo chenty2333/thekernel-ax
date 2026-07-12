@@ -312,14 +312,11 @@ impl<T> CFSTask<T> {
 
     /// Applies the given scheduling parameters to the task.
     ///
-    /// Returns `false` if the parameters are invalid or the task is currently
-    /// linked into any scheduler. Use [`CFScheduler::set_task_params`] to update
-    /// a ready task and reestablish its queue ordering atomically.
-    pub fn configure(&self, params: CfsTaskParams) -> bool {
-        self.configure_result(params).is_ok()
-    }
-
-    fn configure_result(&self, params: CfsTaskParams) -> Result<(), SchedulerError> {
+    /// Returns a typed error if the parameters are invalid or the task is
+    /// currently linked into a scheduler. Use
+    /// [`CFScheduler::set_task_params`] to update a ready task and reestablish
+    /// its queue ordering atomically.
+    pub fn configure(&self, params: CfsTaskParams) -> Result<(), SchedulerError> {
         let params = params
             .validated()
             .ok_or(SchedulerError::InvalidParameters)?;
@@ -344,26 +341,26 @@ impl<T> CFSTask<T> {
     ///
     /// This is a generic spawn-fairness mechanism. Whether a child inherits or
     /// resets scheduling policy is a lifecycle decision for the caller.
-    pub fn inherit_fair_vruntime_from(&self, parent: &Self) -> bool {
+    pub fn inherit_fair_vruntime_from(&self, parent: &Self) -> Result<(), SchedulerError> {
         if self.is_rt() || parent.is_rt() {
-            return false;
+            return Err(SchedulerError::IncompatibleClass);
         }
-        if self
-            .queue_owner
+        self.queue_owner
             .compare_exchange(UNOWNED, CONFIGURING, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return false;
-        }
+            .map_err(|owner| {
+                if owner == CONFIGURING {
+                    SchedulerError::TaskBusy
+                } else {
+                    SchedulerError::AlreadyQueued
+                }
+            })?;
         self.rebase_vruntime(
             parent
                 .get_vruntime()
                 .saturating_add(FAIR_PREEMPT_GRANULARITY_TICKS),
         );
         self.seeded_vruntime.store(true, Ordering::Release);
-        let released = self.transfer_owner(CONFIGURING, UNOWNED).is_ok();
-        debug_assert!(released, "CFS spawn seed ownership changed unexpectedly");
-        released
+        self.transfer_owner(CONFIGURING, UNOWNED)
     }
 }
 
@@ -631,7 +628,7 @@ impl<T> CFScheduler<T> {
             .validated()
             .ok_or(SchedulerError::InvalidParameters)?;
         match task.owner() {
-            UNOWNED => task.configure_result(params),
+            UNOWNED => task.configure(params),
             CONFIGURING => Err(SchedulerError::TaskBusy),
             owner if owner != self.id || self.id == UNOWNED => Err(SchedulerError::ForeignQueue),
             _ => {
@@ -851,12 +848,12 @@ impl<T> BaseScheduler for CFScheduler<T> {
         }
     }
 
-    fn set_priority(&mut self, task: &Self::SchedItem, prio: isize) -> bool {
+    fn set_priority(&mut self, task: &Self::SchedItem, prio: isize) -> Result<(), SchedulerError> {
         if task.is_rt() {
-            return false;
+            return Err(SchedulerError::IncompatibleClass);
         }
         if !(-20..=19).contains(&prio) {
-            return false;
+            return Err(SchedulerError::InvalidParameters);
         }
         self.set_task_params(
             task,
@@ -866,7 +863,6 @@ impl<T> BaseScheduler for CFScheduler<T> {
                 rt_priority: 0,
             },
         )
-        .is_ok()
     }
 }
 
@@ -908,11 +904,12 @@ mod sequence_tests {
         let first = Arc::new(CFSTask::new(1));
         let second = Arc::new(CFSTask::new(2));
         for task in [&first, &second] {
-            assert!(task.configure(CfsTaskParams {
+            task.configure(CfsTaskParams {
                 class: CfsTaskClass::RoundRobin,
                 nice: 0,
                 rt_priority: 10,
-            }));
+            })
+            .unwrap();
         }
         scheduler.add_task(first.clone()).unwrap();
         scheduler.rt_back_seq = isize::MAX;
@@ -928,11 +925,12 @@ mod sequence_tests {
         let first = Arc::new(CFSTask::new(1));
         let second = Arc::new(CFSTask::new(2));
         for task in [&first, &second] {
-            assert!(task.configure(CfsTaskParams {
+            task.configure(CfsTaskParams {
                 class: CfsTaskClass::RoundRobin,
                 nice: 0,
                 rt_priority: 10,
-            }));
+            })
+            .unwrap();
             scheduler.add_task(task.clone()).unwrap();
         }
         let running = scheduler.pick_next_task().unwrap();
