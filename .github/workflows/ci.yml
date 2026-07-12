@@ -26,7 +26,7 @@ jobs:
             --component rustfmt
           rustup override set "${{ matrix.toolchain }}"
       - name: Check formatting
-        run: cargo fmt --all --check
+        run: cargo fmt --all -- --check
       - name: Check registry-only dependency graph
         run: python3 scripts/check_registry_dependencies.py
       - name: Test workspace

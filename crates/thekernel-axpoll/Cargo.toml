@@ -21,11 +21,7 @@ default = ["alloc"]
 
 [dependencies]
 bitflags = { version = "2.10", default-features = false }
-kspin = "0.1"
-linux-raw-sys = { version = "0.12", default-features = false, features = [
-    "no_std",
-    "general",
-] }
+kspin = { version = "0.1", features = ["smp"] }
 
 [dev-dependencies]
 futures = "0.3"
@@ -35,4 +31,3 @@ tokio = { version = "1.37", features = [
     "time",
     "sync",
 ] }
-

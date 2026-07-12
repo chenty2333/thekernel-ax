@@ -38,7 +38,9 @@ from the verified archive.
 TheKernel replaced allocation-growing registration with bounded storage and
 moved waker clone/drop/wake behavior outside the IRQ-safe lock. The standalone
 fork further makes capacity, cancellation, stale tokens, closure, and the
-generic event boundary explicit. `PATCHES.md` is the release ledger.
+generic event boundary explicit. It also enables the registry dependency's SMP
+lock implementation directly; correctness does not rely on feature unification
+from TheKernel. `PATCHES.md` is the release ledger.
 
 ## Rebase rule
 
@@ -47,4 +49,3 @@ VCS record, authors, license expression, and upstream test inventory, then
 reapply and test every item in `PATCHES.md`. Do not infer API completeness from
 the package name or silently drop a patch because a later upstream tree looks
 similar.
-

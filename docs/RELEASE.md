@@ -2,7 +2,8 @@
 
 The packages have independent names and version histories even when they are
 released from one workspace. The first release checkpoint is `0.1.0` for both
-packages.
+packages. User-visible changes for that checkpoint are recorded in
+[`releases/0.1.0.md`](releases/0.1.0.md).
 
 ## Prepare
 
@@ -18,7 +19,7 @@ packages.
 Run with the repository's pinned MSRV and again with stable:
 
 ```sh
-cargo fmt --all --check
+cargo fmt --all -- --check
 python3 scripts/check_registry_dependencies.py
 cargo test --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -48,4 +49,3 @@ TheKernel's `[patch.crates-io]` environment.
 
 Publishing and pushing tags are deliberate maintainer actions; local release
 preparation does not imply authorization to perform either action.
-

@@ -5,7 +5,7 @@ crates maintained by TheKernel. The repository starts with two crates:
 
 | Package | Rust crate name | Purpose |
 | --- | --- | --- |
-| `thekernel-axsched` | `axsched` | FIFO, round-robin, CFS, and Linux-compatible real-time scheduling mechanisms |
+| `thekernel-axsched` | `axsched` | FIFO, round-robin, fair, and real-time scheduling mechanisms |
 | `thekernel-axpoll` | `axpoll` | bounded I/O readiness registration and wakeup primitives |
 
 The package names are new so releases cannot be confused with the upstream
@@ -47,4 +47,3 @@ workspace patches.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) defines the contribution bar.
 - [`SECURITY.md`](SECURITY.md) defines private vulnerability reporting.
 - [`docs/RELEASE.md`](docs/RELEASE.md) is the release checklist.
-

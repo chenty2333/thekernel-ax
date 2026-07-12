@@ -18,7 +18,7 @@ replace `Cargo.toml.orig`, `.cargo_vcs_info.json`, or the archive checksums in
 Run from the repository root:
 
 ```sh
-cargo fmt --all --check
+cargo fmt --all -- --check
 python3 scripts/check_registry_dependencies.py
 cargo test --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -41,4 +41,3 @@ archive checksum before reapplying each maintained patch.
 Keep changes narrow. Explain the mechanism boundary, compatibility impact,
 resource bound, and verification performed. Do not include generated `target/`
 content or a dependency on TheKernel's root `[patch.crates-io]` table.
-

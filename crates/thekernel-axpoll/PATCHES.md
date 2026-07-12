@@ -24,7 +24,28 @@ the tested diff from the verified registry archive.
   patch table.
 - Include complete license texts, provenance, release checks, and unpacked
   package tests.
-
-The registration lifecycle and event namespace are intentionally recorded in a
-separate patch checkpoint after the standalone repository skeleton.
-
+- Replace Linux-named event flags and `linux-raw-sys` constants with generic
+  `IoEvents` names and crate-owned bit values. Linux `POLL*` translation is a
+  downstream ABI-adapter responsibility.
+- Make `PollSet` capacity a const generic (default 64) and return an explicit
+  `RegisterError::Full` instead of overwriting and waking an existing waiter.
+- Return opaque registry/slot/generation tokens, with independent registration,
+  waker update, cancellation, foreign-token rejection, and stale-generation
+  rejection defined explicitly.
+- Remove inherited `Waker::will_wake` registration deduplication: equivalent
+  wakers can represent independent waits or interests, so every `register`
+  call owns a distinct token and slot. Re-polling one logical wait uses
+  `update`.
+- Remove the inherited `Pollable` trait rather than returning one token for a
+  potentially multi-source wait. Bounded fan-in, rollback, interest changes,
+  group update, and group cancellation remain an explicit downstream contract
+  until a generic source/group API is proven against real consumers.
+- Separate one-shot `wake()` from terminal, idempotent `close()`; dropping a set
+  closes it and wakes live registrations.
+- Preserve short-lock linearization while moving Waker clone, replacement,
+  rejection, cancellation drop, drain drop, and wake callbacks outside the
+  IRQ-safe lock.
+- Enable `kspin/smp` explicitly. The standalone package must provide a real
+  cross-core lock without relying on TheKernel's former feature unification.
+- Cover bounded capacity, ABA slot reuse, close/drop, cancel/wake races,
+  re-entrant Wake and final Waker destruction, and token-owning async futures.
