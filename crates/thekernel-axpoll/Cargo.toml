@@ -15,10 +15,6 @@ exclude = ["Cargo.toml.orig", ".cargo_vcs_info.json"]
 name = "axpoll"
 path = "src/lib.rs"
 
-[features]
-alloc = []
-default = ["alloc"]
-
 [dependencies]
 bitflags = { version = "2.10", default-features = false }
 kspin = { version = "0.1", features = ["smp"] }

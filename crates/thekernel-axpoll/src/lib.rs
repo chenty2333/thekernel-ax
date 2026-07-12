@@ -115,6 +115,62 @@ pub enum UpdateError {
     InvalidToken,
 }
 
+/// An owned waker prepared before a source registration is published.
+///
+/// Composite waiters can prepare all source wakers and reserve their own token
+/// storage before arming the first source. This type does not pretend that one
+/// token represents a multi-source wait; every successful [`PollSet::arm`]
+/// still returns one independent [`RegistrationToken`].
+#[must_use = "a prepared registration has not been armed"]
+pub struct PreparedRegistration {
+    waker: Waker,
+}
+
+impl PreparedRegistration {
+    /// Clones a waker before any poll-set lock or source slot is acquired.
+    pub fn new(waker: &Waker) -> Self {
+        Self {
+            waker: waker.clone(),
+        }
+    }
+}
+
+/// Failure to arm one previously prepared source registration.
+///
+/// The rejected preparation is returned intact so an aggregate owner can
+/// release it outside source locks while rolling back earlier tokens.
+pub struct ArmRegistrationError {
+    kind: RegisterError,
+    prepared: PreparedRegistration,
+}
+
+impl ArmRegistrationError {
+    /// Returns the typed source-admission failure.
+    pub const fn kind(&self) -> RegisterError {
+        self.kind
+    }
+
+    /// Recovers ownership of the unarmed waker.
+    pub fn into_prepared(self) -> PreparedRegistration {
+        self.prepared
+    }
+}
+
+impl fmt::Debug for ArmRegistrationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ArmRegistrationError")
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Display for ArmRegistrationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.kind.fmt(formatter)
+    }
+}
+
 impl fmt::Display for UpdateError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -167,30 +223,24 @@ impl<const CAPACITY: usize> Inner<CAPACITY> {
         }
     }
 
-    fn register(
-        &mut self,
-        owned: Waker,
-    ) -> (Result<RegistrationToken, RegisterError>, Option<Waker>) {
+    fn arm(&mut self, owned: Waker) -> Result<RegistrationToken, (RegisterError, Waker)> {
         if self.closed {
-            return (Err(RegisterError::Closed), Some(owned));
+            return Err((RegisterError::Closed, owned));
         }
 
         if self.len == CAPACITY {
-            return (Err(RegisterError::Full), Some(owned));
+            return Err((RegisterError::Full, owned));
         }
 
-        let Some(slot) = (0..CAPACITY)
-            .map(|offset| self.next.wrapping_add(offset) % CAPACITY)
-            .find(|&slot| {
-                self.entries[slot].waker.is_none() && self.entries[slot].generation < usize::MAX
-            })
-        else {
-            return (Err(RegisterError::TokenSpaceExhausted), Some(owned));
+        let Some(slot) = (self.next..CAPACITY).chain(0..self.next).find(|&slot| {
+            self.entries[slot].waker.is_none() && self.entries[slot].generation < usize::MAX
+        }) else {
+            return Err((RegisterError::TokenSpaceExhausted, owned));
         };
 
         let registry_id = if self.registry_id == 0 {
             let Some(registry_id) = allocate_registry_id() else {
-                return (Err(RegisterError::TokenSpaceExhausted), Some(owned));
+                return Err((RegisterError::TokenSpaceExhausted, owned));
             };
             self.registry_id = registry_id;
             registry_id
@@ -202,12 +252,9 @@ impl<const CAPACITY: usize> Inner<CAPACITY> {
         entry.generation += 1;
         entry.waker = Some(owned);
         self.len += 1;
-        self.next = (slot + 1) % CAPACITY;
+        self.next = if slot + 1 == CAPACITY { 0 } else { slot + 1 };
 
-        (
-            Ok(RegistrationToken::new(registry_id, slot, entry.generation)),
-            None,
-        )
+        Ok(RegistrationToken::new(registry_id, slot, entry.generation))
     }
 
     fn update(
@@ -316,6 +363,31 @@ impl<const CAPACITY: usize> PollSet<CAPACITY> {
         self.0.lock().closed
     }
 
+    /// Prepares a source registration without acquiring a source slot.
+    ///
+    /// Aggregate owners should first reserve their bounded token storage, then
+    /// prepare every source waker, and only then call [`Self::arm`] per source.
+    pub fn prepare(&self, waker: &Waker) -> PreparedRegistration {
+        PreparedRegistration::new(waker)
+    }
+
+    /// Arms one prepared source and returns its opaque cancellation token.
+    ///
+    /// Capacity, closure, or token-space failure returns the preparation to the
+    /// caller without replacing or waking an existing registration.
+    pub fn arm(
+        &self,
+        prepared: PreparedRegistration,
+    ) -> Result<RegistrationToken, ArmRegistrationError> {
+        match self.0.lock().arm(prepared.waker) {
+            Ok(token) => Ok(token),
+            Err((kind, waker)) => Err(ArmRegistrationError {
+                kind,
+                prepared: PreparedRegistration { waker },
+            }),
+        }
+    }
+
     /// Registers a waker and returns its opaque cancellation token.
     ///
     /// Every call creates an independent registration, even if another slot has
@@ -324,12 +396,7 @@ impl<const CAPACITY: usize> PollSet<CAPACITY> {
     /// polled again must retain its token and call [`Self::update`] instead of
     /// registering a second time.
     pub fn register(&self, waker: &Waker) -> Result<RegistrationToken, RegisterError> {
-        // A RawWaker clone may execute type-specific reference counting. Clone
-        // before acquiring the IRQ-safe registry lock.
-        let owned = waker.clone();
-        let (result, deferred_drop) = self.0.lock().register(owned);
-        drop(deferred_drop);
-        result
+        self.arm(self.prepare(waker)).map_err(|error| error.kind())
     }
 
     /// Replaces the waker associated with a live token.

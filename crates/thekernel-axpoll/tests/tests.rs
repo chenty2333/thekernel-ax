@@ -51,6 +51,37 @@ fn register_and_wake() {
 }
 
 #[test]
+fn prepare_is_invisible_until_one_source_is_armed() {
+    let poll_set = PollSet::<1>::new();
+    let counter = Counter::new();
+    let prepared = poll_set.prepare(&Waker::from(counter.clone()));
+    assert!(poll_set.is_empty());
+
+    let token = poll_set.arm(prepared).unwrap();
+    assert_eq!(poll_set.len(), 1);
+    assert!(poll_set.cancel(token));
+    assert_eq!(counter.count(), 0);
+}
+
+#[test]
+fn failed_arm_returns_the_unpublished_preparation() {
+    let poll_set = PollSet::<1>::new();
+    let live = Counter::new();
+    poll_set.register(&Waker::from(live.clone())).unwrap();
+
+    let rejected = Counter::new();
+    let error = poll_set
+        .arm(poll_set.prepare(&Waker::from(rejected.clone())))
+        .unwrap_err();
+    assert_eq!(error.kind(), RegisterError::Full);
+    drop(error.into_prepared());
+    assert_eq!(poll_set.len(), 1);
+    assert_eq!(rejected.count(), 0);
+    assert_eq!(poll_set.wake(), 1);
+    assert_eq!(live.count(), 1);
+}
+
+#[test]
 fn wake_is_one_shot_but_does_not_close() {
     let poll_set = PollSet::<1>::new();
     let first = Counter::new();

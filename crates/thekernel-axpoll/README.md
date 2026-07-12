@@ -63,6 +63,19 @@ wake callbacks run outside the IRQ-safe lock and may re-enter the registry.
 The package enables `kspin/smp` explicitly, so this guarantee does not depend on
 feature unification in a larger kernel workspace.
 
+## Explicit prepare/arm seam
+
+`prepare(waker)` clones and owns the waker before any source slot is visible;
+`arm(prepared)` publishes exactly one source and returns exactly one token. An
+arm failure returns `ArmRegistrationError`, from which the unpublished
+preparation can be recovered and dropped outside source locks. A multi-source
+consumer should reserve its finite token storage, prepare every source, arm
+them one by one, and cancel already armed tokens on the first failure.
+
+This seam is intentionally not an aggregate-token API. The consumer still owns
+the source topology, checked maximum, partial-arm rollback, interest update,
+and cancellation of every individual token.
+
 ## Generic events, not Linux constants
 
 `IoEvents` uses neutral names and crate-owned bit values:
@@ -90,6 +103,10 @@ represent atomic cancellation of that group. Downstream object/fd layers must
 own their bounded composite-registration contract, including interest changes,
 partial-registration rollback, waker updates, and drop cancellation. The core
 crate claims only the per-source `PollSet` lifecycle documented above.
+
+The crate always requires Rust's `alloc` runtime for `Waker` ownership and its
+`Wake for PollSet` implementation. It has no empty `alloc` feature flag: turning
+off a feature never falsely claims an allocator-free build.
 
 See [`VENDOR.md`](VENDOR.md) for the immutable upstream source record and
 [`PATCHES.md`](PATCHES.md) for the maintained delta.

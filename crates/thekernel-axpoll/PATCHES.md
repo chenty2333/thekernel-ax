@@ -32,6 +32,10 @@ the tested diff from the verified registry archive.
 - Return opaque registry/slot/generation tokens, with independent registration,
   waker update, cancellation, foreign-token rejection, and stale-generation
   rejection defined explicitly.
+- Add an explicit per-source prepare/arm transaction. A rejected arm returns
+  the unpublished owned waker, letting a bounded aggregate reserve and prepare
+  before publication and roll back earlier source tokens without a one-token
+  fiction.
 - Remove inherited `Waker::will_wake` registration deduplication: equivalent
   wakers can represent independent waits or interests, so every `register`
   call owns a distinct token and slot. Re-polling one logical wait uses
@@ -47,5 +51,7 @@ the tested diff from the verified registry archive.
   IRQ-safe lock.
 - Enable `kspin/smp` explicitly. The standalone package must provide a real
   cross-core lock without relying on TheKernel's former feature unification.
+- Remove the empty `alloc` Cargo feature. The implementation always requires
+  the allocation runtime for owned wakers and says so directly.
 - Cover bounded capacity, ABA slot reuse, close/drop, cancel/wake races,
   re-entrant Wake and final Waker destruction, and token-owning async futures.
