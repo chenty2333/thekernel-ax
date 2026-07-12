@@ -37,5 +37,22 @@ is the tested diff from the verified registry archive.
   ranges themselves.
 - Make foreign-scheduler removal safe for FIFO and round-robin queues rather
   than exposing an unchecked linked-list removal through a safe trait method.
-- Test maximum/zero real-time priorities, rejected-state immutability for a
-  published task, child vruntime seeding, and cross-scheduler removal.
+- Make every enqueue/remove/requeue operation return typed ownership,
+  identifier, sequence, parameter, and configuration failures.
+- Add an atomic per-task queue owner to FIFO, RR, and CFS, reject duplicate or
+  foreign publication, and release every surviving owner when a scheduler is
+  dropped.
+- Serialize CFS task configuration against enqueue and provide a scheduler
+  transaction for ready-task class/priority changes so live intrusive keys are
+  never mutated.
+- Replace signed RR time-slice truncation/underflow with saturating `usize`
+  accounting; reject a zero slice explicitly and accept `usize::MAX`.
+- Rebase CFS fair/front/back sequences allocation-free before exhaustion,
+  preserving current ready order instead of wrapping into key collisions or
+  permanently rejecting future work.
+- Saturate long-running CFS delta/vruntime arithmetic rather than allowing a
+  debug-build panic or release-build wrap.
+- Test maximum/zero real-time priorities, zero/maximum/expired RR slices,
+  rejected-state immutability for a published task, transactional ready-task
+  configuration, child vruntime seeding, sequence rebase, scheduler teardown,
+  duplicate ownership, and cross-scheduler removal.

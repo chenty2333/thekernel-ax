@@ -33,13 +33,13 @@ let mut scheduler = FifoScheduler::new();
 scheduler.init();
 
 for i in 0..10 {
-    scheduler.add_task(Arc::new(FifoTask::new(i)));
+    scheduler.add_task(Arc::new(FifoTask::new(i))).unwrap();
 }
 
 for i in 0..10 {
     let next = scheduler.pick_next_task().unwrap();
     assert_eq!(*next.inner(), i);
-    scheduler.put_prev_task(next, false);
+    scheduler.put_prev_task(next, false).unwrap();
 }
 ```
 
@@ -56,4 +56,26 @@ when it creates a child.
 
 The fair-child vruntime seeding helper is policy-neutral: callers decide which
 task-creation operations should use it. Removing a task that belongs to another
-scheduler instance is safe and returns `None` for every scheduler algorithm.
+scheduler instance is safe and returns `SchedulerError::ForeignQueue`; an
+unqueued task returns `Ok(None)`.
+
+## Queue ownership and failure contract
+
+Every intrusive task wrapper has one generation-independent queue-owner state.
+Enqueue atomically claims it, duplicate publication returns `AlreadyQueued`,
+and another scheduler cannot unlink it. Pick/remove transfers ownership back to
+the caller, while dropping a scheduler drains its queue and releases surviving
+task references. Queue operations return typed errors instead of silently
+ignoring a foreign link.
+
+`CFSTask::configure` only updates an unqueued/running task and uses a short
+configuration claim so an enqueue cannot race the parameter transaction. A
+ready task is updated with `CFScheduler::set_task_params`, which removes,
+reconfigures, and reinserts it under the scheduler's exclusive borrow without
+mutating an intrusive-tree key in place.
+
+Round-robin counters use saturating unsigned arithmetic. A zero const time
+slice is representable but every enqueue rejects it with
+`InvalidTimeSlice`; `usize::MAX` is valid and cannot truncate through a signed
+counter. CFS fair and real-time tie-break sequences are rebased
+allocation-free before exhaustion while preserving ready order.

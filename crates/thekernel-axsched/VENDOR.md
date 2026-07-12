@@ -37,9 +37,10 @@ of the maintained patch.
 TheKernel added fair/FIFO/RR policy mechanics and tests, cross-runqueue and
 lifecycle hardening, and honest rejection of unsupported deadline scheduling.
 The standalone fork additionally removes process-fork policy from scheduler
-state, uses a generic nonzero `u8` real-time priority domain, and makes
-foreign-scheduler removal safe for every queue implementation. `PATCHES.md` is
-the release ledger for that delta.
+state, uses a generic nonzero `u8` real-time priority domain, makes queue
+ownership explicit for every implementation, serializes ready-task
+configuration, uses saturating RR/vruntime arithmetic, and rebases ordering
+sequences before exhaustion. `PATCHES.md` is the release ledger for that delta.
 
 ## Rebase rule
 

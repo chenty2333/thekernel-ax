@@ -10,12 +10,50 @@ mod tests;
 
 extern crate alloc;
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 pub use cfs::{
     CFSTask, CFScheduler, CfsTaskClass, CfsTaskParams, RR_TIMESLICE_TICKS, RT_PRIORITY_MAX,
     RT_PRIORITY_MIN,
 };
 pub use fifo::{FifoScheduler, FifoTask};
 pub use round_robin::{RRScheduler, RRTask};
+
+const UNOWNED: usize = 0;
+const CONFIGURING: usize = usize::MAX;
+static NEXT_SCHEDULER_ID: AtomicUsize = AtomicUsize::new(1);
+
+fn allocate_scheduler_id() -> Result<usize, SchedulerError> {
+    NEXT_SCHEDULER_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .map_err(|_| SchedulerError::IdentifierExhausted)
+}
+
+/// Failure returned by a scheduler queue operation.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum SchedulerError {
+    /// The task is already queued in this scheduler.
+    AlreadyQueued,
+    /// The task is currently owned by another scheduler instance.
+    ForeignQueue,
+    /// The global scheduler-instance identifier space was exhausted.
+    IdentifierExhausted,
+    /// A scheduler-local ordering sequence was exhausted.
+    SequenceExhausted,
+    /// A task is undergoing an atomic configuration transaction.
+    TaskBusy,
+    /// Scheduling parameters were outside the mechanism's accepted domain.
+    InvalidParameters,
+    /// A round-robin scheduler was instantiated with a zero tick budget.
+    InvalidTimeSlice,
+    /// Private queue membership metadata disagreed with the queue contents.
+    ///
+    /// Safe callers cannot create this state. It is reported instead of
+    /// panicking so a kernel can contain and diagnose an internal defect.
+    InconsistentState,
+}
 
 /// Why a runnable task is being enqueued.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -42,13 +80,16 @@ pub trait BaseScheduler {
     fn init(&mut self);
 
     /// Adds a task to the scheduler.
-    fn add_task(&mut self, task: Self::SchedItem);
+    fn add_task(&mut self, task: Self::SchedItem) -> Result<(), SchedulerError>;
 
     /// Removes a task by reference and returns its owned scheduler item.
     ///
-    /// Returns [`None`] when the task is not ready in this scheduler, including
-    /// when it is linked into another scheduler instance.
-    fn remove_task(&mut self, task: &Self::SchedItem) -> Option<Self::SchedItem>;
+    /// Returns [`None`] when the task is not linked into any scheduler and
+    /// [`SchedulerError::ForeignQueue`] when another scheduler owns it.
+    fn remove_task(
+        &mut self,
+        task: &Self::SchedItem,
+    ) -> Result<Option<Self::SchedItem>, SchedulerError>;
 
     /// Picks the next task to run, it will be removed from the scheduler.
     /// Returns [`None`] if there is not runnable task.
@@ -61,14 +102,19 @@ pub trait BaseScheduler {
     /// `preempt` indicates whether the previous task is preempted by the next
     /// task. In this case, the previous task may be placed at the front of the
     /// ready queue.
-    fn put_prev_task(&mut self, prev: Self::SchedItem, preempt: bool);
+    fn put_prev_task(&mut self, prev: Self::SchedItem, preempt: bool)
+        -> Result<(), SchedulerError>;
 
     /// Enqueues a runnable task for the specified reason.
     ///
     /// The default implementation preserves the legacy split between
     /// `add_task()` for fresh/woken tasks and `put_prev_task()` for tasks that
     /// were already running.
-    fn enqueue_task(&mut self, task: Self::SchedItem, reason: EnqueueReason) {
+    fn enqueue_task(
+        &mut self,
+        task: Self::SchedItem,
+        reason: EnqueueReason,
+    ) -> Result<(), SchedulerError> {
         match reason {
             EnqueueReason::New | EnqueueReason::Wakeup => self.add_task(task),
             EnqueueReason::Yield => self.put_prev_task(task, false),

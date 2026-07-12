@@ -1,14 +1,78 @@
 use alloc::sync::Arc;
+use core::{
+    ops::Deref,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
-use linked_list_r4l::{def_node, List};
+use linked_list_r4l::{GetLinks, Links, List};
 
-use crate::BaseScheduler;
+use crate::{allocate_scheduler_id, BaseScheduler, SchedulerError, UNOWNED};
 
-def_node! {
-    /// A task wrapper for the [`FifoScheduler`].
-    ///
-    /// It add extra states to use in [`linked_list::List`].
-    pub struct FifoTask<T>(T);
+/// A task wrapper for the [`FifoScheduler`].
+pub struct FifoTask<T> {
+    inner: T,
+    links: Links<Self>,
+    queue_owner: AtomicUsize,
+}
+
+impl<T> FifoTask<T> {
+    /// Creates an unqueued task wrapper.
+    pub const fn new(inner: T) -> Self {
+        Self {
+            inner,
+            links: Links::new(),
+            queue_owner: AtomicUsize::new(UNOWNED),
+        }
+    }
+
+    /// Returns a reference to the wrapped task.
+    pub const fn inner(&self) -> &T {
+        &self.inner
+    }
+
+    /// Consumes the wrapper and returns the wrapped task.
+    pub fn into_inner(self) -> T {
+        self.inner
+    }
+
+    fn claim(&self, scheduler_id: usize) -> Result<(), SchedulerError> {
+        match self.queue_owner.compare_exchange(
+            UNOWNED,
+            scheduler_id,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            Err(owner) if owner == scheduler_id => Err(SchedulerError::AlreadyQueued),
+            Err(_) => Err(SchedulerError::ForeignQueue),
+        }
+    }
+
+    fn release(&self, scheduler_id: usize) {
+        self.queue_owner
+            .compare_exchange(scheduler_id, UNOWNED, Ordering::AcqRel, Ordering::Acquire)
+            .expect("FIFO task queue owner invariant violated");
+    }
+
+    fn owner(&self) -> usize {
+        self.queue_owner.load(Ordering::Acquire)
+    }
+}
+
+impl<T> GetLinks for FifoTask<T> {
+    type EntryType = Self;
+
+    fn get_links(data: &Self::EntryType) -> &Links<Self::EntryType> {
+        &data.links
+    }
+}
+
+impl<T> Deref for FifoTask<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
 }
 
 /// A simple FIFO (First-In-First-Out) cooperative scheduler.
@@ -18,10 +82,9 @@ def_node! {
 /// taken.
 ///
 /// As it's a cooperative scheduler, it does nothing when the timer tick occurs.
-///
-/// It internally uses a linked list as the ready queue.
 pub struct FifoScheduler<T> {
     ready_queue: List<Arc<FifoTask<T>>>,
+    id: usize,
 }
 
 impl<T> FifoScheduler<T> {
@@ -29,11 +92,20 @@ impl<T> FifoScheduler<T> {
     pub const fn new() -> Self {
         Self {
             ready_queue: List::new(),
+            id: UNOWNED,
         }
     }
-    /// get the name of scheduler
+
+    /// Returns the scheduler name.
     pub fn scheduler_name() -> &'static str {
         "FIFO"
+    }
+
+    fn ensure_id(&mut self) -> Result<usize, SchedulerError> {
+        if self.id == UNOWNED {
+            self.id = allocate_scheduler_id()?;
+        }
+        Ok(self.id)
     }
 }
 
@@ -42,34 +114,61 @@ impl<T> BaseScheduler for FifoScheduler<T> {
 
     fn init(&mut self) {}
 
-    fn add_task(&mut self, task: Self::SchedItem) {
+    fn add_task(&mut self, task: Self::SchedItem) -> Result<(), SchedulerError> {
+        let id = self.ensure_id()?;
+        task.claim(id)?;
         self.ready_queue.push_back(task);
+        Ok(())
     }
 
-    fn remove_task(&mut self, task: &Self::SchedItem) -> Option<Self::SchedItem> {
+    fn remove_task(
+        &mut self,
+        task: &Self::SchedItem,
+    ) -> Result<Option<Self::SchedItem>, SchedulerError> {
+        match task.owner() {
+            UNOWNED => return Ok(None),
+            owner if owner != self.id || self.id == UNOWNED => {
+                return Err(SchedulerError::ForeignQueue);
+            }
+            _ => {}
+        }
+
         let mut cursor = self.ready_queue.cursor_front_mut();
         loop {
             let matches = cursor
                 .current()
                 .is_some_and(|queued| core::ptr::eq(queued, Arc::as_ptr(task)));
             if matches {
-                return cursor.remove_current();
+                let removed = cursor
+                    .remove_current()
+                    .expect("FIFO queue cursor lost its current task");
+                removed.release(self.id);
+                return Ok(Some(removed));
             }
-            cursor.current()?;
+            assert!(
+                cursor.current().is_some(),
+                "FIFO queue owner points at a scheduler that does not contain the task"
+            );
             cursor.move_next();
         }
     }
 
     fn pick_next_task(&mut self) -> Option<Self::SchedItem> {
-        self.ready_queue.pop_front()
+        let task = self.ready_queue.pop_front()?;
+        task.release(self.id);
+        Some(task)
     }
 
-    fn put_prev_task(&mut self, prev: Self::SchedItem, _preempt: bool) {
-        self.ready_queue.push_back(prev);
+    fn put_prev_task(
+        &mut self,
+        prev: Self::SchedItem,
+        _preempt: bool,
+    ) -> Result<(), SchedulerError> {
+        self.add_task(prev)
     }
 
     fn task_tick(&mut self, _current: &Self::SchedItem) -> bool {
-        false // no reschedule
+        false
     }
 
     fn set_priority(&mut self, _task: &Self::SchedItem, _prio: isize) -> bool {
@@ -80,5 +179,13 @@ impl<T> BaseScheduler for FifoScheduler<T> {
 impl<T> Default for FifoScheduler<T> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl<T> Drop for FifoScheduler<T> {
+    fn drop(&mut self) {
+        while let Some(task) = self.ready_queue.pop_front() {
+            task.release(self.id);
+        }
     }
 }
