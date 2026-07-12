@@ -36,7 +36,10 @@ of the maintained patch.
 
 TheKernel added fair/FIFO/RR policy mechanics and tests, cross-runqueue and
 lifecycle hardening, and honest rejection of unsupported deadline scheduling.
-`PATCHES.md` is the release ledger for that delta.
+The standalone fork additionally removes process-fork policy from scheduler
+state, uses a generic nonzero `u8` real-time priority domain, and makes
+foreign-scheduler removal safe for every queue implementation. `PATCHES.md` is
+the release ledger for that delta.
 
 ## Rebase rule
 
@@ -45,4 +48,3 @@ VCS record, authors, license expression, and upstream test inventory, then
 reapply and test every item in `PATCHES.md`. Do not infer API completeness from
 the package name or silently drop a patch because a later upstream tree looks
 similar.
-

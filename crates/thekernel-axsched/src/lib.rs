@@ -44,13 +44,10 @@ pub trait BaseScheduler {
     /// Adds a task to the scheduler.
     fn add_task(&mut self, task: Self::SchedItem);
 
-    /// Removes a task by its reference from the scheduler. Returns the owned
-    /// removed task with ownership if it exists.
+    /// Removes a task by reference and returns its owned scheduler item.
     ///
-    /// # Safety
-    ///
-    /// The caller should ensure that the task is in the scheduler, otherwise
-    /// the behavior is undefined.
+    /// Returns [`None`] when the task is not ready in this scheduler, including
+    /// when it is linked into another scheduler instance.
     fn remove_task(&mut self, task: &Self::SchedItem) -> Option<Self::SchedItem>;
 
     /// Picks the next task to run, it will be removed from the scheduler.
@@ -85,6 +82,9 @@ pub trait BaseScheduler {
     /// `current` is the current running task.
     fn task_tick(&mut self, current: &Self::SchedItem) -> bool;
 
-    /// set priority for a task
+    /// Sets the scheduler-specific priority of a task.
+    ///
+    /// Returns `false` when this scheduler does not support runtime priority
+    /// changes or the value is outside its generic mechanism range.
     fn set_priority(&mut self, task: &Self::SchedItem, prio: isize) -> bool;
 }

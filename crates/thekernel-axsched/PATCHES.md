@@ -14,8 +14,8 @@ See `VENDOR.md` before rebasing.
   lifecycle hardening.
 - `909591e`: removal of false `SCHED_DEADLINE` capability from the generic
   scheduler surface.
-- Tests for fair/FIFO/RR ordering, preemption, priority, fork reset, and task
-  migration behavior.
+- Tests for fair/FIFO/RR ordering, preemption, priority, child-task fairness,
+  and task migration behavior.
 
 These commit IDs are source-history navigation hints. The authoritative patch
 is the tested diff from the verified registry archive.
@@ -29,4 +29,13 @@ is the tested diff from the verified registry archive.
   patch table.
 - Include complete license texts, provenance, release checks, and unpacked
   package tests.
-
+- Remove `reset_on_fork` from scheduler state. Child policy reset is a task
+  lifecycle or ABI decision, while the generic fair-child vruntime seeding
+  mechanism remains available to callers.
+- Expand the generic real-time priority domain from the Linux-shaped `1..=99`
+  range to the full nonzero `u8` range. ABI adapters validate narrower public
+  ranges themselves.
+- Make foreign-scheduler removal safe for FIFO and round-robin queues rather
+  than exposing an unchecked linked-list removal through a safe trait method.
+- Test maximum/zero real-time priorities, rejected-state immutability for a
+  published task, child vruntime seeding, and cross-scheduler removal.

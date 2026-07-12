@@ -46,3 +46,14 @@ for i in 0..10 {
 See [`VENDOR.md`](VENDOR.md) for the immutable upstream source record and
 [`PATCHES.md`](PATCHES.md) for the maintained delta.
 
+## Generic boundary
+
+`CfsTaskParams` describes scheduler mechanism only. Real-time priority uses the
+full nonzero `u8` domain; an ABI adapter may expose a narrower range. Process
+lifecycle policy such as Linux `SCHED_RESET_ON_FORK` is intentionally not
+stored in scheduler tasks and must be applied by the downstream task/ABI layer
+when it creates a child.
+
+The fair-child vruntime seeding helper is policy-neutral: callers decide which
+task-creation operations should use it. Removing a task that belongs to another
+scheduler instance is safe and returns `None` for every scheduler algorithm.

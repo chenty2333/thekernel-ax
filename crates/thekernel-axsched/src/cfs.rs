@@ -8,29 +8,43 @@ use intrusive_collections::{intrusive_adapter, Bound, KeyAdapter, RBTree, RBTree
 
 use crate::{BaseScheduler, EnqueueReason};
 
+/// Default tick budget assigned to a round-robin task.
 pub const RR_TIMESLICE_TICKS: usize = 5;
+/// Lowest valid real-time priority in the generic scheduler domain.
 pub const RT_PRIORITY_MIN: u8 = 1;
-pub const RT_PRIORITY_MAX: u8 = 99;
+/// Highest valid real-time priority in the generic scheduler domain.
+///
+/// ABI adapters may expose a narrower range. For example, a Linux personality
+/// validates its own userspace range instead of changing this mechanism limit.
+pub const RT_PRIORITY_MAX: u8 = u8::MAX;
 const FAIR_PREEMPT_GRANULARITY_TICKS: isize = 2;
 
 /// Runtime scheduling class for CFS tasks.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum CfsTaskClass {
+    /// Ordinary fair scheduling.
     Normal = 0,
+    /// Fair scheduling biased toward throughput over latency.
     Batch = 1,
+    /// Lowest-precedence fair scheduling.
     Idle = 2,
+    /// Fixed-priority, time-sliced scheduling.
     RoundRobin = 3,
+    /// Fixed-priority scheduling without time slicing.
     Fifo = 4,
 }
 
 /// Runtime scheduling parameters for a CFS task.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct CfsTaskParams {
+    /// Scheduling class.
     pub class: CfsTaskClass,
+    /// Fair-class weight selector in the inclusive range `-20..=19`.
     pub nice: i8,
+    /// Real-time priority in the inclusive range
+    /// [`RT_PRIORITY_MIN`]`..=`[`RT_PRIORITY_MAX`].
     pub rt_priority: u8,
-    pub reset_on_fork: bool,
 }
 
 impl Default for CfsTaskParams {
@@ -39,7 +53,6 @@ impl Default for CfsTaskParams {
             class: CfsTaskClass::Normal,
             nice: 0,
             rt_priority: 0,
-            reset_on_fork: false,
         }
     }
 }
@@ -80,7 +93,6 @@ pub struct CFSTask<T> {
     nice: AtomicIsize,
     class: AtomicU8,
     rt_priority: AtomicU8,
-    reset_on_fork: AtomicBool,
     rr_time_slice: AtomicIsize,
     id: AtomicIsize,
 }
@@ -113,7 +125,6 @@ impl<T> CFSTask<T> {
             nice: AtomicIsize::new(0_isize),
             class: AtomicU8::new(CfsTaskClass::Normal as u8),
             rt_priority: AtomicU8::new(0),
-            reset_on_fork: AtomicBool::new(false),
             rr_time_slice: AtomicIsize::new(RR_TIMESLICE_TICKS as isize),
             id: AtomicIsize::new(0_isize),
         }
@@ -195,19 +206,12 @@ impl<T> CFSTask<T> {
         self.rr_time_slice.fetch_sub(1, Ordering::Release)
     }
 
-    fn set_sched_params(
-        &self,
-        class: CfsTaskClass,
-        nice: isize,
-        rt_priority: u8,
-        reset_on_fork: bool,
-    ) {
+    fn set_sched_params(&self, class: CfsTaskClass, nice: isize, rt_priority: u8) {
         let current_vruntime = self.get_vruntime();
         self.rebase_vruntime(current_vruntime);
         self.nice.store(nice, Ordering::Release);
         self.class.store(class as u8, Ordering::Release);
         self.rt_priority.store(rt_priority, Ordering::Release);
-        self.reset_on_fork.store(reset_on_fork, Ordering::Release);
         if matches!(class, CfsTaskClass::RoundRobin | CfsTaskClass::Fifo) {
             self.reset_rr_time_slice();
         } else {
@@ -255,7 +259,6 @@ impl<T> CFSTask<T> {
             class: self.class(),
             nice: self.effective_nice() as i8,
             rt_priority: if self.is_rt() { self.rt_priority() } else { 0 },
-            reset_on_fork: self.reset_on_fork.load(Ordering::Acquire),
         }
     }
 
@@ -274,17 +277,14 @@ impl<T> CFSTask<T> {
                 }
             }
         }
-        self.set_sched_params(
-            params.class,
-            params.nice as isize,
-            params.rt_priority,
-            params.reset_on_fork,
-        );
+        self.set_sched_params(params.class, params.nice as isize, params.rt_priority);
         true
     }
 
-    /// Seeds a freshly forked fair task just behind its parent so fork bursts
-    /// do not unfairly jump ahead of the running parent.
+    /// Seeds a new fair child just behind its parent task.
+    ///
+    /// This is a generic spawn-fairness mechanism. Whether a child inherits or
+    /// resets scheduling policy is a lifecycle decision for the caller.
     pub fn inherit_fair_vruntime_from(&self, parent: &Self) {
         if self.is_rt() || parent.is_rt() {
             return;
@@ -556,9 +556,9 @@ impl<T> BaseScheduler for CFScheduler<T> {
             }
             EnqueueReason::Yield => {
                 // A cooperative yield should put a fair task behind peers that
-                // are already ready, otherwise fork storms keep rescheduling
-                // the yielding parent and freshly forked children never reach
-                // their first blocking syscall.
+                // are already ready, otherwise child-creation bursts keep
+                // rescheduling the yielding parent and new children never
+                // reach their first blocking operation.
                 let floor = self
                     .min_ready_vruntime()
                     .unwrap_or_else(|| self.queue_floor())
@@ -631,7 +631,6 @@ impl<T> BaseScheduler for CFScheduler<T> {
                 class: task.class(),
                 nice: prio as i8,
                 rt_priority: 0,
-                reset_on_fork: task.reset_on_fork.load(Ordering::Acquire),
             },
         )
     }

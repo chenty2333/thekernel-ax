@@ -76,6 +76,24 @@ macro_rules! def_test_sched {
                     (t1 - t0) / (NUM_TASKS as u32)
                 );
             }
+
+            #[test]
+            fn foreign_scheduler_removal_is_safe() {
+                let mut owner = <$scheduler>::new();
+                let mut other = <$scheduler>::new();
+                let task = Arc::new(<$task>::new(1));
+                let peer = Arc::new(<$task>::new(2));
+
+                owner.add_task(task.clone());
+                other.add_task(peer.clone());
+
+                assert!(other.remove_task(&task).is_none());
+                let removed = owner.remove_task(&task).unwrap();
+                assert!(Arc::ptr_eq(&removed, &task));
+                assert!(owner.pick_next_task().is_none());
+                let untouched = other.pick_next_task().unwrap();
+                assert!(Arc::ptr_eq(&untouched, &peer));
+            }
         }
     };
 }
@@ -98,7 +116,6 @@ mod cfs_rt {
             class: CfsTaskClass::Fifo,
             nice: 0,
             rt_priority: 10,
-            reset_on_fork: false,
         }));
         scheduler.add_task(fair.clone());
         scheduler.add_task(rt.clone());
@@ -120,7 +137,6 @@ mod cfs_rt {
             class: CfsTaskClass::Fifo,
             nice: 0,
             rt_priority: 50,
-            reset_on_fork: false,
         }));
 
         scheduler.add_task(fair.clone());
@@ -140,13 +156,11 @@ mod cfs_rt {
             class: CfsTaskClass::Fifo,
             nice: 0,
             rt_priority: 10,
-            reset_on_fork: false,
         }));
         assert!(high.configure(CfsTaskParams {
             class: CfsTaskClass::Fifo,
             nice: 0,
             rt_priority: 20,
-            reset_on_fork: false,
         }));
         scheduler.add_task(low);
         scheduler.add_task(high);
@@ -165,7 +179,6 @@ mod cfs_rt {
                 class: CfsTaskClass::RoundRobin,
                 nice: 0,
                 rt_priority: 42,
-                reset_on_fork: false,
             }));
             scheduler.add_task(task.clone());
         }
@@ -191,7 +204,6 @@ mod cfs_rt {
                 class: CfsTaskClass::RoundRobin,
                 nice: 0,
                 rt_priority: 42,
-                reset_on_fork: false,
             }));
             scheduler.add_task(task.clone());
         }
@@ -220,8 +232,7 @@ mod cfs_rt {
             assert!(task.configure(CfsTaskParams {
                 class: CfsTaskClass::Fifo,
                 nice: 0,
-                rt_priority: 99,
-                reset_on_fork: false,
+                rt_priority: 200,
             }));
             scheduler.add_task(task.clone());
         }
@@ -231,7 +242,7 @@ mod cfs_rt {
         for _ in 0..(RR_TIMESLICE_TICKS * 2) {
             assert!(
                 !scheduler.task_tick(&first),
-                "SCHED_FIFO must not rotate same-priority peers on timer ticks",
+                "FIFO tasks must not rotate same-priority peers on timer ticks",
             );
         }
         scheduler.put_prev_task(first, true);
@@ -240,7 +251,7 @@ mod cfs_rt {
         assert_eq!(
             *next.inner(),
             1,
-            "a preempted SCHED_FIFO task keeps precedence over same-priority peers",
+            "a preempted FIFO task keeps precedence over same-priority peers",
         );
     }
 
@@ -252,8 +263,7 @@ mod cfs_rt {
         assert!(rt.configure(CfsTaskParams {
             class: CfsTaskClass::Fifo,
             nice: 0,
-            rt_priority: 99,
-            reset_on_fork: false,
+            rt_priority: 200,
         }));
         scheduler.add_task(fair);
         scheduler.add_task(rt);
@@ -263,7 +273,7 @@ mod cfs_rt {
         for _ in 0..(RR_TIMESLICE_TICKS * 2) {
             assert!(
                 !scheduler.task_tick(&running),
-                "SCHED_FIFO must not be time-slice preempted for fair work",
+                "FIFO tasks must not be time-slice preempted for fair work",
             );
         }
         scheduler.put_prev_task(running, true);
@@ -286,8 +296,7 @@ mod cfs_rt {
             assert!(task.configure(CfsTaskParams {
                 class: CfsTaskClass::Fifo,
                 nice: 0,
-                rt_priority: 99,
-                reset_on_fork: false,
+                rt_priority: 200,
             }));
             scheduler.add_task(task.clone());
         }
@@ -304,7 +313,7 @@ mod cfs_rt {
         assert_eq!(
             *next.inner(),
             2,
-            "same-priority SCHED_FIFO peers and fair tasks wait until the running FIFO task \
+            "same-priority FIFO peers and fair tasks wait until the running FIFO task \
              blocks, yields, exits, or is preempted by higher priority RT",
         );
     }
@@ -317,8 +326,7 @@ mod cfs_rt {
         assert!(rt.configure(CfsTaskParams {
             class: CfsTaskClass::Fifo,
             nice: 0,
-            rt_priority: 99,
-            reset_on_fork: false,
+            rt_priority: 200,
         }));
         scheduler.add_task(rt);
 
@@ -331,15 +339,61 @@ mod cfs_rt {
         let next_rt = scheduler.pick_next_task().unwrap();
         assert_eq!(*next_rt.inner(), 2);
     }
+
+    #[test]
+    fn full_nonzero_u8_realtime_priority_domain_is_supported() {
+        let mut scheduler = CFScheduler::<usize>::new();
+        let maximum = Arc::new(CFSTask::new(1));
+        let lower = Arc::new(CFSTask::new(2));
+
+        assert!(maximum.configure(CfsTaskParams {
+            class: CfsTaskClass::Fifo,
+            nice: 0,
+            rt_priority: u8::MAX,
+        }));
+        assert!(lower.configure(CfsTaskParams {
+            class: CfsTaskClass::Fifo,
+            nice: 0,
+            rt_priority: u8::MAX - 1,
+        }));
+        scheduler.add_task(lower);
+        scheduler.add_task(maximum);
+
+        assert_eq!(*scheduler.pick_next_task().unwrap().inner(), 1);
+    }
+
+    #[test]
+    fn rejected_zero_realtime_priority_preserves_ready_task_state() {
+        let mut scheduler = CFScheduler::<usize>::new();
+        let task = Arc::new(CFSTask::new(1));
+        let original = CfsTaskParams {
+            class: CfsTaskClass::Fifo,
+            nice: 0,
+            rt_priority: 42,
+        };
+        assert!(task.configure(original));
+        scheduler.add_task(task.clone());
+
+        assert!(!task.configure(CfsTaskParams {
+            class: CfsTaskClass::RoundRobin,
+            nice: 0,
+            rt_priority: 0,
+        }));
+        assert_eq!(task.sched_params(), original);
+
+        let selected = scheduler.pick_next_task().unwrap();
+        assert!(Arc::ptr_eq(&selected, &task));
+        assert_eq!(selected.sched_params(), original);
+    }
 }
 
-mod cfs_fork {
+mod cfs_child_spawn {
     use alloc::sync::Arc;
 
     use crate::*;
 
     #[test]
-    fn forked_fair_task_does_not_immediately_preempt_parent() {
+    fn new_fair_child_does_not_immediately_preempt_parent() {
         let mut scheduler = CFScheduler::<usize>::new();
         let parent = Arc::new(CFSTask::new(1));
 
@@ -357,12 +411,12 @@ mod cfs_fork {
 
         assert!(
             !scheduler.task_tick(&running),
-            "forked child should inherit the parent's vruntime instead of cutting to the floor",
+            "new child should inherit the parent's vruntime instead of cutting to the floor",
         );
     }
 
     #[test]
-    fn yielding_parent_lets_forked_child_run() {
+    fn yielding_parent_lets_new_child_run() {
         let mut scheduler = CFScheduler::<usize>::new();
         let parent = Arc::new(CFSTask::new(1));
 
@@ -380,7 +434,7 @@ mod cfs_fork {
         assert_eq!(
             *next.inner(),
             2,
-            "a yielding parent should let its freshly forked child run first",
+            "a yielding parent should let its new child run first",
         );
     }
 
@@ -444,7 +498,7 @@ mod cfs_intrusive_membership {
         // must not mutate a key already embedded in the intrusive tree.
         assert!(task.configure(CfsTaskParams {
             class: CfsTaskClass::Fifo,
-            rt_priority: 99,
+            rt_priority: 200,
             ..Default::default()
         }));
         let removed = scheduler.remove_task(&task).unwrap();

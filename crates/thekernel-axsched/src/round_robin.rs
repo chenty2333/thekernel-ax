@@ -98,7 +98,17 @@ impl<T, const S: usize> BaseScheduler for RRScheduler<T, S> {
     }
 
     fn remove_task(&mut self, task: &Self::SchedItem) -> Option<Self::SchedItem> {
-        unsafe { self.ready_queue.remove(task) }
+        let mut cursor = self.ready_queue.cursor_front_mut();
+        loop {
+            let matches = cursor
+                .current()
+                .is_some_and(|queued| core::ptr::eq(queued, Arc::as_ptr(task)));
+            if matches {
+                return cursor.remove_current();
+            }
+            cursor.current()?;
+            cursor.move_next();
+        }
     }
 
     fn pick_next_task(&mut self) -> Option<Self::SchedItem> {
