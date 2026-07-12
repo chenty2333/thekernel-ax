@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Rust ${{ matrix.toolchain }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [stable, 1.85.0]
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install "${{ matrix.toolchain }}" \
+            --profile minimal \
+            --component clippy \
+            --component rustfmt
+          rustup override set "${{ matrix.toolchain }}"
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Check registry-only dependency graph
+        run: python3 scripts/check_registry_dependencies.py
+      - name: Test workspace
+        run: cargo test --workspace --all-targets --locked
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test unpacked package artifacts
+        run: scripts/package-unpack.sh

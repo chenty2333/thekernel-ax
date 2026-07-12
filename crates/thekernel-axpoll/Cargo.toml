@@ -1,0 +1,38 @@
+[package]
+name = "thekernel-axpoll"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Mivik <mivikq@gmail.com>", "朝倉水希 <asakuramizu111@gmail.com>"]
+description = "Bounded I/O readiness registration and wakeup primitives"
+license = "GPL-3.0-or-later OR Apache-2.0 OR MulanPSL-2.0"
+repository = "https://github.com/chenty2333/thekernel-ax"
+documentation = "https://docs.rs/thekernel-axpoll"
+readme = "README.md"
+exclude = ["Cargo.toml.orig", ".cargo_vcs_info.json"]
+
+[lib]
+name = "axpoll"
+path = "src/lib.rs"
+
+[features]
+alloc = []
+default = ["alloc"]
+
+[dependencies]
+bitflags = { version = "2.10", default-features = false }
+kspin = "0.1"
+linux-raw-sys = { version = "0.12", default-features = false, features = [
+    "no_std",
+    "general",
+] }
+
+[dev-dependencies]
+futures = "0.3"
+tokio = { version = "1.37", features = [
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "sync",
+] }
+
