@@ -404,9 +404,19 @@ impl TaskIdAllocator {
     }
 
     fn allocate(&self) -> Result<TaskId, TaskCreateError> {
+        self.allocate_up_to(u64::MAX)
+    }
+
+    /// Allocates one monotonic identity no greater than `maximum`.
+    ///
+    /// A personality with a narrower public identity type can use this before
+    /// allocating any task-owned resources. Rejection does not advance the
+    /// generic allocator, while an unrestricted kernel-task allocation may
+    /// still consume identities above that personality's ceiling.
+    fn allocate_up_to(&self, maximum: u64) -> Result<TaskId, TaskCreateError> {
         self.0
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
-                (next != 0).then(|| next.checked_add(1).unwrap_or(0))
+                (next != 0 && next <= maximum).then(|| next.checked_add(1).unwrap_or(0))
             })
             .map(TaskId)
             .map_err(|_| TaskCreateError::IdentifierExhausted)
@@ -555,6 +565,10 @@ impl TaskId {
         TASK_IDS.allocate()
     }
 
+    fn try_new_up_to(maximum: u64) -> Result<Self, TaskCreateError> {
+        TASK_IDS.allocate_up_to(maximum)
+    }
+
     /// Convert the task ID to a `u64`.
     pub const fn as_u64(&self) -> u64 {
         self.0
@@ -600,12 +614,45 @@ impl TaskInner {
     where
         F: FnOnce() + Send + 'static,
     {
+        Self::try_new_with_identity(entry, name, stack_size, TaskId::try_new)
+    }
+
+    /// Fallibly creates an unpublished task whose generic identity must fit a
+    /// caller-owned finite identity domain.
+    ///
+    /// The ceiling is checked atomically against the shared monotonic allocator
+    /// before allocating a stack or boxing the entry closure. This lets an OS
+    /// personality reject identity exhaustion without truncation, rollback, or
+    /// a second task-ID allocator.
+    pub fn try_new_with_id_limit<F>(
+        entry: F,
+        name: String,
+        stack_size: usize,
+        maximum_id: u64,
+    ) -> Result<Self, TaskCreateError>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        Self::try_new_with_identity(entry, name, stack_size, || {
+            TaskId::try_new_up_to(maximum_id)
+        })
+    }
+
+    fn try_new_with_identity<F>(
+        entry: F,
+        name: String,
+        stack_size: usize,
+        allocate_id: impl FnOnce() -> Result<TaskId, TaskCreateError>,
+    ) -> Result<Self, TaskCreateError>
+    where
+        F: FnOnce() + Send + 'static,
+    {
         let stack_size = stack_size
             .checked_add(4095)
             .map(|size| size & !4095)
             .filter(|size| *size >= MIN_KERNEL_STACK_SIZE)
             .ok_or(TaskCreateError::InvalidStackSize)?;
-        let mut t = Self::new_common(TaskId::try_new()?, name);
+        let mut t = Self::new_common(allocate_id()?, name);
         debug!("new task id: {}", t.id.as_u64());
         let kstack = TaskStack::try_alloc(stack_size).map_err(|_| TaskCreateError::OutOfMemory)?;
         let entry = Box::try_new(entry).map_err(|_| TaskCreateError::OutOfMemory)?;
@@ -1590,6 +1637,49 @@ mod mechanism_tests {
             allocator.allocate(),
             Err(TaskCreateError::IdentifierExhausted)
         );
+    }
+
+    #[test]
+    fn bounded_task_identity_rejects_without_advancing_generic_space() {
+        let maximum = i32::MAX as u64;
+        let allocator = TaskIdAllocator::new(maximum);
+
+        assert_eq!(allocator.allocate_up_to(maximum).unwrap().as_u64(), maximum);
+        assert_eq!(
+            allocator.allocate_up_to(maximum),
+            Err(TaskCreateError::IdentifierExhausted)
+        );
+        assert_eq!(allocator.allocate().unwrap().as_u64(), maximum + 1);
+
+        let zero = TaskIdAllocator::new(0);
+        assert_eq!(
+            zero.allocate_up_to(maximum),
+            Err(TaskCreateError::IdentifierExhausted)
+        );
+    }
+
+    #[test]
+    fn bounded_task_rejection_drops_unpublished_entry_ownership() {
+        struct DropProbe(Arc<AtomicBool>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let captured = DropProbe(dropped.clone());
+        let allocator = TaskIdAllocator::new(i32::MAX as u64 + 1);
+        let result = TaskInner::try_new_with_identity(
+            move || drop(captured),
+            "linux-id-exhausted".into(),
+            MIN_KERNEL_STACK_SIZE,
+            || allocator.allocate_up_to(i32::MAX as u64),
+        );
+
+        assert!(matches!(result, Err(TaskCreateError::IdentifierExhausted)));
+        assert!(dropped.load(Ordering::Acquire));
     }
 
     #[test]
