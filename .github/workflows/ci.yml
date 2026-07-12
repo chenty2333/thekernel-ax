@@ -5,6 +5,12 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      axtask_registry_ready:
+        description: Run the real registry-only thekernel-axtask publish dry-run
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -85,4 +91,7 @@ jobs:
       - name: Test unpacked release artifacts
         env:
           CARGO_TOOLCHAIN: nightly-2025-05-20
-        run: scripts/package-unpack.sh
+          AXTASK_REGISTRY_READY: ${{ github.event_name == 'workflow_dispatch' && inputs.axtask_registry_ready && '1' || '0' }}
+        run: |
+          scripts/publish-dry-run.sh
+          scripts/package-unpack.sh

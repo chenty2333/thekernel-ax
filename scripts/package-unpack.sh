@@ -24,7 +24,7 @@ fi
 export CARGO_TARGET_DIR="$tmp/package-target"
 
 # axtask depends on the two sibling 0.1.0 packages, which intentionally do not
-# exist in the registry before the atomic first release. Nightly's workspace
+# exist in the registry before the coordinated first release. Nightly's workspace
 # packager assembles the exact release set; unpacked tests below replace its
 # staging verifier and patch only to those freshly produced artifacts.
 run_cargo -Z package-workspace package \
@@ -146,14 +146,22 @@ CARGO_TARGET_DIR="$tmp/test-target/axsched" \
     run_cargo test --manifest-path "$axsched/Cargo.toml" --all-targets --locked
 CARGO_TARGET_DIR="$tmp/test-target/axpoll" \
     run_cargo test --manifest-path "$axpoll/Cargo.toml" --all-targets --locked
+for target in riscv64gc-unknown-none-elf loongarch64-unknown-none; do
+    CARGO_TARGET_DIR="$tmp/test-target/axpoll-$target" \
+        run_cargo check \
+            --manifest-path "$axpoll/Cargo.toml" \
+            --locked \
+            --target "$target"
+done
 
 patches=(
     --config "patch.crates-io.thekernel-axsched.path=\"$axsched\""
     --config "patch.crates-io.thekernel-axpoll.path=\"$axpoll\""
 )
 
-# crates.io cannot serve the sibling 0.1.0 packages before their first atomic
-# publication. Create a pre-publication test lock in this temporary unpacked
+# crates.io cannot serve the sibling 0.1.0 packages before their coordinated
+# first release sequence.
+# Create a pre-publication test lock in this temporary unpacked
 # directory, replacing only those two checksum-verified archives with their
 # exact extracted paths. Every compile below remains `--locked`.
 package_lock="$tmp/axtask-package.lock"
@@ -206,6 +214,16 @@ CARGO_TARGET_DIR="$tmp/test-target/axtask" \
         --offline \
         --features "test multitask irq preempt smp sched-cfs" \
         "${patches[@]}"
+for target in riscv64gc-unknown-none-elf loongarch64-unknown-none; do
+    CARGO_TARGET_DIR="$tmp/test-target/axtask-$target" \
+        run_cargo check \
+            --manifest-path "$axtask/Cargo.toml" \
+            --locked \
+            --offline \
+            --target "$target" \
+            --features "multitask irq preempt smp sched-cfs task-ext" \
+            "${patches[@]}"
+done
 CARGO_TARGET_DIR="$tmp/test-target/axtask-minimal" \
     run_cargo check \
         --manifest-path "$axtask/Cargo.toml" \
@@ -214,5 +232,21 @@ CARGO_TARGET_DIR="$tmp/test-target/axtask-minimal" \
         --locked \
         --offline \
         "${patches[@]}"
+
+tls_log="$tmp/axtask-tls-rejection.log"
+if CARGO_TARGET_DIR="$tmp/test-target/axtask-tls" \
+    run_cargo check \
+        --manifest-path "$axtask/Cargo.toml" \
+        --lib \
+        --locked \
+        --offline \
+        --features tls \
+        "${patches[@]}" >"$tls_log" 2>&1; then
+    printf 'thekernel-axtask tls compatibility sentinel unexpectedly compiled\n' >&2
+    exit 1
+fi
+grep -Fq \
+    'thekernel-axtask 0.1.0 does not support TLS tasks: axhal must first expose fallible TLS allocation' \
+    "$tls_log"
 
 printf 'package-unpack: PASS (%s packages)\n' "${#packages[@]}"

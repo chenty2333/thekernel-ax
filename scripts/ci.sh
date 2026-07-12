@@ -43,5 +43,6 @@ for target in riscv64gc-unknown-none-elf loongarch64-unknown-none; do
         --features "$nightly_features"
 done
 
+CARGO_TOOLCHAIN=nightly-2025-05-20 scripts/publish-dry-run.sh
 CARGO_TOOLCHAIN=nightly-2025-05-20 scripts/package-unpack.sh
 printf 'workspace-ci: PASS\n'

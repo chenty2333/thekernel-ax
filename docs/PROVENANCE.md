@@ -41,7 +41,7 @@ checks that the preserved upstream files did not leak into the artifact.
 
 ## License texts
 
-Both upstream manifests declare:
+All three upstream manifests declare:
 
 `GPL-3.0-or-later OR Apache-2.0 OR MulanPSL-2.0`
 

@@ -22,6 +22,7 @@ Run with the repository's pinned MSRV and again with stable:
 cargo fmt --all -- --check
 python3 scripts/check_registry_dependencies.py
 scripts/ci.sh
+scripts/publish-dry-run.sh
 scripts/package-unpack.sh
 ```
 
@@ -33,21 +34,33 @@ cargo package --locked --list -p thekernel-axpoll
 cargo +nightly-2025-05-20 package --locked --list -p thekernel-axtask
 ```
 
-The unpack test is a release gate: it proves dependencies resolve from the
-registry and that the packaged source builds outside both this workspace and
-TheKernel's `[patch.crates-io]` environment.
+The unpack test is a release gate: leaf packages build directly from their
+normalized archives, while the first axtask release uses only the two sibling
+archives whose SHA-256 values match its generated release lock. It therefore
+proves packaged source builds outside both this workspace and TheKernel's patch
+table, but it is not described as a registry-only axtask check before those two
+leaf versions exist.
 
 ## Publish
 
-1. Run `cargo publish --locked --dry-run -p <package>`.
-2. Publish `thekernel-axsched` and `thekernel-axpoll` before the dependent
-   `thekernel-axtask`, all from the same verified commit.
-3. Publish only after the dry run and CI pass for the exact release commit.
-4. Create an exact-commit repository tag `v0.1.0`; its release record lists all
+1. Run `scripts/publish-dry-run.sh`. It performs real Cargo publish dry-runs for
+   the two leaf packages.
+2. For the first release, crates.io cannot resolve `thekernel-axtask` until the
+   two sibling `0.1.0` packages exist. Before that point,
+   `scripts/package-unpack.sh` is the checksum-bound substitute: it verifies the
+   exact sibling archives and tests the unpacked axtask artifact without a
+   workspace patch leak. This limitation is reported explicitly rather than
+   calling the dependent dry-run successful.
+3. Publish `thekernel-axsched` and `thekernel-axpoll` from the same verified
+   commit, wait until both are visible in the registry index, then run
+   `AXTASK_REGISTRY_READY=1 scripts/publish-dry-run.sh` and publish
+   `thekernel-axtask` only if that final real dry-run passes.
+4. Publish only after the dry run and CI pass for the exact release commit.
+5. Create an exact-commit repository tag `v0.1.0`; its release record lists all
    three package checksums.
-5. Attach release notes that summarize the maintained delta and any public API
+6. Attach release notes that summarize the maintained delta and any public API
    migration.
-6. Verify the registry checksum and docs.rs build after publication.
+7. Verify the registry checksum and docs.rs build after publication.
 
 Publishing and pushing tags are deliberate maintainer actions; local release
 preparation does not imply authorization to perform either action.
