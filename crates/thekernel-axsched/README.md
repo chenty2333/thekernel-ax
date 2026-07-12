@@ -68,17 +68,43 @@ the caller, while dropping a scheduler drains its queue and releases surviving
 task references. Queue operations return typed errors instead of silently
 ignoring a foreign link.
 
+Every CFS enqueue claims that owner before it snapshots class/nice/real-time
+priority or changes vruntime, child-seed state, or an RR time slice. Duplicate,
+foreign, and sequence-exhausted submissions therefore leave all task state
+unchanged. The claimed parameter tuple is used for the complete enqueue, so a
+concurrent configuration cannot classify one task with two parameter epochs.
+
 `CFSTask::configure` only updates an unqueued/running task and uses a short
 configuration claim so an enqueue cannot race the parameter transaction. A
 ready task is updated with `CFScheduler::set_task_params`, which removes,
 reconfigures, and reinserts it under the scheduler's exclusive borrow without
-mutating an intrusive-tree key in place. Configuration, fair-child vruntime
-seeding, and runtime priority updates return `SchedulerError`; unsupported
-schedulers, invalid values, incompatible classes, busy tasks, and foreign
-queues are therefore distinguishable.
+mutating an intrusive-tree key in place. If target ordering admission fails,
+the transaction restores the exact old parameter tuple, vruntime, seed, RR
+slice, ready key, owner, and scheduler floor without allocating or requesting a
+second sequence. Configuration, fair-child vruntime seeding, and runtime
+priority updates return `SchedulerError`; unsupported schedulers, invalid
+values, incompatible classes, busy tasks, and foreign queues are therefore
+distinguishable.
 
-Round-robin counters use saturating unsigned arithmetic. A zero const time
-slice is representable but every enqueue rejects it with
+Class, nice value, and real-time priority are published in one atomic snapshot.
+One `sched_params()` read therefore cannot observe a torn combination such as a
+new real-time class with the previous class's zero priority. Scheduler
+operations additionally claim or serialize task ownership before using that
+snapshot to modify class-specific state.
+
+`CFScheduler::reserve_new_task` claims one unpublished task and a unique
+scheduler-local ordering sequence before a caller commits external lifecycle
+state. Dropping or explicitly cancelling the token returns task ownership
+without publication. `commit_reserved_task` is safe and allocation-free for the
+owning scheduler; a wrong scheduler or inconsistent private owner returns
+`CfsReservationCommitError`, which retains the complete token for retry or
+cancellation.
+
+The const-generic `RRScheduler` counters use saturating unsigned arithmetic. A
+zero const time slice is representable but every enqueue rejects it with
 `InvalidTimeSlice`; `usize::MAX` is valid and cannot truncate through a signed
-counter. CFS fair and real-time tie-break sequences are rebased
-allocation-free before exhaustion while preserving ready order.
+counter. CFS fair, real-time-front, and real-time-back tie-break sequences are
+strictly monotonic and never wrapped, rebased, or reused. Cancellation may leave
+a harmless gap. Once a direction reaches its finite `isize` domain, new
+admission returns `SequenceExhausted` without mutation, while reservations that
+already own earlier sequences remain committable.

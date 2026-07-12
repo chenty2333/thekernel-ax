@@ -13,8 +13,8 @@ extern crate alloc;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub use cfs::{
-    CFSTask, CFScheduler, CfsTaskClass, CfsTaskParams, RR_TIMESLICE_TICKS, RT_PRIORITY_MAX,
-    RT_PRIORITY_MIN,
+    CFSTask, CFScheduler, CfsReservationCommitError, CfsTaskClass, CfsTaskParams,
+    CfsTaskReservation, RR_TIMESLICE_TICKS, RT_PRIORITY_MAX, RT_PRIORITY_MIN,
 };
 pub use fifo::{FifoScheduler, FifoTask};
 pub use round_robin::{RRScheduler, RRTask};
@@ -42,7 +42,10 @@ pub enum SchedulerError {
     ForeignQueue,
     /// The global scheduler-instance identifier space was exhausted.
     IdentifierExhausted,
-    /// A scheduler-local ordering sequence was exhausted.
+    /// A monotonic scheduler-local ordering sequence was exhausted.
+    ///
+    /// Ordering identities never wrap or get reused; a reservation issued
+    /// before exhaustion remains valid and committable.
     SequenceExhausted,
     /// A task is undergoing an atomic configuration transaction.
     TaskBusy,

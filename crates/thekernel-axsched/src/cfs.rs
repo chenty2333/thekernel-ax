@@ -1,7 +1,8 @@
 use alloc::sync::Arc;
 use core::{
+    fmt,
     ops::Deref,
-    sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU8, AtomicUsize, Ordering},
 };
 
 use intrusive_collections::{intrusive_adapter, Bound, KeyAdapter, RBTree, RBTreeAtomicLink};
@@ -20,6 +21,7 @@ pub const RT_PRIORITY_MIN: u8 = 1;
 /// validates its own userspace range instead of changing this mechanism limit.
 pub const RT_PRIORITY_MAX: u8 = u8::MAX;
 const FAIR_PREEMPT_GRANULARITY_TICKS: isize = 2;
+type ReadyKey = (u8, isize, isize);
 
 /// Runtime scheduling class for CFS tasks.
 #[repr(u8)]
@@ -83,6 +85,31 @@ impl CfsTaskParams {
         };
         valid.then_some(self)
     }
+
+    const fn packed(self) -> u32 {
+        (self.class as u32) | ((self.nice as u8 as u32) << 8) | ((self.rt_priority as u32) << 16)
+    }
+
+    fn from_packed(value: u32) -> Self {
+        let class = match value as u8 {
+            0 => CfsTaskClass::Normal,
+            1 => CfsTaskClass::Batch,
+            2 => CfsTaskClass::Idle,
+            3 => CfsTaskClass::RoundRobin,
+            4 => CfsTaskClass::Fifo,
+            // The word is private and every writer stores a validated class.
+            // Contain a hardware/memory fault without indexing outside the
+            // weight tables; safe callers cannot manufacture this value.
+            _ => CfsTaskClass::Normal,
+        };
+        Self {
+            class,
+            nice: ((value >> 8) as u8) as i8,
+            rt_priority: (value >> 16) as u8,
+        }
+        .validated()
+        .unwrap_or_default()
+    }
 }
 
 /// task for CFS
@@ -100,12 +127,35 @@ pub struct CFSTask<T> {
     init_vruntime: AtomicIsize,
     delta: AtomicIsize,
     seeded_vruntime: AtomicBool,
-    nice: AtomicIsize,
-    class: AtomicU8,
-    rt_priority: AtomicU8,
+    /// One atomic publication word for the class, nice value, and real-time
+    /// priority. Readers must never observe a new class paired with an old
+    /// class-specific priority during a concurrent safe configuration.
+    params: AtomicU32,
     rr_time_slice: AtomicIsize,
     id: AtomicIsize,
     queue_owner: AtomicUsize,
+}
+
+/// Short unqueued-task configuration transaction.
+struct CfsConfigurationClaim<'a, T> {
+    task: &'a CFSTask<T>,
+    active: bool,
+}
+
+impl<T> CfsConfigurationClaim<'_, T> {
+    fn finish(mut self) -> Result<(), SchedulerError> {
+        self.task.transfer_owner(CONFIGURING, UNOWNED)?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl<T> Drop for CfsConfigurationClaim<'_, T> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.task.transfer_owner(CONFIGURING, UNOWNED);
+        }
+    }
 }
 
 // https://elixir.bootlin.com/linux/latest/source/include/linux/sched/prio.h
@@ -133,9 +183,14 @@ impl<T> CFSTask<T> {
             init_vruntime: AtomicIsize::new(0_isize),
             delta: AtomicIsize::new(0_isize),
             seeded_vruntime: AtomicBool::new(false),
-            nice: AtomicIsize::new(0_isize),
-            class: AtomicU8::new(CfsTaskClass::Normal as u8),
-            rt_priority: AtomicU8::new(0),
+            params: AtomicU32::new(
+                CfsTaskParams {
+                    class: CfsTaskClass::Normal,
+                    nice: 0,
+                    rt_priority: 0,
+                }
+                .packed(),
+            ),
             rr_time_slice: AtomicIsize::new(RR_TIMESLICE_TICKS as isize),
             id: AtomicIsize::new(0_isize),
             queue_owner: AtomicUsize::new(UNOWNED),
@@ -167,19 +222,20 @@ impl<T> CFSTask<T> {
         self.queue_owner.load(Ordering::Acquire)
     }
 
-    fn class(&self) -> CfsTaskClass {
-        match self.class.load(Ordering::Acquire) {
-            0 => CfsTaskClass::Normal,
-            1 => CfsTaskClass::Batch,
-            2 => CfsTaskClass::Idle,
-            3 => CfsTaskClass::RoundRobin,
-            4 => CfsTaskClass::Fifo,
-            _ => CfsTaskClass::Normal,
-        }
-    }
-
-    fn is_rt(&self) -> bool {
-        matches!(self.class(), CfsTaskClass::RoundRobin | CfsTaskClass::Fifo)
+    fn claim_configuration(&self) -> Result<CfsConfigurationClaim<'_, T>, SchedulerError> {
+        self.queue_owner
+            .compare_exchange(UNOWNED, CONFIGURING, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|owner| {
+                if owner == CONFIGURING {
+                    SchedulerError::TaskBusy
+                } else {
+                    SchedulerError::AlreadyQueued
+                }
+            })?;
+        Ok(CfsConfigurationClaim {
+            task: self,
+            active: true,
+        })
     }
 
     /// Consumes the scheduler wrapper and returns the inner task.
@@ -187,16 +243,16 @@ impl<T> CFSTask<T> {
         self.inner
     }
 
-    fn effective_nice(&self) -> isize {
-        match self.class() {
+    fn effective_nice(params: CfsTaskParams) -> isize {
+        match params.class {
             CfsTaskClass::Idle => NICE_RANGE_POS as isize,
-            CfsTaskClass::Normal | CfsTaskClass::Batch => self.nice.load(Ordering::Acquire),
+            CfsTaskClass::Normal | CfsTaskClass::Batch => params.nice as isize,
             CfsTaskClass::RoundRobin | CfsTaskClass::Fifo => 0,
         }
     }
 
-    fn get_weight(&self) -> isize {
-        let nice = self.effective_nice();
+    fn weight_for(params: CfsTaskParams) -> isize {
+        let nice = Self::effective_nice(params);
         if nice >= 0 {
             NICE2WEIGHT_POS[nice as usize]
         } else {
@@ -208,29 +264,22 @@ impl<T> CFSTask<T> {
         self.id.load(Ordering::Acquire)
     }
 
-    fn get_vruntime(&self) -> isize {
-        if self.get_weight() == 1024 {
+    fn get_vruntime_with(&self, params: CfsTaskParams) -> isize {
+        let weight = Self::weight_for(params);
+        if weight == 1024 {
             self.init_vruntime
                 .load(Ordering::Acquire)
                 .saturating_add(self.delta.load(Ordering::Acquire))
         } else {
-            self.init_vruntime.load(Ordering::Acquire).saturating_add(
-                self.delta.load(Ordering::Acquire).saturating_mul(1024) / self.get_weight(),
-            )
+            self.init_vruntime
+                .load(Ordering::Acquire)
+                .saturating_add(self.delta.load(Ordering::Acquire).saturating_mul(1024) / weight)
         }
     }
 
     fn rebase_vruntime(&self, v: isize) {
         self.init_vruntime.store(v, Ordering::Release);
         self.delta.store(0, Ordering::Release);
-    }
-
-    fn take_seeded_vruntime(&self) -> bool {
-        self.seeded_vruntime.swap(false, Ordering::AcqRel)
-    }
-
-    fn rt_priority(&self) -> u8 {
-        self.rt_priority.load(Ordering::Acquire)
     }
 
     fn rr_time_slice(&self) -> isize {
@@ -250,17 +299,16 @@ impl<T> CFSTask<T> {
             .unwrap_or(0)
     }
 
-    fn set_sched_params(&self, class: CfsTaskClass, nice: isize, rt_priority: u8) {
-        let current_vruntime = self.get_vruntime();
+    fn set_sched_params(&self, params: CfsTaskParams) {
+        let current = self.load_sched_params();
+        let current_vruntime = self.get_vruntime_with(current);
         self.rebase_vruntime(current_vruntime);
-        self.nice.store(nice, Ordering::Release);
-        self.class.store(class as u8, Ordering::Release);
-        self.rt_priority.store(rt_priority, Ordering::Release);
-        if matches!(class, CfsTaskClass::RoundRobin | CfsTaskClass::Fifo) {
+        if matches!(params.class, CfsTaskClass::RoundRobin | CfsTaskClass::Fifo) {
             self.reset_rr_time_slice();
         } else {
             self.rr_time_slice.store(0, Ordering::Release);
         }
+        self.params.store(params.packed(), Ordering::Release);
     }
 
     fn set_id(&self, id: isize) {
@@ -284,7 +332,7 @@ impl<T> CFSTask<T> {
         self.set_id(sequence);
     }
 
-    fn ready_key(&self) -> (u8, isize, isize) {
+    fn ready_key(&self) -> ReadyKey {
         (
             self.ready_class.load(Ordering::Acquire),
             self.ready_order.load(Ordering::Acquire),
@@ -303,11 +351,39 @@ impl<T> CFSTask<T> {
 
     /// Returns the current scheduling parameters.
     pub fn sched_params(&self) -> CfsTaskParams {
-        CfsTaskParams {
-            class: self.class(),
-            nice: self.effective_nice() as i8,
-            rt_priority: if self.is_rt() { self.rt_priority() } else { 0 },
+        self.load_sched_params()
+    }
+
+    fn load_sched_params(&self) -> CfsTaskParams {
+        CfsTaskParams::from_packed(self.params.load(Ordering::Acquire))
+    }
+
+    fn snapshot_reconfiguration_state(&self) -> CfsTaskStateSnapshot {
+        CfsTaskStateSnapshot {
+            params: self.load_sched_params(),
+            ready_key: self.ready_key(),
+            init_vruntime: self.init_vruntime.load(Ordering::Acquire),
+            delta: self.delta.load(Ordering::Acquire),
+            seeded_vruntime: self.seeded_vruntime.load(Ordering::Acquire),
+            rr_time_slice: self.rr_time_slice.load(Ordering::Acquire),
         }
+    }
+
+    fn restore_reconfiguration_state(&self, snapshot: CfsTaskStateSnapshot) {
+        self.init_vruntime
+            .store(snapshot.init_vruntime, Ordering::Release);
+        self.delta.store(snapshot.delta, Ordering::Release);
+        self.seeded_vruntime
+            .store(snapshot.seeded_vruntime, Ordering::Release);
+        self.rr_time_slice
+            .store(snapshot.rr_time_slice, Ordering::Release);
+        self.params
+            .store(snapshot.params.packed(), Ordering::Release);
+        self.stage_ready_key(
+            snapshot.ready_key.0,
+            snapshot.ready_key.1,
+            snapshot.ready_key.2,
+        );
     }
 
     /// Applies the given scheduling parameters to the task.
@@ -320,21 +396,30 @@ impl<T> CFSTask<T> {
         let params = params
             .validated()
             .ok_or(SchedulerError::InvalidParameters)?;
-        self.queue_owner
-            .compare_exchange(UNOWNED, CONFIGURING, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|owner| {
-                if owner == CONFIGURING {
-                    SchedulerError::TaskBusy
-                } else {
-                    SchedulerError::AlreadyQueued
-                }
-            })?;
+        let claim = self.claim_configuration()?;
         self.apply_validated(params);
-        self.transfer_owner(CONFIGURING, UNOWNED)
+        claim.finish()
     }
 
     fn apply_validated(&self, params: CfsTaskParams) {
-        self.set_sched_params(params.class, params.nice as isize, params.rt_priority);
+        self.set_sched_params(params);
+    }
+
+    fn configure_nice(&self, nice: i8) -> Result<(), SchedulerError> {
+        let claim = self.claim_configuration()?;
+        let current = self.load_sched_params();
+        if is_realtime(current) {
+            return Err(SchedulerError::IncompatibleClass);
+        }
+        let next = CfsTaskParams {
+            class: current.class,
+            nice,
+            rt_priority: 0,
+        }
+        .validated()
+        .expect("validated nice and fair class produce valid scheduler parameters");
+        self.apply_validated(next);
+        claim.finish()
     }
 
     /// Seeds a new fair child just behind its parent task.
@@ -342,26 +427,30 @@ impl<T> CFSTask<T> {
     /// This is a generic spawn-fairness mechanism. Whether a child inherits or
     /// resets scheduling policy is a lifecycle decision for the caller.
     pub fn inherit_fair_vruntime_from(&self, parent: &Self) -> Result<(), SchedulerError> {
-        if self.is_rt() || parent.is_rt() {
+        let claim = self.claim_configuration()?;
+        let child_params = self.load_sched_params();
+        let parent_params = parent.load_sched_params();
+        if is_realtime(child_params) || is_realtime(parent_params) {
             return Err(SchedulerError::IncompatibleClass);
         }
-        self.queue_owner
-            .compare_exchange(UNOWNED, CONFIGURING, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|owner| {
-                if owner == CONFIGURING {
-                    SchedulerError::TaskBusy
-                } else {
-                    SchedulerError::AlreadyQueued
-                }
-            })?;
         self.rebase_vruntime(
             parent
-                .get_vruntime()
+                .get_vruntime_with(parent_params)
                 .saturating_add(FAIR_PREEMPT_GRANULARITY_TICKS),
         );
         self.seeded_vruntime.store(true, Ordering::Release);
-        self.transfer_owner(CONFIGURING, UNOWNED)
+        claim.finish()
     }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct CfsTaskStateSnapshot {
+    params: CfsTaskParams,
+    ready_key: ReadyKey,
+    init_vruntime: isize,
+    delta: isize,
+    seeded_vruntime: bool,
+    rr_time_slice: isize,
 }
 
 impl<T> Deref for CFSTask<T> {
@@ -376,7 +465,7 @@ intrusive_adapter!(ReadyTaskAdapter<T> = Arc<CFSTask<T>>: CFSTask<T> {
 });
 
 impl<'a, T> KeyAdapter<'a> for ReadyTaskAdapter<T> {
-    type Key = (u8, isize, isize);
+    type Key = ReadyKey;
 
     fn get_key(&self, task: &'a CFSTask<T>) -> Self::Key {
         task.ready_key()
@@ -385,6 +474,10 @@ impl<'a, T> KeyAdapter<'a> for ReadyTaskAdapter<T> {
 
 fn rt_priority_key(priority: u8) -> isize {
     (RT_PRIORITY_MAX - priority) as isize
+}
+
+const fn is_realtime(params: CfsTaskParams) -> bool {
+    matches!(params.class, CfsTaskClass::RoundRobin | CfsTaskClass::Fifo)
 }
 
 /// A simple [Completely Fair Scheduler][1] (CFS).
@@ -400,6 +493,136 @@ pub struct CFScheduler<T> {
     fair_sequence: isize,
     rt_front_seq: isize,
     rt_back_seq: isize,
+}
+
+#[derive(Clone, Copy)]
+enum CfsEnqueueAction {
+    New,
+    Wakeup,
+    ExplicitYield,
+    Requeue { preempt: bool },
+}
+
+/// A queue-owner claim acquired before any enqueue-side task state changes.
+struct CfsEnqueueClaim<T> {
+    task: Option<Arc<CFSTask<T>>>,
+    scheduler_id: usize,
+}
+
+impl<T> CfsEnqueueClaim<T> {
+    fn task(&self) -> &Arc<CFSTask<T>> {
+        self.task
+            .as_ref()
+            .expect("live CFS enqueue claim always owns its task")
+    }
+
+    fn publish(mut self) -> Arc<CFSTask<T>> {
+        self.task
+            .take()
+            .expect("live CFS enqueue claim always owns its task")
+    }
+}
+
+impl<T> Drop for CfsEnqueueClaim<T> {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            let _ = task.transfer_owner(self.scheduler_id, UNOWNED);
+        }
+    }
+}
+
+/// One unpublished CFS ready-queue admission.
+///
+/// The reservation claims the task's private queue-ownership word and one
+/// scheduler-local ordering sequence while the destination scheduler is
+/// locked. It does not link the task into the ready tree. Dropping it releases
+/// the claim. Ordering sequences are monotonic and never reused, so this token
+/// remains unique even if later admissions exhaust their sequence domain.
+#[must_use = "dropping the reservation cancels runnable-task publication"]
+pub struct CfsTaskReservation<T> {
+    task: Option<Arc<CFSTask<T>>>,
+    scheduler_id: usize,
+    sequence: isize,
+    params: CfsTaskParams,
+}
+
+impl<T> CfsTaskReservation<T> {
+    /// Returns the exact unpublished task retained by this reservation.
+    pub fn task(&self) -> &Arc<CFSTask<T>> {
+        self.task
+            .as_ref()
+            .expect("live CFS reservation always owns its task")
+    }
+
+    /// Cancels this reservation and returns the exact unpublished task.
+    pub fn cancel(mut self) -> Arc<CFSTask<T>> {
+        let task = self
+            .task
+            .take()
+            .expect("live CFS reservation always owns its task");
+        task.transfer_owner(CONFIGURING, UNOWNED)
+            .expect("private CFS reservation ownership changed before cancellation");
+        task
+    }
+}
+
+impl<T> fmt::Debug for CfsTaskReservation<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CfsTaskReservation")
+            .field("scheduler_id", &self.scheduler_id)
+            .field("sequence", &self.sequence)
+            .field("params", &self.params)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T> Drop for CfsTaskReservation<T> {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            // A safe caller cannot change queue ownership while CONFIGURING is
+            // held. If unsafe code corrupted it, retain the foreign owner
+            // rather than overwriting scheduler state during cancellation.
+            let _ = task.transfer_owner(CONFIGURING, UNOWNED);
+        }
+    }
+}
+
+/// Failed commit of a CFS task reservation.
+///
+/// The error retains the complete unpublished reservation, so the caller may
+/// retry it with the owning scheduler or cancel it without losing task
+/// ownership.
+pub struct CfsReservationCommitError<T> {
+    kind: SchedulerError,
+    reservation: CfsTaskReservation<T>,
+}
+
+impl<T> CfsReservationCommitError<T> {
+    /// Returns the precise scheduler failure.
+    pub const fn kind(&self) -> SchedulerError {
+        self.kind
+    }
+
+    /// Returns the still-live unpublished reservation.
+    pub const fn reservation(&self) -> &CfsTaskReservation<T> {
+        &self.reservation
+    }
+
+    /// Recovers the still-live unpublished reservation.
+    pub fn into_reservation(self) -> CfsTaskReservation<T> {
+        self.reservation
+    }
+}
+
+impl<T> fmt::Debug for CfsReservationCommitError<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CfsReservationCommitError")
+            .field("kind", &self.kind)
+            .field("reservation", &self.reservation)
+            .finish()
+    }
 }
 
 impl<T> CFScheduler<T> {
@@ -432,9 +655,6 @@ impl<T> CFScheduler<T> {
     }
 
     fn next_fair_sequence(&mut self) -> Result<isize, SchedulerError> {
-        if self.fair_sequence == isize::MAX {
-            self.rebase_sequences()?;
-        }
         let sequence = self.fair_sequence;
         self.fair_sequence = self
             .fair_sequence
@@ -466,33 +686,21 @@ impl<T> CFScheduler<T> {
         };
     }
 
-    fn insert_task(&mut self, task: Arc<CFSTask<T>>) -> Result<(), SchedulerError> {
-        if task.is_rt() {
-            self.insert_rt_task(task, false)
-        } else {
-            self.insert_fair_task(task)
-        }
-    }
-
-    fn insert_fair_task(&mut self, task: Arc<CFSTask<T>>) -> Result<(), SchedulerError> {
+    fn claim_enqueue_task(
+        &mut self,
+        task: Arc<CFSTask<T>>,
+    ) -> Result<CfsEnqueueClaim<T>, SchedulerError> {
         let scheduler_id = self.ensure_id()?;
         task.claim(scheduler_id)?;
-        let sequence = match self.next_fair_sequence() {
-            Ok(sequence) => sequence,
-            Err(error) => {
-                task.transfer_owner(scheduler_id, UNOWNED)?;
-                return Err(error);
-            }
-        };
-        task.stage_ready_key(1, task.get_vruntime(), sequence);
-        self.ready_queue.insert(task);
-        self.refresh_min_vruntime(None);
-        Ok(())
+        Ok(CfsEnqueueClaim {
+            task: Some(task),
+            scheduler_id,
+        })
     }
 
-    fn wakeup_floor(&self, task: &CFSTask<T>) -> isize {
+    fn wakeup_floor(&self, params: CfsTaskParams) -> isize {
         let floor = self.queue_floor();
-        match task.class() {
+        match params.class {
             // Keep freshly woken fair tasks slightly behind the current floor
             // so a wakeup burst does not immediately displace the task that is
             // doing the wakeup-side follow-up work.
@@ -504,10 +712,6 @@ impl<T> CFScheduler<T> {
     }
 
     fn next_rt_seq(&mut self, front: bool) -> Result<isize, SchedulerError> {
-        if (front && self.rt_front_seq == isize::MIN) || (!front && self.rt_back_seq == isize::MAX)
-        {
-            self.rebase_sequences()?;
-        }
         if front {
             self.rt_front_seq = self
                 .rt_front_seq
@@ -524,76 +728,219 @@ impl<T> CFScheduler<T> {
         }
     }
 
-    fn rebase_sequences(&mut self) -> Result<(), SchedulerError> {
-        let fair_count = self
-            .ready_queue
-            .iter()
-            .filter(|task| !task.ready_is_rt())
-            .count();
-        let rt_count = self
-            .ready_queue
-            .iter()
-            .filter(|task| task.ready_is_rt())
-            .count();
-        if fair_count > isize::MAX as usize || rt_count > isize::MAX as usize {
-            return Err(SchedulerError::SequenceExhausted);
+    fn enqueue_with_action(
+        &mut self,
+        task: Arc<CFSTask<T>>,
+        action: CfsEnqueueAction,
+    ) -> Result<(), SchedulerError> {
+        let claim = self.claim_enqueue_task(task)?;
+        let params = claim.task().sched_params();
+
+        if is_realtime(params) {
+            let (front, reset_rr) = match params.class {
+                CfsTaskClass::Fifo => (
+                    matches!(action, CfsEnqueueAction::Requeue { preempt: true }),
+                    false,
+                ),
+                CfsTaskClass::RoundRobin => match action {
+                    CfsEnqueueAction::Requeue { preempt: true }
+                        if claim.task().rr_time_slice() > 0 =>
+                    {
+                        (true, false)
+                    }
+                    CfsEnqueueAction::New
+                    | CfsEnqueueAction::Wakeup
+                    | CfsEnqueueAction::ExplicitYield
+                    | CfsEnqueueAction::Requeue { .. } => (false, true),
+                },
+                CfsTaskClass::Normal | CfsTaskClass::Batch | CfsTaskClass::Idle => {
+                    unreachable!("realtime snapshot has a fair class")
+                }
+            };
+            let sequence = self.next_rt_seq(front)?;
+            if reset_rr {
+                claim.task().reset_rr_time_slice();
+            }
+            claim
+                .task()
+                .stage_ready_key(0, rt_priority_key(params.rt_priority), sequence);
+            self.ready_queue.insert(claim.publish());
+            return Ok(());
         }
 
-        let mut rebuilt = RBTree::new(ReadyTaskAdapter::new());
-        let mut fair_sequence = 0isize;
-        let mut rt_sequence = 0isize;
-        while let Some(task) = self.ready_queue.front_mut().remove() {
-            let (class, order, _) = task.ready_key();
-            let sequence = if task.ready_is_rt() {
-                let sequence = rt_sequence;
-                rt_sequence += 1;
-                sequence
-            } else {
-                let sequence = fair_sequence;
-                fair_sequence += 1;
-                sequence
-            };
-            task.stage_ready_key(class, order, sequence);
-            rebuilt.insert(task);
+        let sequence = self.next_fair_sequence()?;
+        let vruntime = match action {
+            CfsEnqueueAction::New => {
+                if claim.task().seeded_vruntime.load(Ordering::Acquire) {
+                    claim
+                        .task()
+                        .get_vruntime_with(params)
+                        .max(self.queue_floor())
+                } else {
+                    self.queue_floor()
+                }
+            }
+            CfsEnqueueAction::Wakeup => claim
+                .task()
+                .get_vruntime_with(params)
+                .max(self.wakeup_floor(params)),
+            CfsEnqueueAction::ExplicitYield => {
+                let floor = self
+                    .min_ready_vruntime()
+                    .unwrap_or_else(|| self.queue_floor())
+                    .saturating_add(FAIR_PREEMPT_GRANULARITY_TICKS);
+                claim.task().get_vruntime_with(params).max(floor)
+            }
+            CfsEnqueueAction::Requeue { .. } => claim.task().get_vruntime_with(params),
+        };
+        if matches!(action, CfsEnqueueAction::New) {
+            claim.task().seeded_vruntime.store(false, Ordering::Release);
         }
-        self.ready_queue = rebuilt;
-        self.fair_sequence = fair_sequence;
-        self.rt_front_seq = 0;
-        self.rt_back_seq = rt_sequence;
+        claim.task().rebase_vruntime(vruntime);
+        claim.task().stage_ready_key(1, vruntime, sequence);
+        self.ready_queue.insert(claim.publish());
+        self.refresh_min_vruntime(None);
         Ok(())
     }
 
-    fn insert_rt_task(&mut self, task: Arc<CFSTask<T>>, front: bool) -> Result<(), SchedulerError> {
+    /// Reserves publication of one brand-new task without making it runnable.
+    ///
+    /// All fallible scheduler identity, ownership, and ordering work completes
+    /// here. Configuration is excluded until the returned token is committed
+    /// or dropped. Sequence numbers may contain cancellation gaps, but they are
+    /// never wrapped, rebased, or reused; exhaustion is reported explicitly.
+    pub fn reserve_new_task(
+        &mut self,
+        task: &Arc<CFSTask<T>>,
+    ) -> Result<CfsTaskReservation<T>, SchedulerError> {
         let scheduler_id = self.ensure_id()?;
-        task.claim(scheduler_id)?;
-        let seq = match self.next_rt_seq(front) {
+        task.queue_owner
+            .compare_exchange(UNOWNED, CONFIGURING, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|owner| {
+                if owner == CONFIGURING {
+                    SchedulerError::TaskBusy
+                } else if owner == scheduler_id {
+                    SchedulerError::AlreadyQueued
+                } else {
+                    SchedulerError::ForeignQueue
+                }
+            })?;
+
+        let params = task.sched_params();
+        let sequence = if is_realtime(params) {
+            self.next_rt_seq(false)
+        } else {
+            self.next_fair_sequence()
+        };
+        let sequence = match sequence {
             Ok(sequence) => sequence,
             Err(error) => {
-                task.transfer_owner(scheduler_id, UNOWNED)?;
+                let _ = task.transfer_owner(CONFIGURING, UNOWNED);
                 return Err(error);
             }
         };
-        task.stage_ready_key(0, rt_priority_key(task.rt_priority()), seq);
-        self.ready_queue.insert(task);
-        Ok(())
+
+        Ok(CfsTaskReservation {
+            task: Some(Arc::clone(task)),
+            scheduler_id,
+            sequence,
+            params,
+        })
     }
 
-    fn reinsert_reconfigured(&mut self, task: Arc<CFSTask<T>>) -> Result<(), SchedulerError> {
+    /// Commits a reservation created by this exact scheduler instance.
+    ///
+    /// A correct-scheduler commit only writes pre-reserved task metadata and
+    /// links an intrusive node; it cannot allocate or exhaust ordering space.
+    /// Passing a token from another scheduler, or detecting inconsistent
+    /// private ownership, returns a typed owner-retaining error.
+    pub fn commit_reserved_task(
+        &mut self,
+        mut reservation: CfsTaskReservation<T>,
+    ) -> Result<Arc<CFSTask<T>>, CfsReservationCommitError<T>> {
+        if reservation.scheduler_id != self.id {
+            return Err(CfsReservationCommitError {
+                kind: SchedulerError::ForeignQueue,
+                reservation,
+            });
+        }
+        let task = Arc::clone(reservation.task());
+        if task.owner() != CONFIGURING || task.sched_params() != reservation.params {
+            return Err(CfsReservationCommitError {
+                kind: SchedulerError::InconsistentState,
+                reservation,
+            });
+        }
+        if task.transfer_owner(CONFIGURING, self.id).is_err() {
+            return Err(CfsReservationCommitError {
+                kind: SchedulerError::InconsistentState,
+                reservation,
+            });
+        }
+
+        let params = reservation.params;
+        if is_realtime(params) {
+            if matches!(params.class, CfsTaskClass::RoundRobin) {
+                task.reset_rr_time_slice();
+            }
+            task.stage_ready_key(0, rt_priority_key(params.rt_priority), reservation.sequence);
+        } else {
+            let vruntime = if task.seeded_vruntime.load(Ordering::Acquire) {
+                task.get_vruntime_with(params).max(self.queue_floor())
+            } else {
+                self.queue_floor()
+            };
+            task.seeded_vruntime.store(false, Ordering::Release);
+            task.rebase_vruntime(vruntime);
+            task.stage_ready_key(1, vruntime, reservation.sequence);
+        }
+
+        let task = reservation
+            .task
+            .take()
+            .expect("live CFS reservation always owns its task");
+        self.ready_queue.insert(Arc::clone(&task));
+        if !is_realtime(params) {
+            self.refresh_min_vruntime(None);
+        }
+        Ok(task)
+    }
+
+    fn reinsert_reconfigured(
+        &mut self,
+        task: Arc<CFSTask<T>>,
+        params: CfsTaskParams,
+    ) -> Result<(), SchedulerError> {
         let scheduler_id = self.ensure_id()?;
-        let sequence = if task.is_rt() {
+        let sequence = if is_realtime(params) {
             self.next_rt_seq(false)?
         } else {
             self.next_fair_sequence()?
         };
-        if task.is_rt() {
-            task.stage_ready_key(0, rt_priority_key(task.rt_priority()), sequence);
+        if is_realtime(params) {
+            task.stage_ready_key(0, rt_priority_key(params.rt_priority), sequence);
         } else {
-            task.stage_ready_key(1, task.get_vruntime(), sequence);
+            task.stage_ready_key(1, task.get_vruntime_with(params), sequence);
         }
         task.transfer_owner(CONFIGURING, scheduler_id)?;
         self.ready_queue.insert(task);
-        self.refresh_min_vruntime(None);
+        if !is_realtime(params) {
+            self.refresh_min_vruntime(None);
+        }
         Ok(())
+    }
+
+    fn restore_reconfigured(
+        &mut self,
+        task: Arc<CFSTask<T>>,
+        snapshot: CfsTaskStateSnapshot,
+        min_vruntime: Option<isize>,
+    ) {
+        task.restore_reconfiguration_state(snapshot);
+        task.transfer_owner(CONFIGURING, self.id)
+            .expect("private CFS reconfiguration ownership changed before rollback");
+        self.ready_queue.insert(task);
+        self.min_vruntime = min_vruntime;
     }
 
     fn has_ready_rt_with_higher_priority(&self, current_priority: u8) -> bool {
@@ -632,17 +979,16 @@ impl<T> CFScheduler<T> {
             CONFIGURING => Err(SchedulerError::TaskBusy),
             owner if owner != self.id || self.id == UNOWNED => Err(SchedulerError::ForeignQueue),
             _ => {
-                let previous = task.sched_params();
+                let previous = task.snapshot_reconfiguration_state();
+                let previous_min_vruntime = self.min_vruntime;
                 let queued = self
                     .remove_owned_task(task, CONFIGURING)?
                     .ok_or(SchedulerError::InconsistentState)?;
                 queued.apply_validated(params);
-                match self.reinsert_reconfigured(queued.clone()) {
+                match self.reinsert_reconfigured(queued.clone(), params) {
                     Ok(()) => Ok(()),
                     Err(error) => {
-                        queued.apply_validated(previous);
-                        self.reinsert_reconfigured(queued)
-                            .map_err(|_| SchedulerError::InconsistentState)?;
+                        self.restore_reconfigured(queued, previous, previous_min_vruntime);
                         Err(error)
                     }
                 }
@@ -692,20 +1038,7 @@ impl<T> BaseScheduler for CFScheduler<T> {
     fn init(&mut self) {}
 
     fn add_task(&mut self, task: Self::SchedItem) -> Result<(), SchedulerError> {
-        if task.is_rt() {
-            if matches!(task.class(), CfsTaskClass::RoundRobin) {
-                task.reset_rr_time_slice();
-            }
-            self.insert_rt_task(task, false)
-        } else {
-            let vruntime = if task.take_seeded_vruntime() {
-                task.get_vruntime().max(self.queue_floor())
-            } else {
-                self.queue_floor()
-            };
-            task.rebase_vruntime(vruntime);
-            self.insert_task(task)
-        }
+        self.enqueue_with_action(task, CfsEnqueueAction::New)
     }
 
     fn remove_task(
@@ -736,26 +1069,7 @@ impl<T> BaseScheduler for CFScheduler<T> {
         prev: Self::SchedItem,
         preempt: bool,
     ) -> Result<(), SchedulerError> {
-        match prev.class() {
-            CfsTaskClass::Fifo => {
-                if preempt {
-                    self.insert_rt_task(prev, true)
-                } else {
-                    self.insert_rt_task(prev, false)
-                }
-            }
-            CfsTaskClass::RoundRobin => {
-                if preempt && prev.rr_time_slice() > 0 {
-                    self.insert_rt_task(prev, true)
-                } else {
-                    prev.reset_rr_time_slice();
-                    self.insert_rt_task(prev, false)
-                }
-            }
-            CfsTaskClass::Normal | CfsTaskClass::Batch | CfsTaskClass::Idle => {
-                self.insert_fair_task(prev)
-            }
-        }
+        self.enqueue_with_action(prev, CfsEnqueueAction::Requeue { preempt })
     }
 
     fn enqueue_task(
@@ -763,52 +1077,27 @@ impl<T> BaseScheduler for CFScheduler<T> {
         task: Self::SchedItem,
         reason: EnqueueReason,
     ) -> Result<(), SchedulerError> {
-        if task.is_rt() {
-            return match reason {
-                EnqueueReason::New | EnqueueReason::Wakeup => {
-                    if matches!(task.class(), CfsTaskClass::RoundRobin) {
-                        task.reset_rr_time_slice();
-                    }
-                    self.insert_rt_task(task, false)
-                }
-                EnqueueReason::Yield => self.put_prev_task(task, false),
-                EnqueueReason::Preempt => self.put_prev_task(task, true),
-            };
-        }
-
-        match reason {
-            EnqueueReason::New => self.add_task(task),
-            EnqueueReason::Wakeup => {
-                let floor = self.wakeup_floor(&task);
-                let vruntime = task.get_vruntime().max(floor);
-                task.rebase_vruntime(vruntime);
-                self.insert_fair_task(task)
-            }
-            EnqueueReason::Yield => {
-                // A cooperative yield should put a fair task behind peers that
-                // are already ready, otherwise child-creation bursts keep
-                // rescheduling the yielding parent and new children never
-                // reach their first blocking operation.
-                let floor = self
-                    .min_ready_vruntime()
-                    .unwrap_or_else(|| self.queue_floor())
-                    .saturating_add(FAIR_PREEMPT_GRANULARITY_TICKS);
-                let vruntime = task.get_vruntime().max(floor);
-                task.rebase_vruntime(vruntime);
-                self.insert_fair_task(task)
-            }
-            EnqueueReason::Preempt => self.put_prev_task(task, false),
-        }
+        let action = match reason {
+            EnqueueReason::New => CfsEnqueueAction::New,
+            EnqueueReason::Wakeup => CfsEnqueueAction::Wakeup,
+            EnqueueReason::Yield => CfsEnqueueAction::ExplicitYield,
+            EnqueueReason::Preempt => CfsEnqueueAction::Requeue { preempt: true },
+        };
+        self.enqueue_with_action(task, action)
     }
 
     fn task_tick(&mut self, current: &Self::SchedItem) -> bool {
-        if current.is_rt() {
-            let current_priority = current.rt_priority();
+        let current_params = current.sched_params();
+        if matches!(
+            current_params.class,
+            CfsTaskClass::RoundRobin | CfsTaskClass::Fifo
+        ) {
+            let current_priority = current_params.rt_priority;
             if self.has_ready_rt_with_higher_priority(current_priority) {
                 return true;
             }
 
-            return match current.class() {
+            return match current_params.class {
                 CfsTaskClass::Fifo => false,
                 CfsTaskClass::RoundRobin => {
                     let old_slice = current.task_tick_rr();
@@ -834,7 +1123,7 @@ impl<T> BaseScheduler for CFScheduler<T> {
         }
 
         current.task_tick();
-        let current_vruntime = current.get_vruntime();
+        let current_vruntime = current.get_vruntime_with(current_params);
         self.refresh_min_vruntime(Some(current_vruntime));
 
         match self.min_ready_vruntime() {
@@ -849,20 +1138,28 @@ impl<T> BaseScheduler for CFScheduler<T> {
     }
 
     fn set_priority(&mut self, task: &Self::SchedItem, prio: isize) -> Result<(), SchedulerError> {
-        if task.is_rt() {
-            return Err(SchedulerError::IncompatibleClass);
-        }
         if !(-20..=19).contains(&prio) {
             return Err(SchedulerError::InvalidParameters);
         }
-        self.set_task_params(
-            task,
-            CfsTaskParams {
-                class: task.class(),
-                nice: prio as i8,
-                rt_priority: 0,
-            },
-        )
+        match task.owner() {
+            UNOWNED => task.configure_nice(prio as i8),
+            CONFIGURING => Err(SchedulerError::TaskBusy),
+            owner if owner != self.id || self.id == UNOWNED => Err(SchedulerError::ForeignQueue),
+            _ => {
+                let current = task.sched_params();
+                if is_realtime(current) {
+                    return Err(SchedulerError::IncompatibleClass);
+                }
+                self.set_task_params(
+                    task,
+                    CfsTaskParams {
+                        class: current.class,
+                        nice: prio as i8,
+                        rt_priority: 0,
+                    },
+                )
+            }
+        }
     }
 }
 
@@ -884,61 +1181,317 @@ impl<T> Drop for CFScheduler<T> {
 #[cfg(test)]
 mod sequence_tests {
     use super::*;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+
+    fn rr_params(priority: u8) -> CfsTaskParams {
+        CfsTaskParams {
+            class: CfsTaskClass::RoundRobin,
+            nice: 0,
+            rt_priority: priority,
+        }
+    }
 
     #[test]
-    fn fair_sequence_exhaustion_rebases_without_reordering() {
+    fn fair_sequence_exhaustion_is_explicit_and_side_effect_free() {
         let mut scheduler = CFScheduler::new();
         let first = Arc::new(CFSTask::new(1));
         let second = Arc::new(CFSTask::new(2));
         scheduler.add_task(first.clone()).unwrap();
         scheduler.fair_sequence = isize::MAX;
-        scheduler.add_task(second.clone()).unwrap();
+        let before = second.snapshot_reconfiguration_state();
+
+        assert_eq!(
+            scheduler.add_task(second.clone()),
+            Err(SchedulerError::SequenceExhausted)
+        );
+        assert_eq!(second.snapshot_reconfiguration_state(), before);
+        assert_eq!(second.owner(), UNOWNED);
 
         assert!(Arc::ptr_eq(&scheduler.pick_next_task().unwrap(), &first));
-        assert!(Arc::ptr_eq(&scheduler.pick_next_task().unwrap(), &second));
+        assert!(scheduler.pick_next_task().is_none());
     }
 
     #[test]
-    fn realtime_back_sequence_exhaustion_rebases_without_reordering() {
+    fn realtime_back_sequence_exhaustion_is_explicit_and_side_effect_free() {
         let mut scheduler = CFScheduler::new();
         let first = Arc::new(CFSTask::new(1));
         let second = Arc::new(CFSTask::new(2));
         for task in [&first, &second] {
-            task.configure(CfsTaskParams {
-                class: CfsTaskClass::RoundRobin,
-                nice: 0,
-                rt_priority: 10,
-            })
-            .unwrap();
+            task.configure(rr_params(10)).unwrap();
         }
         scheduler.add_task(first.clone()).unwrap();
         scheduler.rt_back_seq = isize::MAX;
-        scheduler.add_task(second.clone()).unwrap();
+        let before = second.snapshot_reconfiguration_state();
+
+        assert_eq!(
+            scheduler.add_task(second.clone()),
+            Err(SchedulerError::SequenceExhausted)
+        );
+        assert_eq!(second.snapshot_reconfiguration_state(), before);
+        assert_eq!(second.owner(), UNOWNED);
 
         assert!(Arc::ptr_eq(&scheduler.pick_next_task().unwrap(), &first));
-        assert!(Arc::ptr_eq(&scheduler.pick_next_task().unwrap(), &second));
+        assert!(scheduler.pick_next_task().is_none());
     }
 
     #[test]
-    fn realtime_front_sequence_exhaustion_rebases_before_preemption() {
+    fn realtime_front_sequence_exhaustion_preserves_running_task_state() {
         let mut scheduler = CFScheduler::new();
         let first = Arc::new(CFSTask::new(1));
         let second = Arc::new(CFSTask::new(2));
         for task in [&first, &second] {
-            task.configure(CfsTaskParams {
-                class: CfsTaskClass::RoundRobin,
-                nice: 0,
-                rt_priority: 10,
-            })
-            .unwrap();
+            task.configure(rr_params(10)).unwrap();
             scheduler.add_task(task.clone()).unwrap();
         }
         let running = scheduler.pick_next_task().unwrap();
         assert!(Arc::ptr_eq(&running, &first));
         scheduler.rt_front_seq = isize::MIN;
+        let before = running.snapshot_reconfiguration_state();
+
+        assert_eq!(
+            scheduler.put_prev_task(running.clone(), true),
+            Err(SchedulerError::SequenceExhausted)
+        );
+        assert_eq!(running.snapshot_reconfiguration_state(), before);
+        assert_eq!(running.owner(), UNOWNED);
+        assert!(Arc::ptr_eq(&scheduler.pick_next_task().unwrap(), &second));
+    }
+
+    #[test]
+    fn enqueue_claim_excludes_configuration_before_snapshot_and_mutation() {
+        let mut scheduler = CFScheduler::new();
+        let task = Arc::new(CFSTask::new(()));
+        let before = task.snapshot_reconfiguration_state();
+        let claim = scheduler.claim_enqueue_task(task.clone()).unwrap();
+
+        assert_eq!(
+            task.configure(rr_params(42)),
+            Err(SchedulerError::AlreadyQueued)
+        );
+        assert_eq!(task.snapshot_reconfiguration_state(), before);
+        drop(claim);
+
+        task.configure(rr_params(42)).unwrap();
+    }
+
+    #[test]
+    fn nice_update_claim_excludes_a_competing_class_change() {
+        let mut scheduler = CFScheduler::new();
+        let task = Arc::new(CFSTask::new(()));
+        let claim = task.claim_configuration().unwrap();
+        let before = task.sched_params();
+
+        assert_eq!(
+            scheduler.set_priority(&task, 5),
+            Err(SchedulerError::TaskBusy)
+        );
+        assert_eq!(task.sched_params(), before);
+        drop(claim);
+
+        scheduler.set_priority(&task, 5).unwrap();
+        assert_eq!(task.sched_params().nice, 5);
+    }
+
+    #[test]
+    fn rejected_foreign_enqueue_preserves_rr_slice_and_ready_key() {
+        let mut owner = CFScheduler::new();
+        let mut foreign = CFScheduler::new();
+        let task = Arc::new(CFSTask::new(1));
+        let peer = Arc::new(CFSTask::new(2));
+        for task in [&task, &peer] {
+            task.configure(rr_params(42)).unwrap();
+            owner.add_task(task.clone()).unwrap();
+        }
+
+        let running = owner.pick_next_task().unwrap();
+        for _ in 0..RR_TIMESLICE_TICKS - 1 {
+            assert!(!owner.task_tick(&running));
+        }
+        owner.put_prev_task(running, true).unwrap();
+        let before = task.snapshot_reconfiguration_state();
+        assert_eq!(before.rr_time_slice, 1);
+
+        assert_eq!(
+            foreign.add_task(task.clone()),
+            Err(SchedulerError::ForeignQueue)
+        );
+        assert_eq!(task.snapshot_reconfiguration_state(), before);
+
+        let running = owner.pick_next_task().unwrap();
+        assert!(Arc::ptr_eq(&running, &task));
+        assert!(owner.task_tick(&running));
+    }
+
+    #[test]
+    fn failed_ready_reconfiguration_restores_exact_state_and_order() {
+        let mut scheduler = CFScheduler::new();
+        let task = Arc::new(CFSTask::new(1));
+        let peer = Arc::new(CFSTask::new(2));
+        for task in [&task, &peer] {
+            task.configure(rr_params(42)).unwrap();
+            scheduler.add_task(task.clone()).unwrap();
+        }
+
+        let running = scheduler.pick_next_task().unwrap();
+        for _ in 0..RR_TIMESLICE_TICKS - 1 {
+            assert!(!scheduler.task_tick(&running));
+        }
         scheduler.put_prev_task(running, true).unwrap();
+        let before = task.snapshot_reconfiguration_state();
+        let before_min_vruntime = scheduler.min_vruntime;
+        scheduler.rt_back_seq = isize::MAX;
+
+        assert_eq!(
+            scheduler.set_task_params(&task, rr_params(43)),
+            Err(SchedulerError::SequenceExhausted)
+        );
+        assert_eq!(task.snapshot_reconfiguration_state(), before);
+        assert_eq!(scheduler.min_vruntime, before_min_vruntime);
+        assert_eq!(task.owner(), scheduler.id);
+
+        let running = scheduler.pick_next_task().unwrap();
+        assert!(Arc::ptr_eq(&running, &task));
+        assert!(scheduler.task_tick(&running));
+    }
+
+    #[test]
+    fn concurrent_parameter_snapshots_are_never_torn() {
+        const FAIR: CfsTaskParams = CfsTaskParams {
+            class: CfsTaskClass::Normal,
+            nice: -20,
+            rt_priority: 0,
+        };
+        const REALTIME: CfsTaskParams = CfsTaskParams {
+            class: CfsTaskClass::Fifo,
+            nice: 0,
+            rt_priority: u8::MAX,
+        };
+
+        let task = Arc::new(CFSTask::new(()));
+        let done = Arc::new(AtomicBool::new(false));
+        let writer_task = task.clone();
+        let writer_done = done.clone();
+        let writer = thread::spawn(move || {
+            for iteration in 0..100_000 {
+                writer_task
+                    .configure(if iteration % 2 == 0 { FAIR } else { REALTIME })
+                    .unwrap();
+            }
+            writer_done.store(true, Ordering::Release);
+        });
+
+        while !done.load(Ordering::Acquire) {
+            let observed = task.sched_params();
+            assert!(
+                observed == CfsTaskParams::default() || observed == FAIR || observed == REALTIME
+            );
+        }
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn cancelled_new_task_reservation_never_publishes_or_retains_ownership() {
+        let mut scheduler = CFScheduler::new();
+        let task = Arc::new(CFSTask::new(()));
+
+        let reservation = scheduler.reserve_new_task(&task).unwrap();
+        assert_eq!(scheduler.fair_sequence, 1);
+        assert!(scheduler.pick_next_task().is_none());
+        assert_eq!(
+            task.configure(CfsTaskParams::default()),
+            Err(SchedulerError::TaskBusy)
+        );
+        let returned = reservation.cancel();
+        assert!(Arc::ptr_eq(&returned, &task));
+
+        task.configure(CfsTaskParams::default()).unwrap();
+        scheduler.add_task(task.clone()).unwrap();
+        assert_eq!(task.ready_key().2, 1, "cancelled sequence is never reused");
+        assert!(Arc::ptr_eq(&scheduler.pick_next_task().unwrap(), &task));
+    }
+
+    #[test]
+    fn committed_new_task_reservation_publishes_the_exact_owner() {
+        let mut scheduler = CFScheduler::new();
+        let task = Arc::new(CFSTask::new(()));
+        let reservation = scheduler.reserve_new_task(&task).unwrap();
+
+        let published = scheduler.commit_reserved_task(reservation).unwrap();
+        assert!(Arc::ptr_eq(&published, &task));
+        assert!(Arc::ptr_eq(&scheduler.pick_next_task().unwrap(), &task));
+    }
+
+    #[test]
+    fn wrong_scheduler_commit_returns_the_live_reservation() {
+        let mut owner = CFScheduler::new();
+        let mut foreign = CFScheduler::new();
+        let task = Arc::new(CFSTask::new(()));
+        let reservation = owner.reserve_new_task(&task).unwrap();
+
+        let error = match foreign.commit_reserved_task(reservation) {
+            Ok(_) => panic!("foreign scheduler committed a private reservation"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), SchedulerError::ForeignQueue);
+        assert!(Arc::ptr_eq(error.reservation().task(), &task));
+        assert_eq!(
+            task.configure(CfsTaskParams::default()),
+            Err(SchedulerError::TaskBusy)
+        );
+
+        let published = owner
+            .commit_reserved_task(error.into_reservation())
+            .unwrap();
+        assert!(Arc::ptr_eq(&published, &task));
+    }
+
+    #[test]
+    fn fair_reservation_remains_committable_after_sequence_exhaustion() {
+        let mut scheduler = CFScheduler::new();
+        let first = Arc::new(CFSTask::new(1));
+        let reserved = Arc::new(CFSTask::new(2));
+        let rejected = Arc::new(CFSTask::new(3));
+        scheduler.add_task(first.clone()).unwrap();
+        let reservation = scheduler.reserve_new_task(&reserved).unwrap();
+        scheduler.fair_sequence = isize::MAX;
+        let rejected_before = rejected.snapshot_reconfiguration_state();
+
+        assert_eq!(
+            scheduler.add_task(rejected.clone()),
+            Err(SchedulerError::SequenceExhausted)
+        );
+        assert_eq!(rejected.snapshot_reconfiguration_state(), rejected_before);
+        let published = scheduler.commit_reserved_task(reservation).unwrap();
+        assert!(Arc::ptr_eq(&published, &reserved));
 
         assert!(Arc::ptr_eq(&scheduler.pick_next_task().unwrap(), &first));
-        assert!(Arc::ptr_eq(&scheduler.pick_next_task().unwrap(), &second));
+        assert!(Arc::ptr_eq(&scheduler.pick_next_task().unwrap(), &reserved));
+    }
+
+    #[test]
+    fn realtime_reservation_remains_committable_after_sequence_exhaustion() {
+        let mut scheduler = CFScheduler::new();
+        let first = Arc::new(CFSTask::new(1));
+        let reserved = Arc::new(CFSTask::new(2));
+        let rejected = Arc::new(CFSTask::new(3));
+        for task in [&first, &reserved, &rejected] {
+            task.configure(rr_params(42)).unwrap();
+        }
+        scheduler.add_task(first.clone()).unwrap();
+        let reservation = scheduler.reserve_new_task(&reserved).unwrap();
+        scheduler.rt_back_seq = isize::MAX;
+        let rejected_before = rejected.snapshot_reconfiguration_state();
+
+        assert_eq!(
+            scheduler.add_task(rejected.clone()),
+            Err(SchedulerError::SequenceExhausted)
+        );
+        assert_eq!(rejected.snapshot_reconfiguration_state(), rejected_before);
+        let published = scheduler.commit_reserved_task(reservation).unwrap();
+        assert!(Arc::ptr_eq(&published, &reserved));
+
+        assert!(Arc::ptr_eq(&scheduler.pick_next_task().unwrap(), &first));
+        assert!(Arc::ptr_eq(&scheduler.pick_next_task().unwrap(), &reserved));
     }
 }

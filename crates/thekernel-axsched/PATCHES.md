@@ -46,14 +46,26 @@ is the tested diff from the verified registry archive.
 - Serialize CFS task configuration against enqueue and provide a scheduler
   transaction for ready-task class/priority changes so live intrusive keys are
   never mutated.
+- Pack class, nice value, and real-time priority into one atomic publication
+  word so safe concurrent readers never observe a new class with stale
+  class-specific parameters.
+- Acquire one RAII queue-owner claim before any CFS enqueue reads scheduling
+  parameters or mutates vruntime, fair-child seed, or RR-slice state. Duplicate,
+  foreign, and exhausted admissions release the claim without side effects.
+- Make ready-task reconfiguration rollback allocation-free and infallible by
+  restoring the saved parameter/auxiliary snapshot and original intrusive key
+  directly instead of requesting a second ordering sequence.
+- Add unpublished new-task reservations with explicit cancellation and a safe
+  commit API whose typed error retains the complete token after a wrong-owner
+  attempt.
 - Replace signed RR time-slice truncation/underflow with saturating `usize`
   accounting; reject a zero slice explicitly and accept `usize::MAX`.
-- Rebase CFS fair/front/back sequences allocation-free before exhaustion,
-  preserving current ready order instead of wrapping into key collisions or
-  permanently rejecting future work.
+- Never wrap, rebase, or reuse CFS fair/front/back ordering sequences. Return
+  `SequenceExhausted` without mutation at the boundary while keeping every
+  previously issued reservation ticket unique and committable.
 - Saturate long-running CFS delta/vruntime arithmetic rather than allowing a
   debug-build panic or release-build wrap.
 - Test maximum/zero real-time priorities, zero/maximum/expired RR slices,
-  rejected-state immutability for a published task, transactional ready-task
-  configuration, child vruntime seeding, sequence rebase, scheduler teardown,
-  duplicate ownership, and cross-scheduler removal.
+  duplicate/foreign/exhausted enqueue immutability, exact ready-task rollback,
+  child vruntime seeding, reservation cancellation/ownership/exhaustion,
+  scheduler teardown, duplicate ownership, and cross-scheduler removal.
