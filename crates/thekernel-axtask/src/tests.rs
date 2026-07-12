@@ -1,4 +1,5 @@
 use core::{
+    future::{pending, poll_fn},
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     task::{Context, Poll, Waker},
     time::Duration,
@@ -52,6 +53,59 @@ fn current_handle_owns_an_independent_strong_reference() {
     );
     drop(probe);
     drop(handle);
+}
+
+#[test]
+fn interruptible_ready_result_preserves_a_simultaneous_interrupt() {
+    let _lock = SERIAL.lock();
+    init_for_test();
+    let curr = current();
+    curr.clear_interrupt();
+    curr.interrupt();
+
+    let result = crate::future::block_on(crate::future::interruptible(async { 7_u32 })).unwrap();
+
+    assert_eq!(result, Ok(7));
+    assert!(curr.is_interrupted());
+    curr.clear_interrupt();
+}
+
+#[test]
+fn interruptible_second_check_restores_a_consumed_interrupt() {
+    let _lock = SERIAL.lock();
+    init_for_test();
+    let curr = current();
+    curr.clear_interrupt();
+    curr.interrupt();
+    let polls = AtomicUsize::new(0);
+
+    let result = crate::future::block_on(crate::future::interruptible(poll_fn(|_| {
+        if polls.fetch_add(1, Ordering::AcqRel) == 0 {
+            Poll::Pending
+        } else {
+            Poll::Ready(11_u32)
+        }
+    })))
+    .unwrap();
+
+    assert_eq!(result, Ok(11));
+    assert_eq!(polls.load(Ordering::Acquire), 2);
+    assert!(curr.is_interrupted());
+    curr.clear_interrupt();
+}
+
+#[test]
+fn interruptible_pending_result_consumes_the_interrupt() {
+    let _lock = SERIAL.lock();
+    init_for_test();
+    let curr = current();
+    curr.clear_interrupt();
+    curr.interrupt();
+
+    let result = crate::future::block_on(crate::future::interruptible(pending::<()>())).unwrap();
+
+    assert_eq!(result, Err(crate::future::Interrupted));
+    assert!(!curr.is_interrupted());
 }
 
 fn other_deferred_dispatcher() {}

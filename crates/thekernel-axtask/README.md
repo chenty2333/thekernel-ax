@@ -58,6 +58,10 @@ or cancelled.
 than hidden short-slice polling. It returns condition versus timeout explicitly
 and preserves separate block-session, interruption, and bounded timer-admission
 errors. A satisfied condition wins when observed with an interrupt or timeout.
+The generic `future::interruptible` adapter follows the same condition-first
+rule: it checks the wrapped future before consuming an interrupt and rechecks
+after installing the interrupt waker. If both become ready in that race, the
+future result wins and the interrupt remains pending for the next boundary.
 
 `reserve_prepared_task` is the fallible half of two-phase CFS publication. It
 claims scheduler ownership, a permanent target run queue, and a non-reused

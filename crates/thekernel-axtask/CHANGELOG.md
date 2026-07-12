@@ -25,6 +25,8 @@
 - Add a single-deadline interruptible conditional wait, with typed block,
   interrupt, timer-admission, condition, and timeout outcomes and no slice
   polling.
+- Make the generic interruptible-future adapter condition-first and preserve a
+  simultaneously observed interrupt when the wrapped operation completes.
 - Split prepared CFS publication into a fallible reservation which returns the
   exact task owner on failure and an allocation-free final commit. Reservation
   also excludes affinity changes until commit or cancellation.

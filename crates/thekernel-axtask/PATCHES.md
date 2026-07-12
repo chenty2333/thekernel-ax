@@ -59,6 +59,9 @@ SHA-256
 - Add `WaitQueue::wait_timeout_until_interruptible` over one complete bounded
   timer registration and an interruption source, preserving the
   condition-listener-condition lost-wake handshake without short sleep slices.
+- Poll generic interruptible futures before consuming task interruption and
+  recheck after interrupt-waker publication, restoring a simultaneous
+  interrupt when the wrapped operation wins.
 - Split prepared CFS task publication into fallible target/ownership/ordering
   reservation and allocation-free final linking. Reservation failure returns a
   public typed error owning the exact rejected `AxTaskRef`; token cancellation

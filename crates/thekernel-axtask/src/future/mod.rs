@@ -221,15 +221,33 @@ impl From<Interrupted> for AxError {
     }
 }
 
-/// Makes a future interruptible.
+/// Makes a future interruptible while giving completed work priority.
+///
+/// The wrapped future is polled before the task interrupt is consumed. After
+/// installing the interrupt waker, it is polled once more to close the race
+/// between the operation becoming ready and interruption. If both become
+/// ready in that window, the operation wins and the interrupt is restored for
+/// the caller's next interruption boundary.
 pub async fn interruptible<F: IntoFuture>(f: F) -> Result<F::Output, Interrupted> {
     let mut f = pin!(f.into_future());
     let curr = current();
     poll_fn(|cx| {
-        if curr.poll_interrupt(cx).is_ready() {
-            return Poll::Ready(Err(Interrupted));
+        if let Poll::Ready(output) = f.as_mut().poll(cx) {
+            return Poll::Ready(Ok(output));
         }
-        f.as_mut().poll(cx).map(Ok)
+
+        let interrupted = curr.poll_interrupt(cx).is_ready();
+        if let Poll::Ready(output) = f.as_mut().poll(cx) {
+            if interrupted {
+                curr.interrupt();
+            }
+            return Poll::Ready(Ok(output));
+        }
+        if interrupted {
+            Poll::Ready(Err(Interrupted))
+        } else {
+            Poll::Pending
+        }
     })
     .await
 }
