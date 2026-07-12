@@ -1,7 +1,7 @@
 use core::{fmt, time::Duration};
 
 use axerrno::AxError;
-use axhal::time::wall_time;
+use axhal::time::{TimeValue, wall_time};
 use event_listener::{Event, listener};
 
 use crate::future::{
@@ -68,6 +68,11 @@ impl From<WaitError> for AxError {
 /// ```
 pub struct WaitQueue {
     event: Event,
+}
+
+fn checked_wait_deadline(now: TimeValue, dur: Duration) -> Result<TimeValue, WaitError> {
+    now.checked_add(dur)
+        .ok_or(WaitError::Timer(TimerRegistrationError::DeadlineOverflow))
 }
 
 impl Default for WaitQueue {
@@ -140,9 +145,7 @@ impl WaitQueue {
     /// Blocks the current task and put it into the wait queue, until other tasks
     /// notify it, or the given duration has elapsed.
     pub fn wait_timeout(&self, dur: Duration) -> Result<bool, WaitError> {
-        let deadline = wall_time()
-            .checked_add(dur)
-            .ok_or(WaitError::Timer(TimerRegistrationError::DeadlineOverflow))?;
+        let deadline = checked_wait_deadline(wall_time(), dur)?;
         block_on(async {
             listener!(self.event => listener);
             match timeout_at(Some(deadline), listener).await {
@@ -164,9 +167,13 @@ impl WaitQueue {
     where
         F: FnMut() -> bool,
     {
-        let deadline = wall_time()
-            .checked_add(dur)
-            .ok_or(WaitError::Timer(TimerRegistrationError::DeadlineOverflow))?;
+        // Match the condition-first contract of the other conditional waits:
+        // an already-satisfied predicate needs neither a timer reservation nor
+        // consumption of a pending interruption.
+        if condition() {
+            return Ok(false);
+        }
+        let deadline = checked_wait_deadline(wall_time(), dur)?;
         block_on(async {
             loop {
                 if condition() {
@@ -187,6 +194,58 @@ impl WaitQueue {
         })
         .map_err(WaitError::Block)?
         .map_err(WaitError::Timer)
+    }
+
+    /// Blocks until `condition` becomes true, the complete duration elapses,
+    /// or the current task is interrupted.
+    ///
+    /// Returns `Ok(false)` when the condition wins and `Ok(true)` when the
+    /// deadline wins. Interruption, bounded timer admission, and synchronous
+    /// block-session failures remain distinct [`WaitError`] variants. One timer
+    /// covers the whole wait; this method does not approximate the deadline by
+    /// repeatedly sleeping for short polling slices. The condition has priority
+    /// when it becomes true in the same observation window as interruption or
+    /// timeout.
+    pub fn wait_timeout_until_interruptible<F>(
+        &self,
+        dur: Duration,
+        mut condition: F,
+    ) -> Result<bool, WaitError>
+    where
+        F: FnMut() -> bool,
+    {
+        if condition() {
+            return Ok(false);
+        }
+        let deadline = checked_wait_deadline(wall_time(), dur)?;
+        block_on(async {
+            let wait = interruptible(async {
+                loop {
+                    if condition() {
+                        break;
+                    }
+                    listener!(self.event => listener);
+                    if condition() {
+                        break;
+                    }
+                    listener.await;
+                }
+            });
+
+            match timeout_at(Some(deadline), wait).await {
+                Ok(Ok(())) => Ok(false),
+                Ok(Err(Interrupted)) => {
+                    if condition() {
+                        Ok(false)
+                    } else {
+                        Err(WaitError::Interrupted)
+                    }
+                }
+                Err(TimeoutError::Elapsed(_)) => Ok(!condition()),
+                Err(TimeoutError::Timer(error)) => Err(WaitError::Timer(error)),
+            }
+        })
+        .map_err(WaitError::Block)?
     }
 
     /// Wakes up one task in the wait queue, usually the first one.
@@ -213,5 +272,18 @@ impl WaitQueue {
     /// If `resched` is true, the current task will yield.
     pub fn notify_all(&self, resched: bool) {
         self.notify_many(usize::MAX, resched);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deadline_overflow_is_typed() {
+        assert_eq!(
+            checked_wait_deadline(Duration::from_nanos(1), Duration::MAX),
+            Err(WaitError::Timer(TimerRegistrationError::DeadlineOverflow))
+        );
     }
 }

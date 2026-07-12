@@ -289,6 +289,19 @@ impl Drop for TimerFuture {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn reserve_timer_for_test(
+    deadline: TimeValue,
+) -> Result<Option<TimerFuture>, TimerRegistrationError> {
+    TimerFuture::reserve(deadline)
+}
+
+#[cfg(test)]
+pub(crate) fn timer_future_count_for_test() -> usize {
+    let cpu_id = axhal::percpu::this_cpu_id();
+    runtime_for(cpu_id).0.lock().len
+}
+
 /// Waits until `duration` has elapsed.
 pub async fn sleep(duration: Duration) -> Result<(), TimerRegistrationError> {
     let deadline = wall_time()

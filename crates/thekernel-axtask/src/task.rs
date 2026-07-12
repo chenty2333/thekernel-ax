@@ -6,7 +6,6 @@ use core::{
     cell::{Cell, UnsafeCell},
     fmt,
     future::poll_fn,
-    mem::ManuallyDrop,
     ops::Deref,
     ptr::NonNull,
     sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering},
@@ -14,8 +13,6 @@ use core::{
 };
 
 use axhal::context::TaskContext;
-#[cfg(feature = "tls")]
-use axhal::tls::TlsArea;
 use futures_util::task::AtomicWaker;
 use kspin::SpinNoIrq;
 use memory_addr::VirtAddr;
@@ -34,6 +31,11 @@ pub struct TaskId(u64);
 /// mechanism rejects them before allocation instead of treating the size as a
 /// performance hint.
 pub const MIN_KERNEL_STACK_SIZE: usize = 16 * 1024;
+
+const TASK_MUTATION_IDLE: u8 = 0;
+#[cfg(feature = "sched-cfs")]
+const TASK_MUTATION_PUBLICATION: u8 = 1;
+const TASK_MUTATION_AFFINITY: u8 = 2;
 
 /// Failure while constructing an unpublished task.
 ///
@@ -485,6 +487,13 @@ pub struct TaskInner {
     entry: Cell<Option<Box<dyn FnOnce()>>>,
     state: AtomicU8,
 
+    /// Serializes an unpublished runnable-publication reservation against an
+    /// affinity update. The reservation fixes a destination run queue, so a
+    /// concurrently published mask must not be allowed to exclude that CPU.
+    /// Other task state remains protected by its existing scheduler/field
+    /// ownership domains rather than by this narrow transaction word.
+    mutation: AtomicU8,
+
     /// CPU affinity and its at-most-one pre-admitted migration helper are one
     /// publication domain. Observing a newly disallowed CPU therefore always
     /// implies that the no-allocation scheduling safe point can claim a helper.
@@ -539,9 +548,6 @@ pub struct TaskInner {
 
     #[cfg(feature = "task-ext")]
     task_ext: Option<AxTaskExt>,
-
-    #[cfg(feature = "tls")]
-    tls: TlsArea,
 }
 
 impl TaskId {
@@ -604,9 +610,6 @@ impl TaskInner {
         let kstack = TaskStack::try_alloc(stack_size).map_err(|_| TaskCreateError::OutOfMemory)?;
         let entry = Box::try_new(entry).map_err(|_| TaskCreateError::OutOfMemory)?;
 
-        #[cfg(feature = "tls")]
-        let tls = VirtAddr::from(t.tls.tls_ptr() as usize);
-        #[cfg(not(feature = "tls"))]
         let tls = VirtAddr::from(0);
 
         t.entry = Cell::new(Some(entry));
@@ -761,6 +764,60 @@ impl TaskInner {
         self.affinity.lock().mask
     }
 
+    #[cfg(feature = "sched-cfs")]
+    pub(crate) fn try_reserve_publication_mutation(&self) -> bool {
+        self.mutation
+            .compare_exchange(
+                TASK_MUTATION_IDLE,
+                TASK_MUTATION_PUBLICATION,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    #[cfg(feature = "sched-cfs")]
+    pub(crate) fn release_publication_mutation(&self) {
+        if self
+            .mutation
+            .compare_exchange(
+                TASK_MUTATION_PUBLICATION,
+                TASK_MUTATION_IDLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            self.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+        }
+    }
+
+    pub(crate) fn try_begin_affinity_mutation(&self) -> bool {
+        self.mutation
+            .compare_exchange(
+                TASK_MUTATION_IDLE,
+                TASK_MUTATION_AFFINITY,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub(crate) fn finish_affinity_mutation(&self) {
+        if self
+            .mutation
+            .compare_exchange(
+                TASK_MUTATION_AFFINITY,
+                TASK_MUTATION_IDLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            self.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+        }
+    }
+
     /// Sets the cpu affinity mask of the task.
     ///
     /// # Arguments
@@ -879,6 +936,7 @@ impl TaskInner {
             is_init: false,
             entry: Cell::new(None),
             state: AtomicU8::new(TaskState::Ready as u8),
+            mutation: AtomicU8::new(TASK_MUTATION_IDLE),
             // By default, the task is allowed to run on all CPUs.
             affinity: SpinNoIrq::new(TaskAffinity::new(crate::api::cpu_mask_full())),
             cpu_id: AtomicU32::new(0),
@@ -905,8 +963,6 @@ impl TaskInner {
             ctx: UnsafeCell::new(TaskContext::new()),
             #[cfg(feature = "task-ext")]
             task_ext: None,
-            #[cfg(feature = "tls")]
-            tls: TlsArea::alloc(),
         }
     }
 
@@ -1421,16 +1477,24 @@ impl Drop for TaskStack {
     }
 }
 
-/// A wrapper of [`AxTaskRef`] as the current task.
+/// An owned handle to the task which was current when the handle was created.
 ///
-/// It won't change the reference count of the task when created or dropped.
-pub struct CurrentTask(ManuallyDrop<AxTaskRef>);
+/// The per-CPU current-task slot owns a separate strong reference. Cloning that
+/// reference here is required because a safe caller may retain this handle
+/// across a context switch or even across reclamation of the task's scheduler
+/// state. A non-owning, lifetime-free wrapper around the per-CPU raw pointer
+/// would otherwise become dangling while it was still usable from safe Rust.
+pub struct CurrentTask(AxTaskRef);
 
 impl CurrentTask {
     pub(crate) fn try_get() -> Option<Self> {
         let ptr: *const super::AxTask = axhal::percpu::current_task_ptr();
         if !ptr.is_null() {
-            Some(Self(unsafe { ManuallyDrop::new(AxTaskRef::from_raw(ptr)) }))
+            // SAFETY: the non-null per-CPU pointer owns one strong reference.
+            // Increment it before reconstructing an independently owned Arc for
+            // the returned handle; the per-CPU ownership remains untouched.
+            unsafe { Arc::increment_strong_count(ptr) };
+            Some(Self(unsafe { AxTaskRef::from_raw(ptr) }))
         } else {
             None
         }
@@ -1443,7 +1507,7 @@ impl CurrentTask {
     /// Clone the inner `AxTaskRef`.
     #[allow(clippy::should_implement_trait)]
     pub fn clone(&self) -> AxTaskRef {
-        self.0.deref().clone()
+        self.0.clone()
     }
 
     /// Returns `true` if the current task is the same as `other`.
@@ -1453,10 +1517,6 @@ impl CurrentTask {
 
     pub(crate) unsafe fn init_current(init_task: AxTaskRef) {
         assert!(init_task.is_init());
-        #[cfg(feature = "tls")]
-        unsafe {
-            axhal::asm::write_thread_pointer(init_task.tls.tls_ptr() as usize)
-        };
         let ptr = Arc::into_raw(init_task);
         unsafe {
             axhal::percpu::set_current_task_ptr(ptr);
@@ -1464,12 +1524,19 @@ impl CurrentTask {
     }
 
     pub(crate) unsafe fn set_current(prev: Self, next: AxTaskRef) {
-        let Self(arc) = prev;
-        ManuallyDrop::into_inner(arc); // `call Arc::drop()` to decrease prev task reference count.
+        let previous_raw: *const super::AxTask = axhal::percpu::current_task_ptr();
+        debug_assert_eq!(previous_raw, Arc::as_ptr(&prev.0));
         let ptr = Arc::into_raw(next);
         unsafe {
             axhal::percpu::set_current_task_ptr(ptr);
-        }
+        };
+
+        // SAFETY: `previous_raw` is the distinct strong reference owned by the
+        // per-CPU current-task slot. Replacing the slot above transfers that
+        // ownership out exactly once. `prev` is an additional owned handle and
+        // is dropped independently at the end of this function.
+        drop(unsafe { AxTaskRef::from_raw(previous_raw) });
+        drop(prev);
     }
 }
 
@@ -1497,8 +1564,11 @@ extern "C" fn task_entry() -> ! {
         drop(retired);
     }
     crate::run_deferred_work();
-    let task = crate::current();
-    if let Some(entry) = task.entry.take() {
+    let entry = {
+        let task = crate::current();
+        task.entry.take()
+    };
+    if let Some(entry) = entry {
         entry()
     }
     crate::exit(0);

@@ -34,7 +34,9 @@ multitask = [
 ]
 task-ext = ["dep:extern-trait"]
 irq = ["axhal/irq"]
-tls = ["axhal/tls"]
+# Compatibility sentinel for downstream feature-forwarding manifests. Enabling
+# it is rejected explicitly in lib.rs until axhal exposes fallible TLS setup.
+tls = []
 preempt = ["irq", "percpu?/preempt", "kernel_guard/preempt"]
 smp = ["kspin/smp"]
 sched-fifo = ["multitask"]

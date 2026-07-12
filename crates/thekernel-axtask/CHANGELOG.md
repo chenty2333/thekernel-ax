@@ -15,3 +15,21 @@
   priority, class, and queue-ownership causes from `thekernel-axsched`.
 - Keep IRQ waiter registration free of hardware-enable side effects; IRQ
   capability owners retain domain validation, enable/disable, and ack policy.
+- Make `CurrentTask` a genuinely owned handle; safe callers may retain it
+  across context switches without borrowing a lifetime-free per-CPU raw Arc.
+- Retain the inherited optional `tls` name only as an explicitly rejected
+  compatibility sentinel until `axhal` provides a fallible TLS-area constructor
+  compatible with typed task-creation OOM.
+- Reject affinity masks that contain no initialized run queue and exclude
+  possible-but-offline CPUs from runnable-task publication.
+- Add a single-deadline interruptible conditional wait, with typed block,
+  interrupt, timer-admission, condition, and timeout outcomes and no slice
+  polling.
+- Split prepared CFS publication into a fallible reservation which returns the
+  exact task owner on failure and an allocation-free final commit. Reservation
+  also excludes affinity changes until commit or cancellation.
+- Keep the idle task Running while it probes the ready queue instead of
+  publishing a fake Ready state, and admit an already-Running idle as the empty
+  scheduler's next fallback.
+- Release owned current-task handles before non-returning exit switches so
+  exited task objects and kernel stacks remain reclaimable.

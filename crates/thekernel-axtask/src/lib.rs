@@ -32,6 +32,11 @@
 #![feature(doc_cfg)]
 #![feature(linkage)]
 
+#[cfg(feature = "tls")]
+compile_error!(
+    "thekernel-axtask 0.1.0 does not support TLS tasks: axhal must first expose fallible TLS allocation"
+);
+
 #[cfg(all(test, feature = "multitask"))]
 mod tests;
 

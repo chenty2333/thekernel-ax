@@ -14,8 +14,11 @@ pub use axsched::{
 use kernel_guard::NoPreemptIrqSave;
 use spin::Once;
 
-use crate::run_queue::{TaskEnqueueError, TaskEnqueueErrorKind};
-pub use crate::run_queue::{TaskRuntimeInitError, TaskSchedError};
+#[cfg(feature = "sched-cfs")]
+pub use crate::run_queue::PreparedTaskPublication;
+pub use crate::run_queue::{
+    TaskEnqueueError, TaskEnqueueErrorKind, TaskRuntimeInitError, TaskSchedError,
+};
 pub(crate) use crate::run_queue::{current_run_queue, select_run_queue};
 #[doc(cfg(all(feature = "multitask", feature = "task-ext")))]
 #[cfg(feature = "task-ext")]
@@ -270,14 +273,22 @@ fn map_scheduler_error(error: axsched::SchedulerError) -> AxError {
 }
 
 fn map_task_enqueue_error(error: TaskEnqueueError) -> AxError {
-    let kind = error.kind;
-    drop(error.task);
-    match kind {
-        TaskEnqueueErrorKind::RunQueueUnavailable(_) => AxError::BadState,
-        TaskEnqueueErrorKind::Scheduler(error) => map_scheduler_error(error),
-        TaskEnqueueErrorKind::TaskNotReady => AxError::InvalidInput,
-        #[cfg(feature = "smp")]
-        TaskEnqueueErrorKind::HandoffOccupied => AxError::BadState,
+    error.into_ax_error()
+}
+
+impl TaskEnqueueError {
+    /// Converts a generic task-publication failure to its axerrno category,
+    /// releasing the returned unpublished task owner in the caller's context.
+    pub fn into_ax_error(self) -> AxError {
+        let kind = self.kind;
+        drop(self.task);
+        match kind {
+            TaskEnqueueErrorKind::RunQueueUnavailable(_) => AxError::BadState,
+            TaskEnqueueErrorKind::Scheduler(error) => map_scheduler_error(error),
+            TaskEnqueueErrorKind::TaskNotReady => AxError::InvalidInput,
+            #[cfg(feature = "smp")]
+            TaskEnqueueErrorKind::HandoffOccupied => AxError::BadState,
+        }
     }
 }
 
@@ -367,14 +378,28 @@ fn inherit_fair_vruntime_if_applicable(task: &AxTaskRef, parent: &AxTaskRef) -> 
     }
 }
 
-/// Publishes a fully prepared task to its selected run queue.
+/// Reserves a fully prepared task's selected run queue without publishing it.
 ///
-/// CFS uses an intrusive ready tree, so this final lifecycle commit does not
-/// allocate and cannot report a partial-publication failure.
+/// Scheduler identity, queue ownership, target-CPU availability, and ordering
+/// sequence admission all complete here. Dropping the returned token cancels
+/// the claim. A lifecycle adapter should obtain this token before committing
+/// any process, signal, or lookup-table state which cannot be rolled back.
 #[cfg(feature = "sched-cfs")]
-pub fn publish_prepared_task(task: AxTaskRef) -> AxResult {
-    let publication = select_run_queue::<NoPreemptIrqSave>(&task).add_task(task);
-    publication.map_err(map_task_enqueue_error)
+pub fn reserve_prepared_task(task: AxTaskRef) -> Result<PreparedTaskPublication, TaskEnqueueError> {
+    if !task.try_reserve_publication_mutation() {
+        return Err(TaskEnqueueError {
+            kind: TaskEnqueueErrorKind::Scheduler(axsched::SchedulerError::TaskBusy),
+            task,
+        });
+    }
+    select_run_queue::<NoPreemptIrqSave>(&task).reserve_claimed_new_task(task)
+}
+
+/// Publishes an already reserved task without allocation or recoverable
+/// failure and returns the exact runnable task owner.
+#[cfg(feature = "sched-cfs")]
+pub fn publish_prepared_task(publication: PreparedTaskPublication) -> AxTaskRef {
+    publication.commit()
 }
 
 /// Spawns a new task with the given parameters.
@@ -527,6 +552,22 @@ fn retire_allowed_migration_current() {
     drop(retired);
 }
 
+struct AffinityMutation<'a>(&'a AxTaskRef);
+
+impl<'a> AffinityMutation<'a> {
+    fn try_begin(task: &'a AxTaskRef) -> AxResult<Self> {
+        task.try_begin_affinity_mutation()
+            .then_some(Self(task))
+            .ok_or(AxError::ResourceBusy)
+    }
+}
+
+impl Drop for AffinityMutation<'_> {
+    fn drop(&mut self) {
+        self.0.finish_affinity_mutation();
+    }
+}
+
 /// Set the affinity for the current task.
 /// [`AxCpuMask`] is used to specify the CPU affinity.
 ///
@@ -539,7 +580,13 @@ pub fn set_current_affinity(cpumask: AxCpuMask) -> AxResult {
         return Err(AxError::InvalidInput);
     }
 
+    #[cfg(feature = "smp")]
+    if !crate::run_queue::affinity_has_online_cpu(cpumask) {
+        return Err(AxError::InvalidInput);
+    }
+
     let curr = current().clone();
+    let _mutation = AffinityMutation::try_begin(&curr)?;
     #[cfg(feature = "smp")]
     {
         // The task can be preempted and migrated while allocation is in
@@ -590,9 +637,16 @@ pub fn set_task_affinity(task: &AxTaskRef, cpumask: AxCpuMask) -> AxResult {
         return Err(AxError::InvalidInput);
     }
 
+    #[cfg(feature = "smp")]
+    if !crate::run_queue::affinity_has_online_cpu(cpumask) {
+        return Err(AxError::InvalidInput);
+    }
+
     if current().ptr_eq(task) {
         return set_current_affinity(cpumask);
     }
+
+    let _mutation = AffinityMutation::try_begin(task)?;
 
     #[cfg(feature = "smp")]
     {
@@ -709,7 +763,12 @@ pub fn sleep_until(deadline: axhal::time::TimeValue) -> AxResult<()> {
     }
 }
 
-/// Exits the current task.
+/// Exits the current task without unwinding its kernel stack.
+///
+/// Destructors for caller-owned local values do not run. Code which invokes
+/// this function directly must release resources requiring deterministic drop
+/// before the call; normal task-entry return performs its internal cleanup
+/// before reaching this path.
 pub fn exit(exit_code: i32) -> ! {
     run_deferred_work();
     current_run_queue::<NoPreemptIrqSave>().exit_current(exit_code)

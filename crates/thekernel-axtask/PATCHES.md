@@ -27,6 +27,9 @@ SHA-256
   and reject Linux PID-style rewinds or wraparound.
 - Replace aliased static mutable runqueue references with guarded shared
   interior mutability and explicit CPU identity.
+- Replace the lifetime-free non-owning public `CurrentTask` wrapper with an
+  independently reference-counted handle while keeping the per-CPU slot's raw
+  Arc ownership distinct during context switches.
 - Replace the allocating per-CPU exited-task `VecDeque` with a task-embedded
   intrusive FIFO that transfers exactly one raw `Arc` ownership unit, snapshots
   each reclaim batch, and records first-wins typed ownership faults.
@@ -46,3 +49,23 @@ SHA-256
   outcomes through task configuration and runtime priority adapters.
 - Enforce a 16 KiB minimum kernel-task stack after focused CFS tests proved
   smaller stacks could corrupt adjacent allocator state before diagnosis.
+- Keep the inherited `tls` feature name only as a compile-time rejection for
+  downstream forwarding compatibility: the registry `axhal` baseline has only
+  an infallible TLS allocator, so enabling the old implementation would bypass
+  the crate's typed task-creation OOM contract.
+- Validate affinity against initialized run queues before publication and make
+  normal scheduler selection skip possible-but-offline CPUs instead of
+  stranding a ready or blocked task on an unavailable queue.
+- Add `WaitQueue::wait_timeout_until_interruptible` over one complete bounded
+  timer registration and an interruption source, preserving the
+  condition-listener-condition lost-wake handshake without short sleep slices.
+- Split prepared CFS task publication into fallible target/ownership/ordering
+  reservation and allocation-free final linking. Reservation failure returns a
+  public typed error owning the exact rejected `AxTaskRef`; token cancellation
+  returns ownership and token lifetime excludes affinity retargeting.
+- Keep idle tasks out of the ready-state transition, explicitly probe the
+  scheduler from idle yield/preemption paths, and accept Ready or Running only
+  for the per-CPU idle fallback.
+- Release every internal owned current-task handle before abandoning an exiting
+  kernel stack, while retaining the distinct per-CPU slot and exited-queue
+  ownership required for a safe final context switch and deferred reclamation.

@@ -1,6 +1,7 @@
 use core::{
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     task::{Context, Poll, Waker},
+    time::Duration,
 };
 use std::sync::{Mutex, Once};
 
@@ -24,6 +25,33 @@ fn test_deferred_dispatcher() {
     if DEFERRED_REENTER.swap(false, Ordering::AcqRel) {
         axtask::run_deferred_work();
     }
+}
+
+#[test]
+fn current_handle_owns_an_independent_strong_reference() {
+    let _lock = SERIAL.lock();
+    init_for_test();
+
+    let raw: *const crate::AxTask = axhal::percpu::current_task_ptr();
+    assert!(!raw.is_null());
+
+    // SAFETY: the initialized per-CPU current-task slot keeps `raw` live. Each
+    // temporary probe below creates and releases exactly one additional strong
+    // reference without consuming the slot's ownership.
+    unsafe { alloc::sync::Arc::increment_strong_count(raw) };
+    let probe = unsafe { crate::AxTaskRef::from_raw(raw) };
+    let baseline_with_probe = alloc::sync::Arc::strong_count(&probe);
+    drop(probe);
+
+    let handle = current();
+    unsafe { alloc::sync::Arc::increment_strong_count(raw) };
+    let probe = unsafe { crate::AxTaskRef::from_raw(raw) };
+    assert_eq!(
+        alloc::sync::Arc::strong_count(&probe),
+        baseline_with_probe + 1
+    );
+    drop(probe);
+    drop(handle);
 }
 
 fn other_deferred_dispatcher() {}
@@ -156,6 +184,127 @@ fn test_wait_queue() {
 }
 
 #[test]
+fn interruptible_timed_wait_rechecks_condition_after_listener_publication() {
+    let _lock = SERIAL.lock();
+    init_for_test();
+
+    let wait_queue = WaitQueue::new();
+    let mut checks = 0;
+    let timed_out = wait_queue
+        .wait_timeout_until_interruptible(Duration::from_secs(1), || {
+            checks += 1;
+            checks >= 2
+        })
+        .unwrap();
+
+    assert!(!timed_out);
+    assert_eq!(checks, 2);
+}
+
+#[test]
+fn interruptible_timed_wait_condition_notification_cancels_timer() {
+    let _lock = SERIAL.lock();
+    init_for_test();
+
+    static WAIT: WaitQueue = WaitQueue::new();
+    static READY: AtomicBool = AtomicBool::new(false);
+    READY.store(false, Ordering::Release);
+    let timer_count = crate::future::timer_future_count_for_test();
+    let notifier = axtask::spawn(|| {
+        READY.store(true, Ordering::Release);
+        WAIT.notify_one(false);
+    })
+    .unwrap();
+
+    assert!(
+        !WAIT
+            .wait_timeout_until_interruptible(Duration::from_secs(1), || {
+                READY.load(Ordering::Acquire)
+            })
+            .unwrap()
+    );
+    notifier.join().unwrap();
+    assert_eq!(crate::future::timer_future_count_for_test(), timer_count);
+}
+
+#[test]
+fn interruptible_timed_wait_satisfied_condition_needs_no_timer_or_interrupt() {
+    let _lock = SERIAL.lock();
+    init_for_test();
+
+    let curr = current();
+    curr.interrupt();
+    let timer_count = crate::future::timer_future_count_for_test();
+    assert_eq!(
+        WaitQueue::new().wait_timeout_until_interruptible(Duration::MAX, || true),
+        Ok(false)
+    );
+    assert!(curr.is_interrupted());
+    assert_eq!(crate::future::timer_future_count_for_test(), timer_count);
+    curr.clear_interrupt();
+}
+
+#[test]
+fn interruptible_timed_wait_reports_capacity_and_releases_all_test_timers() {
+    let _lock = SERIAL.lock();
+    init_for_test();
+
+    assert_eq!(crate::future::timer_future_count_for_test(), 0);
+    let deadline = axhal::time::wall_time()
+        .checked_add(Duration::from_secs(3600))
+        .unwrap();
+    let mut timers = Vec::with_capacity(crate::future::TIMER_FUTURE_CAPACITY);
+    for _ in 0..crate::future::TIMER_FUTURE_CAPACITY {
+        timers.push(
+            crate::future::reserve_timer_for_test(deadline)
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    assert_eq!(
+        crate::future::timer_future_count_for_test(),
+        crate::future::TIMER_FUTURE_CAPACITY
+    );
+    assert_eq!(
+        WaitQueue::new().wait_timeout_until_interruptible(Duration::from_secs(1), || false),
+        Err(crate::WaitError::Timer(
+            crate::future::TimerRegistrationError::CapacityExhausted
+        ))
+    );
+
+    drop(timers);
+    assert_eq!(crate::future::timer_future_count_for_test(), 0);
+}
+
+#[test]
+fn interruptible_timed_wait_reports_interrupt_without_slice_polling() {
+    let _lock = SERIAL.lock();
+    init_for_test();
+
+    static WAIT: WaitQueue = WaitQueue::new();
+    let waiter = current().clone();
+    let interrupter = axtask::spawn(move || waiter.interrupt()).unwrap();
+
+    assert_eq!(
+        WAIT.wait_timeout_until_interruptible(Duration::from_secs(1), || false),
+        Err(crate::WaitError::Interrupted)
+    );
+    interrupter.join().unwrap();
+}
+
+#[test]
+fn interruptible_timed_wait_reports_one_complete_deadline() {
+    let _lock = SERIAL.lock();
+    init_for_test();
+
+    assert!(
+        WaitQueue::new()
+            .wait_timeout_until_interruptible(Duration::ZERO, || false)
+            .unwrap()
+    );
+}
+
+#[test]
 fn test_task_join() {
     let _lock = SERIAL.lock();
     init_for_test();
@@ -181,6 +330,21 @@ fn test_task_join() {
     for (i, task) in tasks.into_iter().enumerate() {
         assert_eq!(task.join().unwrap(), i as _);
     }
+    let returned = axtask::spawn(|| {}).unwrap();
+    assert_eq!(returned.join().unwrap(), 0);
+    drop(returned);
+    assert!(!axtask::reclaim_exited_tasks_until_clear(128));
+}
+
+#[test]
+fn direct_exit_releases_internal_current_task_owners() {
+    let _lock = SERIAL.lock();
+    init_for_test();
+
+    let task = axtask::spawn(|| axtask::exit(37)).unwrap();
+    assert_eq!(task.join().unwrap(), 37);
+    drop(task);
+    assert!(!axtask::reclaim_exited_tasks_until_clear(128));
 }
 
 #[test]
@@ -286,6 +450,96 @@ fn sched_state_update_preserves_typed_failure_causes() {
         axtask::set_sched_state(&task, Default::default()),
         Err(crate::TaskSchedError::TaskExited)
     );
+}
+
+#[cfg(feature = "sched-cfs")]
+#[test]
+fn failed_publication_reservation_returns_the_exact_task_owner() {
+    let _lock = SERIAL.lock();
+    init_for_test();
+
+    let task = crate::TaskInner::new_init("publish-owner".into())
+        .unwrap()
+        .into_arc()
+        .unwrap();
+    let id = task.id();
+    task.notify_exit(0);
+
+    let error = axtask::reserve_prepared_task(task).unwrap_err();
+    assert_eq!(error.kind(), crate::TaskEnqueueErrorKind::TaskNotReady);
+    let returned = error.into_task();
+    assert_eq!(returned.id(), id);
+    assert_eq!(returned.state(), crate::TaskState::Exited);
+    assert_eq!(
+        axtask::set_task_affinity(&returned, returned.cpumask()),
+        Err(AxError::NoSuchProcess)
+    );
+}
+
+#[cfg(feature = "sched-cfs")]
+#[test]
+fn publication_reservation_cancel_returns_the_unpublished_task() {
+    let _lock = SERIAL.lock();
+    init_for_test();
+
+    let task = crate::TaskInner::new_init("reserved-owner".into())
+        .unwrap()
+        .into_arc()
+        .unwrap();
+    let id = task.id();
+    let reservation = axtask::reserve_prepared_task(task).unwrap();
+    assert_eq!(reservation.task().id(), id);
+    let reserved = reservation.task().clone();
+    let original_affinity = reserved.cpumask();
+    assert_eq!(
+        axtask::set_task_affinity(&reserved, original_affinity),
+        Err(AxError::ResourceBusy)
+    );
+    assert_eq!(reserved.cpumask(), original_affinity);
+    assert_eq!(
+        axtask::set_sched_state(&reserved, Default::default()),
+        Err(crate::TaskSchedError::Scheduler(
+            axsched::SchedulerError::TaskBusy
+        ))
+    );
+    drop(reserved);
+
+    let task = reservation.cancel();
+    assert_eq!(task.id(), id);
+    assert_eq!(task.state(), crate::TaskState::Ready);
+    axtask::set_task_affinity(&task, original_affinity).unwrap();
+    axtask::set_sched_state(&task, Default::default()).unwrap();
+}
+
+#[cfg(feature = "sched-cfs")]
+#[test]
+fn publication_reservation_commits_and_auto_exit_is_reclaimable() {
+    let _lock = SERIAL.lock();
+    init_for_test();
+
+    static RAN: AtomicBool = AtomicBool::new(false);
+    RAN.store(false, Ordering::Release);
+    let parent = current().clone();
+    let prepared = axtask::prepare_task_with_sched_from(
+        crate::TaskInner::new(
+            || RAN.store(true, Ordering::Release),
+            "reserved-publish".into(),
+            crate::MIN_KERNEL_STACK_SIZE,
+        )
+        .unwrap(),
+        Default::default(),
+        &parent,
+    )
+    .unwrap();
+    let id = prepared.id();
+
+    let reservation = axtask::reserve_prepared_task(prepared).unwrap();
+    let published = axtask::publish_prepared_task(reservation);
+    assert_eq!(published.id(), id);
+    assert_eq!(published.join().unwrap(), 0);
+    assert!(RAN.load(Ordering::Acquire));
+    drop(published);
+    assert!(!axtask::reclaim_exited_tasks_until_clear(128));
 }
 
 #[cfg(not(feature = "sched-cfs"))]

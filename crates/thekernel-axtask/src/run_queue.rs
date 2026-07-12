@@ -9,6 +9,8 @@ use core::{
 };
 
 use axhal::{mem::total_ram_size, percpu::this_cpu_id};
+#[cfg(feature = "sched-cfs")]
+use axsched::CfsTaskReservation;
 use axsched::{BaseScheduler, EnqueueReason, SchedulerError};
 use futures_util::task::AtomicWaker;
 use kernel_guard::BaseGuard;
@@ -318,18 +320,158 @@ fn recycle_task_stack(stack: TaskStack) {
 static RUN_QUEUES: [AtomicPtr<AxRunQueue>; axconfig::plat::MAX_CPU_NUM] =
     [const { AtomicPtr::new(core::ptr::null_mut()) }; axconfig::plat::MAX_CPU_NUM];
 
+/// Typed cause of a failed runnable-task publication.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) enum TaskEnqueueErrorKind {
+pub enum TaskEnqueueErrorKind {
+    /// The selected CPU has no initialized run queue.
     RunQueueUnavailable(usize),
+    /// The scheduler rejected task ownership or ordering admission.
     Scheduler(SchedulerError),
     #[cfg(feature = "smp")]
+    /// A remote context-switch handoff already contained an owned wake.
     HandoffOccupied,
+    /// The submitted task was not in the unpublished Ready state.
     TaskNotReady,
 }
 
-pub(crate) struct TaskEnqueueError {
+/// Failed runnable-task publication with ownership returned to the caller.
+///
+/// No error variant represents partial publication. The scheduler/runqueue
+/// locks have been released when this value is returned, and [`Self::into_task`]
+/// recovers the exact task reference supplied to the operation for rollback or
+/// terminal containment.
+pub struct TaskEnqueueError {
     pub(crate) kind: TaskEnqueueErrorKind,
     pub(crate) task: AxTaskRef,
+}
+
+impl TaskEnqueueError {
+    /// Returns the typed publication failure without consuming task ownership.
+    pub const fn kind(&self) -> TaskEnqueueErrorKind {
+        self.kind
+    }
+
+    /// Returns the unpublished or safely contained task.
+    pub const fn task(&self) -> &AxTaskRef {
+        &self.task
+    }
+
+    /// Recovers the exact task ownership returned by the failed publication.
+    pub fn into_task(self) -> AxTaskRef {
+        self.task
+    }
+}
+
+impl fmt::Debug for TaskEnqueueError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TaskEnqueueError")
+            .field("kind", &self.kind)
+            .field("task_id", &self.task.id())
+            .finish()
+    }
+}
+
+impl fmt::Display for TaskEnqueueError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "task {} publication failed: {:?}",
+            self.task.id().as_u64(),
+            self.kind
+        )
+    }
+}
+
+impl core::error::Error for TaskEnqueueError {}
+
+/// Reserved final publication of one new CFS task.
+///
+/// The token retains the exact permanent destination run queue and the
+/// scheduler's private ownership/ordering reservation. It is not runnable
+/// until [`crate::publish_prepared_task`] consumes this value. Dropping it
+/// cancels scheduler admission without ever publishing the task.
+#[cfg(feature = "sched-cfs")]
+#[must_use = "dropping the token cancels runnable-task publication"]
+pub struct PreparedTaskPublication {
+    run_queue: &'static AxRunQueue,
+    reservation: Option<CfsTaskReservation<TaskInner>>,
+}
+
+#[cfg(feature = "sched-cfs")]
+impl PreparedTaskPublication {
+    /// Returns the exact unpublished task held by this reservation.
+    pub fn task(&self) -> &AxTaskRef {
+        self.reservation
+            .as_ref()
+            .expect("live task publication always owns its reservation")
+            .task()
+    }
+
+    /// Cancels publication and returns an owned reference to the task.
+    pub fn cancel(self) -> AxTaskRef {
+        let task = Arc::clone(self.task());
+        drop(self);
+        task
+    }
+
+    pub(crate) fn commit(mut self) -> AxTaskRef {
+        let reservation = self
+            .reservation
+            .take()
+            .expect("live task publication always owns its reservation");
+        // The constructor stores the exact permanent run queue whose scheduler
+        // created `reservation`; neither field is publicly mutable, and the
+        // task-level mutation claim excludes parameter/affinity changes.
+        match self
+            .run_queue
+            .scheduler
+            .lock()
+            .commit_reserved_task(reservation)
+        {
+            Ok(task) => {
+                task.release_publication_mutation();
+                task
+            }
+            Err(error) => {
+                let kind = error.kind();
+                let reservation = error.into_reservation();
+                let task = Arc::clone(reservation.task());
+                drop(reservation);
+                task.release_publication_mutation();
+                task.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+                error!(
+                    "reserved task {} final publication invariant failed: {:?}",
+                    task.id().as_u64(),
+                    kind
+                );
+                // Lifecycle state may already be externally visible. Returning
+                // or pretending publication succeeded could strand that state;
+                // fail-stop after preserving the exact task and durable fault.
+                axhal::power::system_off()
+            }
+        }
+    }
+}
+
+#[cfg(feature = "sched-cfs")]
+impl fmt::Debug for PreparedTaskPublication {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedTaskPublication")
+            .field("task_id", &self.task().id())
+            .field("cpu_id", &self.run_queue.cpu_id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "sched-cfs")]
+impl Drop for PreparedTaskPublication {
+    fn drop(&mut self) {
+        if let Some(reservation) = self.reservation.as_ref() {
+            reservation.task().release_publication_mutation();
+        }
+    }
 }
 
 /// Failure to initialize one CPU's generic task runtime.
@@ -451,7 +593,7 @@ pub(crate) fn current_run_queue<G: BaseGuard>() -> CurrentRunQueueRef<'static, G
     let irq_state = G::acquire();
     CurrentRunQueueRef {
         inner: current_run_queue_inner(),
-        current_task: crate::current(),
+        current_task: Some(crate::current()),
         state: irq_state,
         _phantom: core::marker::PhantomData,
     }
@@ -492,11 +634,19 @@ pub(crate) fn select_run_queue_index(cpumask: AxCpuMask) -> usize {
         % axconfig::plat::MAX_CPU_NUM;
     for offset in 0..axconfig::plat::MAX_CPU_NUM {
         let index = (start + offset) % axconfig::plat::MAX_CPU_NUM;
-        if cpumask.get(index) {
+        if cpumask.get(index) && !RUN_QUEUES[index].load(Ordering::Acquire).is_null() {
             return index;
         }
     }
     usize::MAX
+}
+
+/// Returns whether an affinity mask contains at least one initialized run
+/// queue. Possible-but-offline CPUs are not sufficient publication targets.
+#[cfg(feature = "smp")]
+pub(crate) fn affinity_has_online_cpu(cpumask: AxCpuMask) -> bool {
+    (0..axconfig::plat::MAX_CPU_NUM)
+        .any(|index| cpumask.get(index) && !RUN_QUEUES[index].load(Ordering::Acquire).is_null())
 }
 
 /// Retrieves the initialized shared run queue for a CPU.
@@ -625,7 +775,7 @@ impl<G: BaseGuard> Drop for AxRunQueueRef<'_, G> {
 /// in which scheduling operations can be performed.
 pub(crate) struct CurrentRunQueueRef<'a, G: BaseGuard> {
     inner: &'a AxRunQueue,
-    current_task: CurrentTask,
+    current_task: Option<CurrentTask>,
     state: G::State,
     _phantom: core::marker::PhantomData<G>,
 }
@@ -734,11 +884,56 @@ impl<G: BaseGuard> AxRunQueueRef<'_, G> {
     }
 }
 
+#[cfg(feature = "sched-cfs")]
+impl<G: BaseGuard> AxRunQueueRef<'static, G> {
+    /// Reserves final publication of a brand-new CFS task.
+    pub(crate) fn reserve_claimed_new_task(
+        &mut self,
+        task: AxTaskRef,
+    ) -> Result<PreparedTaskPublication, TaskEnqueueError> {
+        let Some(run_queue) = self.inner else {
+            task.release_publication_mutation();
+            return Err(self.unavailable(task));
+        };
+        if !task.is_ready() {
+            task.release_publication_mutation();
+            return Err(TaskEnqueueError {
+                kind: TaskEnqueueErrorKind::TaskNotReady,
+                task,
+            });
+        }
+
+        let reservation = match run_queue.scheduler.lock().reserve_new_task(&task) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                task.release_publication_mutation();
+                return Err(TaskEnqueueError {
+                    kind: TaskEnqueueErrorKind::Scheduler(error),
+                    task,
+                });
+            }
+        };
+        #[cfg(feature = "smp")]
+        task.set_cpu_id(run_queue.cpu_id as _);
+        drop(task);
+        Ok(PreparedTaskPublication {
+            run_queue,
+            reservation: Some(reservation),
+        })
+    }
+}
+
 /// Core functions of run queue.
 impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
+    fn current_task(&self) -> &CurrentTask {
+        self.current_task
+            .as_ref()
+            .expect("current task ownership was already released")
+    }
+
     #[cfg(feature = "smp")]
     fn maybe_migrate_current(&mut self) -> bool {
-        let curr = &self.current_task;
+        let curr = self.current_task();
         match curr.claim_migration(self.inner.cpu_id) {
             MigrationClaim::Allowed => false,
             MigrationClaim::Prepared(migration_task) => {
@@ -764,7 +959,7 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
 
     #[cfg(feature = "irq")]
     pub fn scheduler_timer_tick(&mut self) {
-        let curr = &self.current_task;
+        let curr = self.current_task();
         #[cfg(feature = "smp")]
         if !curr.cpumask().get(self.inner.cpu_id) {
             #[cfg(feature = "preempt")]
@@ -786,12 +981,25 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
     /// This function will put the current task into this run queue with `Ready` state,
     /// and reschedule to the next task on this run queue.
     pub fn yield_current(&mut self) {
-        let curr = self.current_task.clone();
+        let curr = self.current_task().clone();
         trace!("task yield: id={}", curr.id().as_u64());
-        assert!(curr.is_running());
+        assert!(
+            curr.is_running(),
+            "yielding task id={} is not running: {:?}",
+            curr.id().as_u64(),
+            curr.state()
+        );
 
         #[cfg(feature = "smp")]
         if self.maybe_migrate_current() {
+            return;
+        }
+
+        if curr.is_idle() {
+            // The idle task is never a ready-queue member. Keep its lifecycle
+            // state Running and still probe the scheduler so a wake published
+            // without immediate preemption can take the CPU.
+            self.inner.resched();
             return;
         }
 
@@ -815,7 +1023,7 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
     /// before the migration task inserted it into the target run queue.
     #[cfg(feature = "smp")]
     pub fn migrate_current(&mut self, migration_task: AxTaskRef) {
-        let curr = &self.current_task;
+        let curr = self.current_task();
         trace!("task migrate: id={}", curr.id().as_u64());
         assert!(curr.is_running());
 
@@ -840,7 +1048,7 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
     pub fn preempt_resched(&mut self) {
         // There is no need to disable IRQ and preemption here, because
         // they both have been disabled in `current_check_preempt_pending`.
-        let curr = self.current_task.clone();
+        let curr = self.current_task().clone();
         assert!(curr.is_running());
 
         // When we call `preempt_resched()`, both IRQs and preemption must
@@ -857,6 +1065,10 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
         if can_preempt {
             #[cfg(feature = "smp")]
             if self.maybe_migrate_current() {
+                return;
+            }
+            if curr.is_idle() {
+                self.inner.resched();
                 return;
             }
             match self
@@ -878,7 +1090,10 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
     /// Exit the current task with the specified exit code.
     /// This function will never return.
     pub fn exit_current(&mut self, exit_code: i32) -> ! {
-        let curr = &self.current_task;
+        let curr = self
+            .current_task
+            .take()
+            .expect("current task ownership was already released");
         debug!(
             "task exit: id={}, exit_code={}",
             curr.id().as_u64(),
@@ -907,6 +1122,12 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
                 axhal::power::system_off();
             }
 
+            // This stack will never unwind after the context switch. Release
+            // the runqueue guard's independent current-task owner explicitly;
+            // the per-CPU current slot and exited queue still retain the task
+            // until switch completion and GC respectively.
+            drop(curr);
+
             // Schedule to next task.
             self.inner.resched();
         }
@@ -921,7 +1142,7 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
     /// No waker waits for the owner and no wake can fall between the state
     /// check and the scheduler handoff.
     pub(crate) fn blocked_resched_atomic(&mut self, token: BlockWaitToken) -> BlockWaitCommit {
-        let curr = &self.current_task;
+        let curr = self.current_task();
         if !curr.is_running() || curr.is_idle() {
             return BlockWaitCommit::Stale;
         }
@@ -963,7 +1184,7 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
         self.inner
             .scheduler
             .lock()
-            .set_priority(&self.current_task, priority)
+            .set_priority(self.current_task(), priority)
             .map_err(TaskSchedError::from)
     }
 }
@@ -1089,7 +1310,10 @@ impl AxRunQueue {
     ) -> PutTaskOutcome {
         // If the task's state matches `current_state`, set its state to `Ready` and
         // put it back to the run queue (except idle task).
-        if task.transition_state(current_state, TaskState::Ready) && !task.is_idle() {
+        if task.is_idle() {
+            return PutTaskOutcome::StateMismatch;
+        }
+        if task.transition_state(current_state, TaskState::Ready) {
             let reason = match current_state {
                 TaskState::Blocked => EnqueueReason::Wakeup,
                 TaskState::Running if preempt => EnqueueReason::Preempt,
@@ -1136,17 +1360,30 @@ impl AxRunQueue {
     /// Core reschedule subroutine.
     /// Pick the next task to run and switch to it.
     fn resched(&self) {
-        let selected = { self.scheduler.lock().pick_next_task() };
-        let next = selected.unwrap_or_else(|| unsafe {
-            // Safety: IRQs must be disabled at this time.
-            IDLE_TASK.current_ref_raw().get_unchecked().clone()
-        });
-        assert!(
-            next.is_ready(),
-            "next task id={} is not ready: {:?}",
-            next.id().as_u64(),
-            next.state()
-        );
+        let next = match self.scheduler.lock().pick_next_task() {
+            Some(next) => {
+                assert!(
+                    next.is_ready(),
+                    "selected task id={} is not ready: {:?}",
+                    next.id().as_u64(),
+                    next.state()
+                );
+                next
+            }
+            None => {
+                let idle = unsafe {
+                    // Safety: IRQs must be disabled at this time.
+                    IDLE_TASK.current_ref_raw().get_unchecked().clone()
+                };
+                assert!(
+                    is_valid_idle_fallback(&idle),
+                    "idle fallback id={} has invalid state: {:?}",
+                    idle.id().as_u64(),
+                    idle.state()
+                );
+                idle
+            }
+        };
         self.switch_to(crate::current(), next);
     }
 
@@ -1196,9 +1433,11 @@ impl AxRunQueue {
                 *PREV_TASK.current_ref_mut_raw() = Arc::downgrade(&prev_task);
             }
 
-            // The strong reference count of `prev_task` will be decremented by 1,
-            // but won't be dropped until `gc_entry()` is called.
-            assert!(Arc::strong_count(&prev_task) > 1);
+            // `prev_task` is an owned public handle in addition to the per-CPU
+            // current-task reference. Switching drops both; a runnable,
+            // blocked, or exiting lifecycle owner must retain at least one more
+            // reference until it is safe to reclaim the old kernel stack.
+            assert!(Arc::strong_count(&prev_task) > 2);
             assert!(Arc::strong_count(&next_task) >= 1);
 
             CurrentTask::set_current(prev_task, next_task);
@@ -1211,6 +1450,10 @@ impl AxRunQueue {
             clear_prev_task_on_cpu();
         }
     }
+}
+
+fn is_valid_idle_fallback(task: &AxTaskRef) -> bool {
+    task.is_idle() && (task.is_ready() || task.is_running())
 }
 
 fn poll_gc(cx: &mut Context<'_>) -> Poll<()> {
@@ -1442,6 +1685,26 @@ mod exited_queue_tests {
             .unwrap()
             .into_arc()
             .unwrap()
+    }
+
+    #[test]
+    fn idle_probe_does_not_publish_a_fake_ready_state() {
+        let idle = task("idle");
+        assert!(is_valid_idle_fallback(&idle));
+        idle.set_state(TaskState::Running);
+        let run_queue = AxRunQueue {
+            cpu_id: 0,
+            scheduler: SpinRaw::new(Scheduler::new()),
+        };
+
+        assert!(matches!(
+            run_queue.put_task_with_state(idle.clone(), TaskState::Running, false),
+            PutTaskOutcome::StateMismatch
+        ));
+        assert_eq!(idle.state(), TaskState::Running);
+        assert!(is_valid_idle_fallback(&idle));
+        idle.set_state(TaskState::Blocked);
+        assert!(!is_valid_idle_fallback(&idle));
     }
 
     fn pop_clean(queue: &mut ExitedTaskQueue) -> AxTaskRef {
