@@ -6,7 +6,7 @@ crates maintained by TheKernel. The workspace contains these crates:
 | Package | Rust crate name | Purpose |
 | --- | --- | --- |
 | `thekernel-axfault` | `axfault` | bounded generation-safe fault-request broker state |
-| `thekernel-axtlb` | `axtlb` | bounded allocation-free SMP TLB shootdown state |
+| `thekernel-axtlb` | `axtlb` | bounded allocation-free SMP TLB and instruction-sync shootdown state |
 | `thekernel-axsched` | `axsched` | FIFO, round-robin, fair, and real-time scheduling mechanisms |
 | `thekernel-axpoll` | `axpoll` | bounded I/O readiness registration and wakeup primitives |
 | `thekernel-axtask` | `axtask` | bounded task, run-queue, wait, timer, and IRQ-wake mechanisms |

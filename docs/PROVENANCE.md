@@ -27,10 +27,11 @@ under Apache-2.0; the distributed license text is the canonical Apache-2.0 text
 already used by this repository.
 
 `thekernel-axtlb` 0.1.0 was designed and implemented in this repository as a
-generic, bounded, allocation-free SMP TLB shootdown state machine. It has no
-upstream registry archive or vendored implementation. Architecture-specific
-IPI delivery, TLB instructions, timeout policy, and MM ownership remain in its
-kernel adapter. Its source is licensed under Apache-2.0.
+generic, bounded, allocation-free SMP TLB and instruction-sync shootdown state
+machine. It has no upstream registry archive or vendored implementation.
+Architecture-specific IPI delivery, maintenance instructions, timeout policy,
+and MM ownership remain in its kernel adapter. Its source is licensed under
+Apache-2.0.
 
 ## Immutable registry baselines
 

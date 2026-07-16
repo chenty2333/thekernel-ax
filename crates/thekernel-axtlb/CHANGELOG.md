@@ -9,3 +9,5 @@
 - Add explicit online, draining, and offline CPU lifecycle transitions.
 - Make lifecycle admission one atomic CAS protocol and report exhaustion.
 - Retain issuer admission in each live shootdown request through grace.
+- Carry fixed TLB/I-cache maintenance bits in each request and acknowledge
+  their epochs independently.

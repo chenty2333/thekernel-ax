@@ -17,8 +17,48 @@ const CPU_DRAINING: usize = 2;
 const CPU_STATE_MASK: usize = 0b11;
 const ADMISSION_ONE: usize = CPU_STATE_MASK + 1;
 
-/// Reserved mailbox reason for a TLB shootdown request.
-pub const TLB_SHOOTDOWN_REASON: IpiReason = IpiReason { index: 0 };
+/// Reserved mailbox reason for a CPU-maintenance shootdown request.
+pub const CPU_MAINTENANCE_REASON: IpiReason = IpiReason { index: 0 };
+
+/// Fixed set of remotely acknowledged CPU-maintenance operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CpuMaintenance {
+    bits: u8,
+}
+
+impl CpuMaintenance {
+    /// Page-table translation invalidation only.
+    pub const TLB: Self = Self { bits: 1 << 0 };
+    /// Instruction-stream synchronization only.
+    pub const ICACHE: Self = Self { bits: 1 << 1 };
+    /// Both translation invalidation and instruction-stream synchronization.
+    pub const TLB_AND_ICACHE: Self = Self {
+        bits: Self::TLB.bits | Self::ICACHE.bits,
+    };
+
+    /// Returns whether translation invalidation is required.
+    pub const fn needs_tlb(self) -> bool {
+        self.bits & Self::TLB.bits != 0
+    }
+
+    /// Returns whether instruction-stream synchronization is required.
+    pub const fn needs_icache(self) -> bool {
+        self.bits & Self::ICACHE.bits != 0
+    }
+
+    fn from_pending(tlb: bool, icache: bool) -> Option<Self> {
+        match (tlb, icache) {
+            (false, false) => None,
+            (true, false) => Some(Self::TLB),
+            (false, true) => Some(Self::ICACHE),
+            (true, true) => Some(Self::TLB_AND_ICACHE),
+        }
+    }
+
+    const fn is_empty(self) -> bool {
+        self.bits == 0
+    }
+}
 
 /// A fixed mailbox reason represented by one machine-word bit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,13 +99,13 @@ pub enum CpuLifecycleError {
     MailboxNotDrained,
     /// An offline transition still has a target-admission reader.
     AdmissionInProgress,
-    /// An offline transition still has an unacknowledged TLB request.
+    /// An offline transition still has unacknowledged CPU-maintenance work.
     ShootdownPending,
     /// An offline transition still has an undispatched IPI reason.
     ReasonPending,
 }
 
-/// Failure while issuing a TLB shootdown.
+/// Failure while issuing a CPU-maintenance shootdown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ShootdownIssueError {
@@ -87,7 +127,7 @@ pub enum MailboxError {
     InvalidCpu,
 }
 
-/// Failure while posting a fixed non-TLB IPI reason.
+/// Failure while posting a fixed non-maintenance IPI reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ReasonPostError {
@@ -97,8 +137,8 @@ pub enum ReasonPostError {
     CpuUnavailable,
     /// The fixed lifecycle word cannot represent another concurrent admission.
     AdmissionExhausted,
-    /// The reserved TLB reason must be published with a shootdown epoch.
-    ReservedTlbReason,
+    /// The reserved maintenance reason must be published with a shootdown epoch.
+    ReservedMaintenanceReason,
 }
 
 /// Result of posting one fixed IPI reason.
@@ -114,53 +154,74 @@ impl ReasonPost {
     }
 }
 
-/// Opaque proof that every target acknowledged one domain's request epoch.
-#[must_use = "mapping resources may be reclaimed only after observing this grace"]
-pub struct TlbGrace<'domain, const MAX_CPUS: usize> {
+/// Opaque proof that every target acknowledged one domain's requested work.
+#[must_use = "affected state may be reclaimed or published only after observing this grace"]
+pub struct ShootdownGrace<'domain, const MAX_CPUS: usize> {
     domain: &'domain TlbShootdown<MAX_CPUS>,
     epoch: u64,
+    maintenance: CpuMaintenance,
 }
 
-impl<const MAX_CPUS: usize> TlbGrace<'_, MAX_CPUS> {
+impl<const MAX_CPUS: usize> ShootdownGrace<'_, MAX_CPUS> {
     /// Returns the completed global epoch for bounded diagnostics.
     pub const fn epoch(&self) -> u64 {
         self.epoch
     }
+
+    /// Returns the exact maintenance operations covered by this grace.
+    pub const fn maintenance(&self) -> CpuMaintenance {
+        self.maintenance
+    }
 }
 
-impl<const MAX_CPUS: usize> fmt::Debug for TlbGrace<'_, MAX_CPUS> {
+impl<const MAX_CPUS: usize> fmt::Debug for ShootdownGrace<'_, MAX_CPUS> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("TlbGrace")
+            .debug_struct("ShootdownGrace")
             .field("epoch", &self.epoch)
+            .field("maintenance", &self.maintenance)
             .finish_non_exhaustive()
     }
 }
 
-impl<const MAX_CPUS: usize> PartialEq for TlbGrace<'_, MAX_CPUS> {
+impl<const MAX_CPUS: usize> PartialEq for ShootdownGrace<'_, MAX_CPUS> {
     fn eq(&self, other: &Self) -> bool {
-        self.epoch == other.epoch && core::ptr::eq(self.domain, other.domain)
+        self.epoch == other.epoch
+            && self.maintenance == other.maintenance
+            && core::ptr::eq(self.domain, other.domain)
     }
 }
 
-impl<const MAX_CPUS: usize> Eq for TlbGrace<'_, MAX_CPUS> {}
+impl<const MAX_CPUS: usize> Eq for ShootdownGrace<'_, MAX_CPUS> {}
 
-/// Result of servicing all TLB work visible in one mailbox.
+/// Result of servicing all CPU-maintenance work visible in one mailbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TlbService {
-    completed_epoch: u64,
-    flush_count: usize,
+pub struct ShootdownService {
+    completed_tlb_epoch: u64,
+    completed_icache_epoch: u64,
+    tlb_flush_count: usize,
+    icache_flush_count: usize,
 }
 
-impl TlbService {
-    /// Returns the greatest epoch acknowledged by this service call.
-    pub const fn completed_epoch(self) -> u64 {
-        self.completed_epoch
+impl ShootdownService {
+    /// Returns the greatest translation-invalidation epoch acknowledged.
+    pub const fn completed_tlb_epoch(self) -> u64 {
+        self.completed_tlb_epoch
     }
 
-    /// Returns how many local full flushes were required.
-    pub const fn flush_count(self) -> usize {
-        self.flush_count
+    /// Returns the greatest instruction-sync epoch acknowledged.
+    pub const fn completed_icache_epoch(self) -> u64 {
+        self.completed_icache_epoch
+    }
+
+    /// Returns how many callback rounds requested a full local TLB flush.
+    pub const fn tlb_flush_count(self) -> usize {
+        self.tlb_flush_count
+    }
+
+    /// Returns how many callback rounds requested a local instruction sync.
+    pub const fn icache_flush_count(self) -> usize {
+        self.icache_flush_count
     }
 }
 
@@ -171,8 +232,10 @@ pub struct CpuSnapshot {
     draining: bool,
     admissions: usize,
     pending_reasons: usize,
-    requested_epoch: u64,
-    completed_epoch: u64,
+    requested_tlb_epoch: u64,
+    completed_tlb_epoch: u64,
+    requested_icache_epoch: u64,
+    completed_icache_epoch: u64,
 }
 
 impl CpuSnapshot {
@@ -196,14 +259,24 @@ impl CpuSnapshot {
         self.pending_reasons
     }
 
-    /// Returns the greatest requested TLB epoch.
-    pub const fn requested_epoch(self) -> u64 {
-        self.requested_epoch
+    /// Returns the greatest requested translation-invalidation epoch.
+    pub const fn requested_tlb_epoch(self) -> u64 {
+        self.requested_tlb_epoch
     }
 
-    /// Returns the greatest acknowledged TLB epoch.
-    pub const fn completed_epoch(self) -> u64 {
-        self.completed_epoch
+    /// Returns the greatest acknowledged translation-invalidation epoch.
+    pub const fn completed_tlb_epoch(self) -> u64 {
+        self.completed_tlb_epoch
+    }
+
+    /// Returns the greatest requested instruction-sync epoch.
+    pub const fn requested_icache_epoch(self) -> u64 {
+        self.requested_icache_epoch
+    }
+
+    /// Returns the greatest acknowledged instruction-sync epoch.
+    pub const fn completed_icache_epoch(self) -> u64 {
+        self.completed_icache_epoch
     }
 }
 
@@ -213,8 +286,10 @@ struct CpuMailbox {
     // miss an in-flight admission.
     lifecycle: AtomicUsize,
     pending_reasons: AtomicUsize,
-    requested_epoch: AtomicU64,
-    completed_epoch: AtomicU64,
+    requested_tlb_epoch: AtomicU64,
+    completed_tlb_epoch: AtomicU64,
+    requested_icache_epoch: AtomicU64,
+    completed_icache_epoch: AtomicU64,
 }
 
 impl CpuMailbox {
@@ -222,8 +297,10 @@ impl CpuMailbox {
         Self {
             lifecycle: AtomicUsize::new(CPU_OFFLINE),
             pending_reasons: AtomicUsize::new(0),
-            requested_epoch: AtomicU64::new(0),
-            completed_epoch: AtomicU64::new(0),
+            requested_tlb_epoch: AtomicU64::new(0),
+            completed_tlb_epoch: AtomicU64::new(0),
+            requested_icache_epoch: AtomicU64::new(0),
+            completed_icache_epoch: AtomicU64::new(0),
         }
     }
 
@@ -270,8 +347,10 @@ impl CpuMailbox {
             draining: state == CPU_DRAINING,
             admissions: lifecycle >> 2,
             pending_reasons: self.pending_reasons.load(Ordering::Acquire),
-            requested_epoch: self.requested_epoch.load(Ordering::Acquire),
-            completed_epoch: self.completed_epoch.load(Ordering::Acquire),
+            requested_tlb_epoch: self.requested_tlb_epoch.load(Ordering::Acquire),
+            completed_tlb_epoch: self.completed_tlb_epoch.load(Ordering::Acquire),
+            requested_icache_epoch: self.requested_icache_epoch.load(Ordering::Acquire),
+            completed_icache_epoch: self.completed_icache_epoch.load(Ordering::Acquire),
         }
     }
 }
@@ -320,12 +399,14 @@ impl<const MAX_CPUS: usize> TlbShootdown<MAX_CPUS> {
         self.cpus.get(cpu).ok_or(MailboxError::InvalidCpu)
     }
 
-    /// Publishes a fully initialized, locally flushed CPU as an IPI target.
+    /// Publishes a fully initialized and locally synchronized CPU as a target.
     pub fn publish_online(&self, cpu: usize) -> Result<(), CpuLifecycleError> {
         let mailbox = self.cpu(cpu)?;
         if mailbox.pending_reasons.load(Ordering::Acquire) != 0
-            || mailbox.requested_epoch.load(Ordering::Acquire)
-                != mailbox.completed_epoch.load(Ordering::Acquire)
+            || mailbox.requested_tlb_epoch.load(Ordering::Acquire)
+                != mailbox.completed_tlb_epoch.load(Ordering::Acquire)
+            || mailbox.requested_icache_epoch.load(Ordering::Acquire)
+                != mailbox.completed_icache_epoch.load(Ordering::Acquire)
         {
             return Err(CpuLifecycleError::MailboxNotDrained);
         }
@@ -362,7 +443,7 @@ impl<const MAX_CPUS: usize> TlbShootdown<MAX_CPUS> {
         }
     }
 
-    /// Commits offline only after admission, reasons, and TLB work are drained.
+    /// Commits offline only after admission, reasons, and maintenance are drained.
     pub fn complete_offline(&self, cpu: usize) -> Result<(), CpuLifecycleError> {
         let mailbox = self.cpu(cpu)?;
         let lifecycle = mailbox.lifecycle.load(Ordering::Acquire);
@@ -372,8 +453,10 @@ impl<const MAX_CPUS: usize> TlbShootdown<MAX_CPUS> {
         if lifecycle >> 2 != 0 {
             return Err(CpuLifecycleError::AdmissionInProgress);
         }
-        if mailbox.requested_epoch.load(Ordering::Acquire)
-            > mailbox.completed_epoch.load(Ordering::Acquire)
+        if mailbox.requested_tlb_epoch.load(Ordering::Acquire)
+            > mailbox.completed_tlb_epoch.load(Ordering::Acquire)
+            || mailbox.requested_icache_epoch.load(Ordering::Acquire)
+                > mailbox.completed_icache_epoch.load(Ordering::Acquire)
         {
             return Err(CpuLifecycleError::ShootdownPending);
         }
@@ -387,14 +470,14 @@ impl<const MAX_CPUS: usize> TlbShootdown<MAX_CPUS> {
             .map_err(|_| CpuLifecycleError::InvalidState)
     }
 
-    /// Posts a fixed non-TLB reason to one online CPU.
-    pub fn post_non_tlb_reason(
+    /// Posts a fixed non-maintenance reason to one online CPU.
+    pub fn post_non_maintenance_reason(
         &self,
         cpu: usize,
         reason: IpiReason,
     ) -> Result<ReasonPost, ReasonPostError> {
-        if reason == TLB_SHOOTDOWN_REASON {
-            return Err(ReasonPostError::ReservedTlbReason);
+        if reason == CPU_MAINTENANCE_REASON {
+            return Err(ReasonPostError::ReservedMaintenanceReason);
         }
         let mailbox = self.cpus.get(cpu).ok_or(ReasonPostError::InvalidCpu)?;
         let _admission = mailbox.try_admit().map_err(|error| match error {
@@ -409,21 +492,50 @@ impl<const MAX_CPUS: usize> TlbShootdown<MAX_CPUS> {
     ///
     /// Every online CPU except `issuer_cpu` becomes a target. Hardware IPIs must
     /// be sent only to CPUs for which [`ShootdownRequest::needs_kick`] is true.
-    /// Any error leaves the caller without a grace request after its page-table
+    /// Any error leaves the caller without a grace request after its local
     /// mutation, and may follow partial target publication. A real adapter must
-    /// therefore fail-stop instead of reclaiming the affected resources.
+    /// therefore fail-stop instead of reclaiming or publishing affected state.
     pub fn issue_after_local_flush(
         &self,
         issuer_cpu: usize,
     ) -> Result<ShootdownRequest<'_, MAX_CPUS>, ShootdownIssueError> {
-        self.issue_after_local_flush_with(issuer_cpu, || {})
+        self.issue_after_local_maintenance(issuer_cpu, CpuMaintenance::TLB)
     }
 
+    /// Issues one request after the caller completed the matching local work.
+    ///
+    /// The request uses one global epoch but records translation and
+    /// instruction-sync acknowledgement independently on every target. This
+    /// lets executable publication request only instruction synchronization,
+    /// while `mprotect +X` can request both operations without conflating them.
+    pub fn issue_after_local_maintenance(
+        &self,
+        issuer_cpu: usize,
+        maintenance: CpuMaintenance,
+    ) -> Result<ShootdownRequest<'_, MAX_CPUS>, ShootdownIssueError> {
+        self.issue_after_local_maintenance_with(issuer_cpu, maintenance, || {})
+    }
+
+    #[cfg(test)]
     fn issue_after_local_flush_with(
         &self,
         issuer_cpu: usize,
         after_issuer_admission: impl FnOnce(),
     ) -> Result<ShootdownRequest<'_, MAX_CPUS>, ShootdownIssueError> {
+        self.issue_after_local_maintenance_with(
+            issuer_cpu,
+            CpuMaintenance::TLB,
+            after_issuer_admission,
+        )
+    }
+
+    fn issue_after_local_maintenance_with(
+        &self,
+        issuer_cpu: usize,
+        maintenance: CpuMaintenance,
+        after_issuer_admission: impl FnOnce(),
+    ) -> Result<ShootdownRequest<'_, MAX_CPUS>, ShootdownIssueError> {
+        debug_assert!(!maintenance.is_empty());
         let Some(issuer) = self.cpus.get(issuer_cpu) else {
             return Err(ShootdownIssueError::InvalidCpu);
         };
@@ -456,8 +568,17 @@ impl<const MAX_CPUS: usize> TlbShootdown<MAX_CPUS> {
                     return Err(ShootdownIssueError::AdmissionExhausted);
                 }
             };
-            mailbox.requested_epoch.fetch_max(epoch, Ordering::Release);
-            let post = mailbox.post_reason(TLB_SHOOTDOWN_REASON);
+            if maintenance.needs_tlb() {
+                mailbox
+                    .requested_tlb_epoch
+                    .fetch_max(epoch, Ordering::Release);
+            }
+            if maintenance.needs_icache() {
+                mailbox
+                    .requested_icache_epoch
+                    .fetch_max(epoch, Ordering::Release);
+            }
+            let post = mailbox.post_reason(CPU_MAINTENANCE_REASON);
             targets[cpu] = true;
             kicks[cpu] = post.needs_kick();
         }
@@ -466,6 +587,7 @@ impl<const MAX_CPUS: usize> TlbShootdown<MAX_CPUS> {
             domain: self,
             _issuer_admission: issuer_admission,
             epoch,
+            maintenance,
             targets,
             kicks,
         })
@@ -476,33 +598,51 @@ impl<const MAX_CPUS: usize> TlbShootdown<MAX_CPUS> {
         Ok(self.mailbox(cpu)?.pending_reasons.swap(0, Ordering::AcqRel))
     }
 
-    /// Services every TLB epoch visible to one CPU with local full flushes.
+    /// Services every maintenance epoch visible to one CPU.
     ///
-    /// `flush_local_all` runs without any lock owned by this crate. The adapter
-    /// must keep it allocation-free and must not acquire address-space, frame,
-    /// pin, or mailbox locks.
-    pub fn service_tlb(
+    /// `maintain_local` receives the exact nonempty union needed in one round.
+    /// It runs without any lock owned by this crate. The adapter must execute
+    /// every requested operation, stay allocation-free, and must not acquire
+    /// address-space, frame, pin, or mailbox locks. When both bits are present,
+    /// translation invalidation must precede instruction-stream synchronization.
+    pub fn service_maintenance(
         &self,
         cpu: usize,
-        mut flush_local_all: impl FnMut(),
-    ) -> Result<TlbService, MailboxError> {
+        mut maintain_local: impl FnMut(CpuMaintenance),
+    ) -> Result<ShootdownService, MailboxError> {
         let mailbox = self.mailbox(cpu)?;
-        let mut flush_count = 0;
+        let mut tlb_flush_count = 0usize;
+        let mut icache_flush_count = 0usize;
 
         loop {
-            let requested = mailbox.requested_epoch.load(Ordering::Acquire);
-            let completed = mailbox.completed_epoch.load(Ordering::Acquire);
-            if completed >= requested {
-                return Ok(TlbService {
-                    completed_epoch: completed,
-                    flush_count,
+            let requested_tlb = mailbox.requested_tlb_epoch.load(Ordering::Acquire);
+            let completed_tlb = mailbox.completed_tlb_epoch.load(Ordering::Acquire);
+            let requested_icache = mailbox.requested_icache_epoch.load(Ordering::Acquire);
+            let completed_icache = mailbox.completed_icache_epoch.load(Ordering::Acquire);
+            let Some(maintenance) = CpuMaintenance::from_pending(
+                completed_tlb < requested_tlb,
+                completed_icache < requested_icache,
+            ) else {
+                return Ok(ShootdownService {
+                    completed_tlb_epoch: completed_tlb,
+                    completed_icache_epoch: completed_icache,
+                    tlb_flush_count,
+                    icache_flush_count,
                 });
+            };
+            maintain_local(maintenance);
+            if maintenance.needs_tlb() {
+                tlb_flush_count = tlb_flush_count.saturating_add(1);
+                mailbox
+                    .completed_tlb_epoch
+                    .fetch_max(requested_tlb, Ordering::Release);
             }
-            flush_local_all();
-            flush_count = flush_count.saturating_add(1);
-            mailbox
-                .completed_epoch
-                .fetch_max(requested, Ordering::Release);
+            if maintenance.needs_icache() {
+                icache_flush_count = icache_flush_count.saturating_add(1);
+                mailbox
+                    .completed_icache_epoch
+                    .fetch_max(requested_icache, Ordering::Release);
+            }
         }
     }
 
@@ -539,6 +679,7 @@ pub struct ShootdownRequest<'domain, const MAX_CPUS: usize> {
     domain: &'domain TlbShootdown<MAX_CPUS>,
     _issuer_admission: CpuAdmission<'domain>,
     epoch: u64,
+    maintenance: CpuMaintenance,
     targets: [bool; MAX_CPUS],
     kicks: [bool; MAX_CPUS],
 }
@@ -547,6 +688,11 @@ impl<'domain, const MAX_CPUS: usize> ShootdownRequest<'domain, MAX_CPUS> {
     /// Returns this request's nonzero global epoch.
     pub const fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// Returns the exact maintenance operations this request must acknowledge.
+    pub const fn maintenance(&self) -> CpuMaintenance {
+        self.maintenance
     }
 
     /// Returns whether `cpu` must acknowledge this request.
@@ -565,20 +711,26 @@ impl<'domain, const MAX_CPUS: usize> ShootdownRequest<'domain, MAX_CPUS> {
     }
 
     /// Returns grace only when every target in this request acknowledged it.
-    pub fn try_complete(&self) -> Option<TlbGrace<'domain, MAX_CPUS>> {
+    pub fn try_complete(&self) -> Option<ShootdownGrace<'domain, MAX_CPUS>> {
         for (cpu, targeted) in self.targets.iter().copied().enumerate() {
-            if targeted
-                && self.domain.cpus[cpu]
-                    .completed_epoch
-                    .load(Ordering::Acquire)
-                    < self.epoch
-            {
-                return None;
+            if targeted {
+                let mailbox = &self.domain.cpus[cpu];
+                if self.maintenance.needs_tlb()
+                    && mailbox.completed_tlb_epoch.load(Ordering::Acquire) < self.epoch
+                {
+                    return None;
+                }
+                if self.maintenance.needs_icache()
+                    && mailbox.completed_icache_epoch.load(Ordering::Acquire) < self.epoch
+                {
+                    return None;
+                }
             }
         }
-        Some(TlbGrace {
+        Some(ShootdownGrace {
             domain: self.domain,
             epoch: self.epoch,
+            maintenance: self.maintenance,
         })
     }
 }
@@ -632,17 +784,20 @@ mod tests {
         assert!(!second.needs_kick(1));
         assert_eq!(
             domain.take_pending_reasons(1).unwrap(),
-            TLB_SHOOTDOWN_REASON.bit()
+            CPU_MAINTENANCE_REASON.bit()
         );
 
         let flushes = AtomicUsize::new(0);
         let service = domain
-            .service_tlb(1, || {
+            .service_maintenance(1, |maintenance| {
+                assert_eq!(maintenance, CpuMaintenance::TLB);
                 flushes.fetch_add(1, Ordering::Relaxed);
             })
             .unwrap();
-        assert_eq!(service.completed_epoch(), second.epoch());
-        assert_eq!(service.flush_count(), 1);
+        assert_eq!(service.completed_tlb_epoch(), second.epoch());
+        assert_eq!(service.completed_icache_epoch(), 0);
+        assert_eq!(service.tlb_flush_count(), 1);
+        assert_eq!(service.icache_flush_count(), 0);
         assert_eq!(flushes.load(Ordering::Relaxed), 1);
         assert_eq!(first.try_complete().unwrap().epoch(), first.epoch());
         assert_eq!(second.try_complete().unwrap().epoch(), second.epoch());
@@ -657,10 +812,73 @@ mod tests {
         assert!(request.try_complete().is_none());
         assert_eq!(
             domain.take_pending_reasons(1).unwrap(),
-            TLB_SHOOTDOWN_REASON.bit()
+            CPU_MAINTENANCE_REASON.bit()
         );
-        domain.service_tlb(1, || {}).unwrap();
+        domain.service_maintenance(1, |_| {}).unwrap();
         assert_eq!(request.try_complete().unwrap().epoch(), 1);
+    }
+
+    #[test]
+    fn mixed_maintenance_coalesces_but_acknowledges_each_class_epoch() {
+        let domain = TlbShootdown::<2>::new();
+        online(&domain);
+        let icache = domain
+            .issue_after_local_maintenance(0, CpuMaintenance::ICACHE)
+            .unwrap();
+        let tlb = domain.issue_after_local_flush(0).unwrap();
+
+        assert!(icache.needs_kick(1));
+        assert!(!tlb.needs_kick(1));
+        assert_eq!(
+            domain.take_pending_reasons(1).unwrap(),
+            CPU_MAINTENANCE_REASON.bit()
+        );
+        let service = domain
+            .service_maintenance(1, |maintenance| {
+                assert_eq!(maintenance, CpuMaintenance::TLB_AND_ICACHE);
+            })
+            .unwrap();
+        assert_eq!(service.completed_tlb_epoch(), tlb.epoch());
+        assert_eq!(service.completed_icache_epoch(), icache.epoch());
+        assert_eq!(service.tlb_flush_count(), 1);
+        assert_eq!(service.icache_flush_count(), 1);
+        assert_eq!(
+            icache.try_complete().unwrap().maintenance(),
+            CpuMaintenance::ICACHE
+        );
+        assert_eq!(
+            tlb.try_complete().unwrap().maintenance(),
+            CpuMaintenance::TLB
+        );
+    }
+
+    #[test]
+    fn combined_request_does_not_reach_grace_after_only_tlb_ack() {
+        let domain = TlbShootdown::<2>::new();
+        online(&domain);
+        let request = domain
+            .issue_after_local_maintenance(0, CpuMaintenance::TLB_AND_ICACHE)
+            .unwrap();
+        domain.cpus[1]
+            .completed_tlb_epoch
+            .store(request.epoch(), Ordering::Release);
+
+        assert!(request.try_complete().is_none());
+        assert_eq!(
+            domain.take_pending_reasons(1).unwrap(),
+            CPU_MAINTENANCE_REASON.bit()
+        );
+        let service = domain
+            .service_maintenance(1, |maintenance| {
+                assert_eq!(maintenance, CpuMaintenance::ICACHE);
+            })
+            .unwrap();
+        assert_eq!(service.tlb_flush_count(), 0);
+        assert_eq!(service.icache_flush_count(), 1);
+        assert_eq!(
+            request.try_complete().unwrap().maintenance(),
+            CpuMaintenance::TLB_AND_ICACHE
+        );
     }
 
     #[test]
@@ -685,17 +903,27 @@ mod tests {
     }
 
     #[test]
-    fn non_tlb_reasons_share_the_fixed_bit_mailbox() {
+    fn non_maintenance_reasons_share_the_fixed_bit_mailbox() {
         let domain = TlbShootdown::<1>::new();
         online(&domain);
         let reason = IpiReason::try_new(3).unwrap();
 
-        assert!(domain.post_non_tlb_reason(0, reason).unwrap().needs_kick());
-        assert!(!domain.post_non_tlb_reason(0, reason).unwrap().needs_kick());
+        assert!(
+            domain
+                .post_non_maintenance_reason(0, reason)
+                .unwrap()
+                .needs_kick()
+        );
+        assert!(
+            !domain
+                .post_non_maintenance_reason(0, reason)
+                .unwrap()
+                .needs_kick()
+        );
         assert_eq!(domain.take_pending_reasons(0).unwrap(), reason.bit());
         assert_eq!(
-            domain.post_non_tlb_reason(0, TLB_SHOOTDOWN_REASON),
-            Err(ReasonPostError::ReservedTlbReason)
+            domain.post_non_maintenance_reason(0, CPU_MAINTENANCE_REASON),
+            Err(ReasonPostError::ReservedMaintenanceReason)
         );
     }
 
@@ -712,9 +940,9 @@ mod tests {
         );
         assert_eq!(
             domain.take_pending_reasons(1).unwrap(),
-            TLB_SHOOTDOWN_REASON.bit()
+            CPU_MAINTENANCE_REASON.bit()
         );
-        domain.service_tlb(1, || {}).unwrap();
+        domain.service_maintenance(1, |_| {}).unwrap();
         domain.complete_offline(1).unwrap();
         assert!(request.try_complete().is_some());
         assert!(!domain.cpu_snapshot(1).unwrap().is_online());
@@ -773,9 +1001,9 @@ mod tests {
         );
         assert_eq!(
             domain.take_pending_reasons(1).unwrap(),
-            TLB_SHOOTDOWN_REASON.bit()
+            CPU_MAINTENANCE_REASON.bit()
         );
-        domain.service_tlb(1, || {}).unwrap();
+        domain.service_maintenance(1, |_| {}).unwrap();
         let grace = request.try_complete().unwrap();
         drop(request);
         domain.complete_offline(0).unwrap();
@@ -830,7 +1058,7 @@ mod tests {
         assert_eq!(domain.cpu_snapshot(0).unwrap().admissions(), 0);
         let reason = IpiReason::try_new(1).unwrap();
         assert_eq!(
-            domain.post_non_tlb_reason(1, reason),
+            domain.post_non_maintenance_reason(1, reason),
             Err(ReasonPostError::AdmissionExhausted)
         );
     }
@@ -859,11 +1087,11 @@ mod tests {
         assert_eq!(usize::from(first.1) + usize::from(second.1), 1);
         for cpu in 0..3 {
             let reasons = domain.take_pending_reasons(cpu).unwrap();
-            if reasons & TLB_SHOOTDOWN_REASON.bit() != 0 {
-                domain.service_tlb(cpu, || {}).unwrap();
+            if reasons & CPU_MAINTENANCE_REASON.bit() != 0 {
+                domain.service_maintenance(cpu, |_| {}).unwrap();
             }
         }
-        let completed = domain.cpu_snapshot(2).unwrap().completed_epoch();
+        let completed = domain.cpu_snapshot(2).unwrap().completed_tlb_epoch();
         assert!(completed >= first.0);
         assert!(completed >= second.0);
     }
