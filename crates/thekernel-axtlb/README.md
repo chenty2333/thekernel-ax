@@ -16,8 +16,9 @@ issued it, so safe code cannot complete it against another domain's epochs.
 
 - Construction allocates nothing and all storage is fixed by `MAX_CPUS`.
 - IPI reasons are a machine-word bitset; there is no callback queue.
-- Epochs are monotonic and never wrap. Exhaustion is reported after the page
-  table writer has published its stores, so a kernel adapter must fail-stop.
+- Epochs are monotonic and never wrap. Every issue error is reported after the
+  page-table writer has published its stores and may follow partial mailbox
+  publication, so a kernel adapter must fail-stop.
 - `issue_after_local_flush` is called only after the issuer has made its page
   table stores visible and completed its local invalidation.
 - An IPI handler clears pending reason bits, calls `service_tlb` with a local
@@ -25,6 +26,11 @@ issued it, so safe code cannot complete it against another domain's epochs.
   lock.
 - CPU offline first closes target admission, waits for outstanding admission
   readers, drains and acknowledges the mailbox, and only then commits offline.
+- A live request retains its issuer admission through grace; target mailboxes
+  retain their own pending epoch/reason until service.
+- CPU state and admission count share one atomic lifecycle word, so offline
+  cannot miss a reader between a state check and a separate counter increment.
+- Both a request and its grace remain borrowed from the issuing domain.
 - A timeout must not be converted into grace. Continuing to reclaim memory
   after a timeout is outside this crate's contract.
 

@@ -6,11 +6,16 @@
 #[cfg(test)]
 extern crate std;
 
-use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use core::{
+    fmt,
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+};
 
-const CPU_OFFLINE: u8 = 0;
-const CPU_ONLINE: u8 = 1;
-const CPU_DRAINING: u8 = 2;
+const CPU_OFFLINE: usize = 0;
+const CPU_ONLINE: usize = 1;
+const CPU_DRAINING: usize = 2;
+const CPU_STATE_MASK: usize = 0b11;
+const ADMISSION_ONE: usize = CPU_STATE_MASK + 1;
 
 /// Reserved mailbox reason for a TLB shootdown request.
 pub const TLB_SHOOTDOWN_REASON: IpiReason = IpiReason { index: 0 };
@@ -68,6 +73,8 @@ pub enum ShootdownIssueError {
     InvalidCpu,
     /// The issuer has not been published online.
     IssuerOffline,
+    /// The fixed lifecycle word cannot represent another concurrent admission.
+    AdmissionExhausted,
     /// The global non-wrapping epoch space is exhausted.
     EpochExhausted,
 }
@@ -88,6 +95,8 @@ pub enum ReasonPostError {
     InvalidCpu,
     /// The target is offline or already draining toward offline.
     CpuUnavailable,
+    /// The fixed lifecycle word cannot represent another concurrent admission.
+    AdmissionExhausted,
     /// The reserved TLB reason must be published with a shootdown epoch.
     ReservedTlbReason,
 }
@@ -105,18 +114,36 @@ impl ReasonPost {
     }
 }
 
-/// Opaque proof that every target acknowledged the request epoch.
-#[derive(Debug, PartialEq, Eq)]
-pub struct TlbGrace {
+/// Opaque proof that every target acknowledged one domain's request epoch.
+#[must_use = "mapping resources may be reclaimed only after observing this grace"]
+pub struct TlbGrace<'domain, const MAX_CPUS: usize> {
+    domain: &'domain TlbShootdown<MAX_CPUS>,
     epoch: u64,
 }
 
-impl TlbGrace {
+impl<const MAX_CPUS: usize> TlbGrace<'_, MAX_CPUS> {
     /// Returns the completed global epoch for bounded diagnostics.
     pub const fn epoch(&self) -> u64 {
         self.epoch
     }
 }
+
+impl<const MAX_CPUS: usize> fmt::Debug for TlbGrace<'_, MAX_CPUS> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TlbGrace")
+            .field("epoch", &self.epoch)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<const MAX_CPUS: usize> PartialEq for TlbGrace<'_, MAX_CPUS> {
+    fn eq(&self, other: &Self) -> bool {
+        self.epoch == other.epoch && core::ptr::eq(self.domain, other.domain)
+    }
+}
+
+impl<const MAX_CPUS: usize> Eq for TlbGrace<'_, MAX_CPUS> {}
 
 /// Result of servicing all TLB work visible in one mailbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,8 +208,10 @@ impl CpuSnapshot {
 }
 
 struct CpuMailbox {
-    state: AtomicU8,
-    admissions: AtomicUsize,
+    // State and reader count share one CAS word. Separate atomics would leave
+    // a load-online/increment gap in which an offline/re-online cycle could
+    // miss an in-flight admission.
+    lifecycle: AtomicUsize,
     pending_reasons: AtomicUsize,
     requested_epoch: AtomicU64,
     completed_epoch: AtomicU64,
@@ -191,30 +220,37 @@ struct CpuMailbox {
 impl CpuMailbox {
     const fn new() -> Self {
         Self {
-            state: AtomicU8::new(CPU_OFFLINE),
-            admissions: AtomicUsize::new(0),
+            lifecycle: AtomicUsize::new(CPU_OFFLINE),
             pending_reasons: AtomicUsize::new(0),
             requested_epoch: AtomicU64::new(0),
             completed_epoch: AtomicU64::new(0),
         }
     }
 
-    fn try_admit(&self) -> bool {
-        if self.state.load(Ordering::Acquire) != CPU_ONLINE {
-            return false;
-        }
-        self.admissions.fetch_add(1, Ordering::AcqRel);
-        if self.state.load(Ordering::Acquire) == CPU_ONLINE {
-            true
-        } else {
-            self.admissions.fetch_sub(1, Ordering::Release);
-            false
+    fn try_admit(&self) -> Result<CpuAdmission<'_>, AdmissionError> {
+        let mut lifecycle = self.lifecycle.load(Ordering::Acquire);
+        loop {
+            if lifecycle & CPU_STATE_MASK != CPU_ONLINE {
+                return Err(AdmissionError::Unavailable);
+            }
+            let next = lifecycle
+                .checked_add(ADMISSION_ONE)
+                .ok_or(AdmissionError::Exhausted)?;
+            match self.lifecycle.compare_exchange_weak(
+                lifecycle,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(CpuAdmission { mailbox: self }),
+                Err(observed) => lifecycle = observed,
+            }
         }
     }
 
     fn release_admission(&self) {
-        let previous = self.admissions.fetch_sub(1, Ordering::Release);
-        debug_assert!(previous > 0);
+        let previous = self.lifecycle.fetch_sub(ADMISSION_ONE, Ordering::Release);
+        debug_assert!(previous >> 2 > 0);
     }
 
     fn post_reason(&self, reason: IpiReason) -> ReasonPost {
@@ -227,15 +263,33 @@ impl CpuMailbox {
     }
 
     fn snapshot(&self) -> CpuSnapshot {
-        let state = self.state.load(Ordering::Acquire);
+        let lifecycle = self.lifecycle.load(Ordering::Acquire);
+        let state = lifecycle & CPU_STATE_MASK;
         CpuSnapshot {
             online: state == CPU_ONLINE,
             draining: state == CPU_DRAINING,
-            admissions: self.admissions.load(Ordering::Acquire),
+            admissions: lifecycle >> 2,
             pending_reasons: self.pending_reasons.load(Ordering::Acquire),
             requested_epoch: self.requested_epoch.load(Ordering::Acquire),
             completed_epoch: self.completed_epoch.load(Ordering::Acquire),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdmissionError {
+    Unavailable,
+    Exhausted,
+}
+
+#[must_use = "dropping the admission releases the CPU lifecycle reader"]
+struct CpuAdmission<'mailbox> {
+    mailbox: &'mailbox CpuMailbox,
+}
+
+impl Drop for CpuAdmission<'_> {
+    fn drop(&mut self) {
+        self.mailbox.release_admission();
     }
 }
 
@@ -269,15 +323,14 @@ impl<const MAX_CPUS: usize> TlbShootdown<MAX_CPUS> {
     /// Publishes a fully initialized, locally flushed CPU as an IPI target.
     pub fn publish_online(&self, cpu: usize) -> Result<(), CpuLifecycleError> {
         let mailbox = self.cpu(cpu)?;
-        if mailbox.admissions.load(Ordering::Acquire) != 0
-            || mailbox.pending_reasons.load(Ordering::Acquire) != 0
+        if mailbox.pending_reasons.load(Ordering::Acquire) != 0
             || mailbox.requested_epoch.load(Ordering::Acquire)
                 != mailbox.completed_epoch.load(Ordering::Acquire)
         {
             return Err(CpuLifecycleError::MailboxNotDrained);
         }
         mailbox
-            .state
+            .lifecycle
             .compare_exchange(
                 CPU_OFFLINE,
                 CPU_ONLINE,
@@ -290,25 +343,33 @@ impl<const MAX_CPUS: usize> TlbShootdown<MAX_CPUS> {
 
     /// Stops new target admission for a CPU before its mailbox is drained.
     pub fn begin_offline(&self, cpu: usize) -> Result<(), CpuLifecycleError> {
-        self.cpu(cpu)?
-            .state
-            .compare_exchange(
-                CPU_ONLINE,
-                CPU_DRAINING,
+        let mailbox = self.cpu(cpu)?;
+        let mut lifecycle = mailbox.lifecycle.load(Ordering::Acquire);
+        loop {
+            if lifecycle & CPU_STATE_MASK != CPU_ONLINE {
+                return Err(CpuLifecycleError::InvalidState);
+            }
+            let draining = (lifecycle & !CPU_STATE_MASK) | CPU_DRAINING;
+            match mailbox.lifecycle.compare_exchange_weak(
+                lifecycle,
+                draining,
                 Ordering::AcqRel,
                 Ordering::Acquire,
-            )
-            .map(|_| ())
-            .map_err(|_| CpuLifecycleError::InvalidState)
+            ) {
+                Ok(_) => return Ok(()),
+                Err(observed) => lifecycle = observed,
+            }
+        }
     }
 
     /// Commits offline only after admission, reasons, and TLB work are drained.
     pub fn complete_offline(&self, cpu: usize) -> Result<(), CpuLifecycleError> {
         let mailbox = self.cpu(cpu)?;
-        if mailbox.state.load(Ordering::Acquire) != CPU_DRAINING {
+        let lifecycle = mailbox.lifecycle.load(Ordering::Acquire);
+        if lifecycle & CPU_STATE_MASK != CPU_DRAINING {
             return Err(CpuLifecycleError::InvalidState);
         }
-        if mailbox.admissions.load(Ordering::Acquire) != 0 {
+        if lifecycle >> 2 != 0 {
             return Err(CpuLifecycleError::AdmissionInProgress);
         }
         if mailbox.requested_epoch.load(Ordering::Acquire)
@@ -320,13 +381,8 @@ impl<const MAX_CPUS: usize> TlbShootdown<MAX_CPUS> {
             return Err(CpuLifecycleError::ReasonPending);
         }
         mailbox
-            .state
-            .compare_exchange(
-                CPU_DRAINING,
-                CPU_OFFLINE,
-                Ordering::Release,
-                Ordering::Acquire,
-            )
+            .lifecycle
+            .compare_exchange(lifecycle, CPU_OFFLINE, Ordering::Release, Ordering::Acquire)
             .map(|_| ())
             .map_err(|_| CpuLifecycleError::InvalidState)
     }
@@ -341,11 +397,11 @@ impl<const MAX_CPUS: usize> TlbShootdown<MAX_CPUS> {
             return Err(ReasonPostError::ReservedTlbReason);
         }
         let mailbox = self.cpus.get(cpu).ok_or(ReasonPostError::InvalidCpu)?;
-        if !mailbox.try_admit() {
-            return Err(ReasonPostError::CpuUnavailable);
-        }
+        let _admission = mailbox.try_admit().map_err(|error| match error {
+            AdmissionError::Unavailable => ReasonPostError::CpuUnavailable,
+            AdmissionError::Exhausted => ReasonPostError::AdmissionExhausted,
+        })?;
         let post = mailbox.post_reason(reason);
-        mailbox.release_admission();
         Ok(post)
     }
 
@@ -353,16 +409,29 @@ impl<const MAX_CPUS: usize> TlbShootdown<MAX_CPUS> {
     ///
     /// Every online CPU except `issuer_cpu` becomes a target. Hardware IPIs must
     /// be sent only to CPUs for which [`ShootdownRequest::needs_kick`] is true.
+    /// Any error leaves the caller without a grace request after its page-table
+    /// mutation, and may follow partial target publication. A real adapter must
+    /// therefore fail-stop instead of reclaiming the affected resources.
     pub fn issue_after_local_flush(
         &self,
         issuer_cpu: usize,
     ) -> Result<ShootdownRequest<'_, MAX_CPUS>, ShootdownIssueError> {
+        self.issue_after_local_flush_with(issuer_cpu, || {})
+    }
+
+    fn issue_after_local_flush_with(
+        &self,
+        issuer_cpu: usize,
+        after_issuer_admission: impl FnOnce(),
+    ) -> Result<ShootdownRequest<'_, MAX_CPUS>, ShootdownIssueError> {
         let Some(issuer) = self.cpus.get(issuer_cpu) else {
             return Err(ShootdownIssueError::InvalidCpu);
         };
-        if issuer.state.load(Ordering::Acquire) != CPU_ONLINE {
-            return Err(ShootdownIssueError::IssuerOffline);
-        }
+        let issuer_admission = issuer.try_admit().map_err(|error| match error {
+            AdmissionError::Unavailable => ShootdownIssueError::IssuerOffline,
+            AdmissionError::Exhausted => ShootdownIssueError::AdmissionExhausted,
+        })?;
+        after_issuer_admission();
         // This RMW is sequenced after the caller's PTE stores. AcqRel makes
         // the total global epoch order carry earlier writers' stores forward:
         // acknowledging a later epoch therefore also covers every earlier one.
@@ -377,18 +446,25 @@ impl<const MAX_CPUS: usize> TlbShootdown<MAX_CPUS> {
         let mut kicks = [false; MAX_CPUS];
 
         for (cpu, mailbox) in self.cpus.iter().enumerate() {
-            if cpu == issuer_cpu || !mailbox.try_admit() {
+            if cpu == issuer_cpu {
                 continue;
             }
+            let _target_admission = match mailbox.try_admit() {
+                Ok(admission) => admission,
+                Err(AdmissionError::Unavailable) => continue,
+                Err(AdmissionError::Exhausted) => {
+                    return Err(ShootdownIssueError::AdmissionExhausted);
+                }
+            };
             mailbox.requested_epoch.fetch_max(epoch, Ordering::Release);
             let post = mailbox.post_reason(TLB_SHOOTDOWN_REASON);
             targets[cpu] = true;
             kicks[cpu] = post.needs_kick();
-            mailbox.release_admission();
         }
 
         Ok(ShootdownRequest {
             domain: self,
+            _issuer_admission: issuer_admission,
             epoch,
             targets,
             kicks,
@@ -445,26 +521,29 @@ impl<const MAX_CPUS: usize> Default for TlbShootdown<MAX_CPUS> {
 /// Fixed target and hardware-kick facts for one global shootdown epoch.
 ///
 /// The request borrows the domain that issued it, so safe code cannot ask a
-/// different domain to manufacture grace for an unrelated epoch.
+/// different domain to manufacture grace for an unrelated epoch. The grace
+/// returned by [`Self::try_complete`] carries the same domain borrow.
 ///
 /// ```compile_fail
 /// use axtlb::TlbShootdown;
 ///
-/// let first = TlbShootdown::<1>::new();
-/// let second = TlbShootdown::<1>::new();
-/// first.publish_online(0).unwrap();
-/// second.publish_online(0).unwrap();
-/// let request = first.issue_after_local_flush(0).unwrap();
-/// let _wrong_domain_grace = second.try_complete(&request);
+/// let request = {
+///     let domain = TlbShootdown::<1>::new();
+///     domain.publish_online(0).unwrap();
+///     domain.issue_after_local_flush(0).unwrap()
+/// };
+/// let _grace = request.try_complete();
 /// ```
+#[must_use = "a shootdown request must reach grace or force the adapter to stop"]
 pub struct ShootdownRequest<'domain, const MAX_CPUS: usize> {
     domain: &'domain TlbShootdown<MAX_CPUS>,
+    _issuer_admission: CpuAdmission<'domain>,
     epoch: u64,
     targets: [bool; MAX_CPUS],
     kicks: [bool; MAX_CPUS],
 }
 
-impl<const MAX_CPUS: usize> ShootdownRequest<'_, MAX_CPUS> {
+impl<'domain, const MAX_CPUS: usize> ShootdownRequest<'domain, MAX_CPUS> {
     /// Returns this request's nonzero global epoch.
     pub const fn epoch(&self) -> u64 {
         self.epoch
@@ -486,7 +565,7 @@ impl<const MAX_CPUS: usize> ShootdownRequest<'_, MAX_CPUS> {
     }
 
     /// Returns grace only when every target in this request acknowledged it.
-    pub fn try_complete(&self) -> Option<TlbGrace> {
+    pub fn try_complete(&self) -> Option<TlbGrace<'domain, MAX_CPUS>> {
         for (cpu, targeted) in self.targets.iter().copied().enumerate() {
             if targeted
                 && self.domain.cpus[cpu]
@@ -497,7 +576,10 @@ impl<const MAX_CPUS: usize> ShootdownRequest<'_, MAX_CPUS> {
                 return None;
             }
         }
-        Some(TlbGrace { epoch: self.epoch })
+        Some(TlbGrace {
+            domain: self.domain,
+            epoch: self.epoch,
+        })
     }
 }
 
@@ -505,7 +587,7 @@ impl<const MAX_CPUS: usize> ShootdownRequest<'_, MAX_CPUS> {
 mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
     use std::{
-        sync::{Arc, Barrier},
+        sync::{Arc, Barrier, mpsc},
         thread,
     };
 
@@ -582,6 +664,27 @@ mod tests {
     }
 
     #[test]
+    fn grace_identity_includes_the_issuing_domain() {
+        let first = TlbShootdown::<1>::new();
+        let second = TlbShootdown::<1>::new();
+        online(&first);
+        online(&second);
+
+        let first_grace = first
+            .issue_after_local_flush(0)
+            .unwrap()
+            .try_complete()
+            .unwrap();
+        let second_grace = second
+            .issue_after_local_flush(0)
+            .unwrap()
+            .try_complete()
+            .unwrap();
+        assert_eq!(first_grace.epoch(), second_grace.epoch());
+        assert_ne!(first_grace, second_grace);
+    }
+
+    #[test]
     fn non_tlb_reasons_share_the_fixed_bit_mailbox() {
         let domain = TlbShootdown::<1>::new();
         online(&domain);
@@ -622,6 +725,64 @@ mod tests {
     }
 
     #[test]
+    fn issuer_admission_blocks_offline_completion_until_publication_finishes() {
+        let domain = Arc::new(TlbShootdown::<2>::new());
+        online(&domain);
+        let (admitted_tx, admitted_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let issuer_domain = domain.clone();
+
+        let issuer = thread::spawn(move || {
+            let request = issuer_domain
+                .issue_after_local_flush_with(0, || {
+                    admitted_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                })
+                .unwrap();
+            (request.epoch(), request.targets(1))
+        });
+
+        admitted_rx.recv().unwrap();
+        domain.begin_offline(0).unwrap();
+        let snapshot = domain.cpu_snapshot(0).unwrap();
+        assert!(snapshot.is_draining());
+        assert_eq!(snapshot.admissions(), 1);
+        assert_eq!(
+            domain.complete_offline(0),
+            Err(CpuLifecycleError::AdmissionInProgress)
+        );
+
+        resume_tx.send(()).unwrap();
+        let (epoch, targeted_remote) = issuer.join().unwrap();
+        assert_eq!(epoch, 1);
+        assert!(targeted_remote);
+        domain.complete_offline(0).unwrap();
+    }
+
+    #[test]
+    fn live_request_keeps_issuer_admitted_until_grace_is_observed() {
+        let domain = TlbShootdown::<2>::new();
+        online(&domain);
+        let request = domain.issue_after_local_flush(0).unwrap();
+
+        domain.begin_offline(0).unwrap();
+        assert_eq!(domain.cpu_snapshot(0).unwrap().admissions(), 1);
+        assert_eq!(
+            domain.complete_offline(0),
+            Err(CpuLifecycleError::AdmissionInProgress)
+        );
+        assert_eq!(
+            domain.take_pending_reasons(1).unwrap(),
+            TLB_SHOOTDOWN_REASON.bit()
+        );
+        domain.service_tlb(1, || {}).unwrap();
+        let grace = request.try_complete().unwrap();
+        drop(request);
+        domain.complete_offline(0).unwrap();
+        assert_eq!(grace.epoch(), 1);
+    }
+
+    #[test]
     fn invalid_cpu_and_issuer_state_are_explicit() {
         let domain = TlbShootdown::<2>::new();
         assert_eq!(
@@ -650,6 +811,28 @@ mod tests {
             Some(ShootdownIssueError::EpochExhausted)
         );
         assert_eq!(domain.next_epoch.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(domain.cpu_snapshot(0).unwrap().admissions(), 0);
+    }
+
+    #[test]
+    fn lifecycle_admission_exhaustion_is_explicit_and_releases_the_issuer() {
+        let domain = TlbShootdown::<2>::new();
+        online(&domain);
+        let exhausted_online = (usize::MAX & !CPU_STATE_MASK) | CPU_ONLINE;
+        domain.cpus[1]
+            .lifecycle
+            .store(exhausted_online, Ordering::Relaxed);
+
+        assert_eq!(
+            domain.issue_after_local_flush(0).err(),
+            Some(ShootdownIssueError::AdmissionExhausted)
+        );
+        assert_eq!(domain.cpu_snapshot(0).unwrap().admissions(), 0);
+        let reason = IpiReason::try_new(1).unwrap();
+        assert_eq!(
+            domain.post_non_tlb_reason(1, reason),
+            Err(ReasonPostError::AdmissionExhausted)
+        );
     }
 
     #[test]
