@@ -16,6 +16,12 @@ cargo +1.85.0 clippy -p thekernel-axfault --all-targets --locked -- -D warnings
 RUSTDOCFLAGS='-D warnings' \
     cargo +1.85.0 doc -p thekernel-axfault --no-deps --locked
 
+cargo +1.85.0 test -p thekernel-axtlb --all-targets --locked
+cargo +1.85.0 test -p thekernel-axtlb --doc --locked
+cargo +1.85.0 clippy -p thekernel-axtlb --all-targets --locked -- -D warnings
+RUSTDOCFLAGS='-D warnings' \
+    cargo +1.85.0 doc -p thekernel-axtlb --no-deps --locked
+
 cargo +1.85.0 test -p thekernel-axpoll --all-targets --locked
 cargo +1.85.0 clippy -p thekernel-axpoll --all-targets --locked -- -D warnings
 RUSTDOCFLAGS='-D warnings' \
@@ -42,6 +48,7 @@ done
 
 for target in riscv64gc-unknown-none-elf loongarch64-unknown-none; do
     cargo +1.85.0 check -p thekernel-axfault --locked --target "$target"
+    cargo +1.85.0 check -p thekernel-axtlb --locked --target "$target"
     cargo +1.85.0 check -p thekernel-axpoll --locked --target "$target"
     cargo +nightly-2025-05-20 check \
         -p thekernel-axtask \
@@ -50,7 +57,7 @@ for target in riscv64gc-unknown-none-elf loongarch64-unknown-none; do
         --features "$nightly_features"
 done
 
-cargo +1.85.0 package -p thekernel-axfault --locked
+CARGO_TOOLCHAIN=1.85.0 scripts/package-unpack-original.sh
 CARGO_TOOLCHAIN=nightly-2025-05-20 scripts/publish-dry-run.sh
 CARGO_TOOLCHAIN=nightly-2025-05-20 scripts/package-unpack.sh
 printf 'workspace-ci: PASS\n'

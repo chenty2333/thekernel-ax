@@ -1,0 +1,15 @@
+[package]
+name = "thekernel-axtlb"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["TheKernel contributors"]
+description = "Bounded allocation-free SMP TLB shootdown state machine"
+license = "Apache-2.0"
+repository = "https://github.com/chenty2333/thekernel-ax"
+documentation = "https://docs.rs/thekernel-axtlb"
+readme = "README.md"
+
+[lib]
+name = "axtlb"
+path = "src/lib.rs"
