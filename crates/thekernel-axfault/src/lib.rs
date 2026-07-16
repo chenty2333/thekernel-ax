@@ -564,6 +564,21 @@ where
         self.id
     }
 
+    /// Finds the live request that a subsequent [`Self::admit`] would reuse.
+    ///
+    /// This read-only probe lets an upper policy distinguish a new request,
+    /// which consumes request quota, from one additional waiter on an exact
+    /// existing request. The returned generation-tagged snapshot is advisory
+    /// until the externally serialized caller invokes `admit`; consumers must
+    /// keep both operations in the same broker critical section.
+    pub fn matching_request(&self, handler: H, key: K) -> Option<RequestSnapshot<K, H>> {
+        let slot = self.requests.iter().position(|slot| {
+            slot.record
+                .is_some_and(|record| record.handler == handler && record.key == key)
+        })?;
+        self.snapshot_slot(slot)
+    }
+
     /// Admits one exact request plus one independently cancellable waiter.
     ///
     /// An existing live request is reused only when both `handler` and `key`
@@ -1234,7 +1249,12 @@ mod tests {
     fn exact_request_coalescing_preserves_independent_waiters() {
         let mut broker = Broker::try_new(3, 4).unwrap();
         let key = Key::page(7, 11, 0x1000, Access::Read);
+        assert!(broker.matching_request(3, key).is_none());
         let first = broker.admit(3, key).unwrap();
+        let matching = broker.matching_request(3, key).unwrap();
+        assert_eq!(matching.token(), first.request());
+        assert_eq!(matching.phase(), RequestPhase::Pending);
+        assert!(broker.matching_request(4, key).is_none());
         let second = broker.admit(3, key).unwrap();
         assert!(!first.coalesced());
         assert!(second.coalesced());
