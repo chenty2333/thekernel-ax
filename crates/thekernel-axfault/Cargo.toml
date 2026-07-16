@@ -1,0 +1,15 @@
+[package]
+name = "thekernel-axfault"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["TheKernel contributors"]
+description = "Bounded generation-safe fault-request broker state"
+license = "Apache-2.0"
+repository = "https://github.com/chenty2333/thekernel-ax"
+documentation = "https://docs.rs/thekernel-axfault"
+readme = "README.md"
+
+[lib]
+name = "axfault"
+path = "src/lib.rs"

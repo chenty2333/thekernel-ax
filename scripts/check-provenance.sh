@@ -66,4 +66,10 @@ grep -Fq 'bc45120776afddf28b19bb7aba87e379c5779cf28a8f7884943a4821caeec774' \
 grep -Fq '6c6765c05df0550e31edb0ca82d468199f108b3f' "$axtask/VENDOR.md"
 grep -Fq 'dbbaea9ff0ee6c63bdfb9d9828d4a8d25ba8d0b1' "$axtask/VENDOR.md"
 
+axfault="$repo_root/crates/thekernel-axfault"
+check_sha256 \
+    c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4 \
+    "$axfault/LICENSES/Apache-2.0.txt"
+grep -Fq 'license = "Apache-2.0"' "$axfault/Cargo.toml"
+
 printf 'provenance: PASS\n'

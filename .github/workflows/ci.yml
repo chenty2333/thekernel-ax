@@ -46,6 +46,26 @@ jobs:
       - name: Test unpacked axsched artifact at MSRV
         run: scripts/test-axsched-msrv.sh
 
+  axfault-msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: 1.85.0
+          components: clippy
+          targets: riscv64gc-unknown-none-elf,loongarch64-unknown-none
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Test, lint, document, package, and cross-check axfault
+        run: |
+          cargo +1.85.0 test -p thekernel-axfault --all-targets --locked
+          cargo +1.85.0 test -p thekernel-axfault --doc --locked
+          cargo +1.85.0 clippy -p thekernel-axfault --all-targets --locked -- -D warnings
+          RUSTDOCFLAGS='-D warnings' cargo +1.85.0 doc -p thekernel-axfault --no-deps --locked
+          cargo +1.85.0 check -p thekernel-axfault --locked --target riscv64gc-unknown-none-elf
+          cargo +1.85.0 check -p thekernel-axfault --locked --target loongarch64-unknown-none
+          cargo +1.85.0 package -p thekernel-axfault --locked
+
   axpoll-msrv:
     runs-on: ubuntu-latest
     steps:

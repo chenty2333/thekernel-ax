@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/thekernel-axfault",
     "crates/thekernel-axtask",
     "crates/thekernel-axsched",
     "crates/thekernel-axpoll",

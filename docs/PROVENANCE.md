@@ -18,6 +18,14 @@ The initial standalone source was copied from TheKernel commit
 The copied crate paths were clean at that commit. The unrelated TheKernel root
 `README.md` working-tree modification was not copied or modified.
 
+## Original fault-broker source
+
+`thekernel-axfault` 0.1.0 was designed and implemented in this repository as a
+generic, bounded state core. It has no upstream registry archive, vendored
+baseline, or copied Linux MM/userfaultfd implementation. Its source is licensed
+under Apache-2.0; the distributed license text is the canonical Apache-2.0 text
+already used by this repository.
+
 ## Immutable registry baselines
 
 | New package | Upstream registry baseline | Registry archive SHA-256 | Recorded source commit |
@@ -58,6 +66,9 @@ license expression:
 
 The same three files are included under each crate so a registry artifact is
 self-contained.
+
+The original `thekernel-axfault` package declares Apache-2.0 and includes only
+`LICENSES/Apache-2.0.txt`, whose SHA-256 is the Apache-2.0 value above.
 
 ## Verification rule
 

@@ -1,0 +1,15 @@
+# Changelog
+
+## 0.1.0
+
+- Add explicitly bounded, preallocated request and waiter registries.
+- Add broker/slot/generation request and waiter tokens that never wrap.
+- Coalesce only exact handler/request keys and retain independent waiter
+  cancellation ownership.
+- Add FIFO pending-to-delivered claims whose copyout-failure retry never
+  reorders the request.
+- Add immediate or deferred terminal visibility, predicate/range release,
+  handler detach, and final-waiter reclamation.
+- Add exact load snapshots and deterministic race/state-machine tests.
+- Keep the core `no_std`, unsafe-free, allocation-free after construction, and
+  independent of tasks, Linux MM/VMA policy, readiness, and errno.
