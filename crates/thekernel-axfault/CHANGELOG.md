@@ -6,8 +6,8 @@
 - Add broker/slot/generation request and waiter tokens that never wrap.
 - Coalesce only exact handler/request keys and retain independent waiter
   cancellation ownership.
-- Add FIFO pending-to-delivered claims whose copyout-failure retry never
-  reorders the request.
+- Add FIFO pending-to-delivered claims that never requeue a request behind
+  newer work when the upper layer drops its delivery snapshot.
 - Add immediate or deferred terminal visibility, predicate/range release,
   handler detach, and final-waiter reclamation.
 - Add exact load snapshots and deterministic race/state-machine tests.

@@ -177,7 +177,7 @@ impl WaiterToken {
 pub enum RequestPhase {
     /// The request is linked in the broker's FIFO delivery queue.
     Pending,
-    /// A handler claimed the request and owns copyout/retry sequencing.
+    /// A handler claimed the request; it is no longer pending for delivery.
     Delivered,
     /// A terminal result exists but is not yet visible to waiters.
     TerminalDeferred,
@@ -718,25 +718,6 @@ where
             return self.snapshot_slot(slot);
         }
         None
-    }
-
-    /// Revalidates the exact delivered request after an event-copy failure.
-    ///
-    /// This operation does not change any queue or phase. The adapter retains
-    /// the request token and retries the same event; a newer pending request
-    /// cannot move ahead of it through this API.
-    pub fn retain_delivery_after_copyout_fault(
-        &self,
-        token: RequestToken,
-    ) -> Result<RequestSnapshot<K, H>, RequestError> {
-        let slot = self.request_index(token)?;
-        let snapshot = self
-            .snapshot_slot(slot)
-            .ok_or(RequestError::StaleOrForeign)?;
-        if snapshot.phase != RequestPhase::Delivered {
-            return Err(RequestError::NotDelivered);
-        }
-        Ok(snapshot)
     }
 
     /// Returns a stable copy of one live request's current facts.
@@ -1306,7 +1287,7 @@ mod tests {
     }
 
     #[test]
-    fn copyout_failure_keeps_delivered_request_out_of_pending_fifo() {
+    fn dropping_a_claim_snapshot_keeps_request_out_of_pending_fifo() {
         let mut broker = Broker::try_new(3, 3).unwrap();
         let first = broker
             .admit(9, Key::page(1, 1, 0x1000, Access::Read))
@@ -1315,12 +1296,10 @@ mod tests {
             .admit(9, Key::page(2, 1, 0x2000, Access::Read))
             .unwrap();
 
-        let delivered = broker.claim_next(9).unwrap();
-        assert_eq!(delivered.token(), first.request());
-        let retained = broker
-            .retain_delivery_after_copyout_fault(first.request())
-            .unwrap();
-        assert_eq!(retained.phase(), RequestPhase::Delivered);
+        {
+            let delivered = broker.claim_next(9).unwrap();
+            assert_eq!(delivered.token(), first.request());
+        }
         assert_eq!(broker.claim_next(9).unwrap().token(), second.request());
         assert!(broker.claim_next(9).is_none());
         assert_eq!(

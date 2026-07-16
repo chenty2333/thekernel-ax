@@ -40,9 +40,11 @@ coalesce accidentally. Cancelling or consuming the final waiter immediately
 reclaims its request, including a pending or delivered request.
 
 New requests enter one FIFO pending list. `claim_next(handler)` removes the
-oldest matching request and leaves it in `Delivered`. A failed userspace event
-copy must call `retain_delivery_after_copyout_fault` (or simply keep the token):
-the request remains delivered and is never appended behind a newer request.
+oldest matching request and leaves it in `Delivered`. Dropping the returned
+snapshot does not requeue the request or append it behind a newer request.
+Whether a failed upper-layer delivery is retried is deliberately outside this
+crate; the generic broker only preserves the claimed phase until completion or
+final-waiter cancellation.
 
 Completion may be immediately `Visible` or `Deferred`. Deferred completion is
 the generic mechanism used by a Linux adapter for `DONTWAKE`: the terminal
