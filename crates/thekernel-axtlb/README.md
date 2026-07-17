@@ -26,9 +26,19 @@ code cannot complete it against another domain's epochs.
   page-table or executable-data stores visible and completed every matching
   local operation. `issue_after_local_flush` is the TLB-only convenience API.
 - An IPI handler clears pending reason bits and calls `service_maintenance`.
-  Its callback must execute every requested bit and take no address-space,
-  frame, pin, allocator, or mailbox lock. If both bits are present, it executes
-  the full TLB invalidation before instruction-stream synchronization.
+  One invocation captures one fixed epoch snapshot and invokes its callback at
+  most once, so interrupt work cannot chase an unbounded stream of concurrent
+  publications. Its callback must execute every requested bit and take no
+  address-space, frame, pin, allocator, or mailbox lock. If both bits are
+  present, it executes the full TLB invalidation before instruction-stream
+  synchronization.
+- A publication after the handler clears its reason bit either appears in the
+  fixed service snapshot or leaves a newly posted reason for the next service.
+  Work published after the snapshot is never acknowledged by the earlier local
+  maintenance operation.
+- `ShootdownRequest::target_pending` and `target_complete` report only the
+  target, epoch, and maintenance classes owned by that request. Newer or
+  unrelated mailbox work does not make an older request look incomplete.
 - CPU offline first closes target admission, waits for outstanding admission
   readers, drains and acknowledges the mailbox, and only then commits offline.
 - A live request retains its issuer admission through grace; target mailboxes

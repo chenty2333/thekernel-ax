@@ -598,52 +598,55 @@ impl<const MAX_CPUS: usize> TlbShootdown<MAX_CPUS> {
         Ok(self.mailbox(cpu)?.pending_reasons.swap(0, Ordering::AcqRel))
     }
 
-    /// Services every maintenance epoch visible to one CPU.
+    /// Services one fixed snapshot of maintenance work visible to one CPU.
     ///
-    /// `maintain_local` receives the exact nonempty union needed in one round.
-    /// It runs without any lock owned by this crate. The adapter must execute
-    /// every requested operation, stay allocation-free, and must not acquire
-    /// address-space, frame, pin, or mailbox locks. When both bits are present,
-    /// translation invalidation must precede instruction-stream synchronization.
+    /// `maintain_local` is called at most once with the exact nonempty union in
+    /// the captured snapshot. It runs without any lock owned by this crate. The
+    /// adapter must execute every requested operation, stay allocation-free,
+    /// and must not acquire address-space, frame, pin, or mailbox locks. When
+    /// both bits are present, translation invalidation must precede
+    /// instruction-stream synchronization.
+    ///
+    /// Work published after the snapshot is not acknowledged by this call.
+    /// The publisher posts the maintenance reason after publishing its epoch,
+    /// so that work remains available to a later bounded service invocation.
     pub fn service_maintenance(
         &self,
         cpu: usize,
-        mut maintain_local: impl FnMut(CpuMaintenance),
+        maintain_local: impl FnOnce(CpuMaintenance),
     ) -> Result<ShootdownService, MailboxError> {
         let mailbox = self.mailbox(cpu)?;
-        let mut tlb_flush_count = 0usize;
-        let mut icache_flush_count = 0usize;
+        let requested_tlb = mailbox.requested_tlb_epoch.load(Ordering::Acquire);
+        let mut completed_tlb = mailbox.completed_tlb_epoch.load(Ordering::Acquire);
+        let requested_icache = mailbox.requested_icache_epoch.load(Ordering::Acquire);
+        let mut completed_icache = mailbox.completed_icache_epoch.load(Ordering::Acquire);
+        let pending = CpuMaintenance::from_pending(
+            completed_tlb < requested_tlb,
+            completed_icache < requested_icache,
+        );
 
-        loop {
-            let requested_tlb = mailbox.requested_tlb_epoch.load(Ordering::Acquire);
-            let completed_tlb = mailbox.completed_tlb_epoch.load(Ordering::Acquire);
-            let requested_icache = mailbox.requested_icache_epoch.load(Ordering::Acquire);
-            let completed_icache = mailbox.completed_icache_epoch.load(Ordering::Acquire);
-            let Some(maintenance) = CpuMaintenance::from_pending(
-                completed_tlb < requested_tlb,
-                completed_icache < requested_icache,
-            ) else {
-                return Ok(ShootdownService {
-                    completed_tlb_epoch: completed_tlb,
-                    completed_icache_epoch: completed_icache,
-                    tlb_flush_count,
-                    icache_flush_count,
-                });
-            };
+        if let Some(maintenance) = pending {
             maintain_local(maintenance);
             if maintenance.needs_tlb() {
-                tlb_flush_count = tlb_flush_count.saturating_add(1);
-                mailbox
+                completed_tlb = mailbox
                     .completed_tlb_epoch
-                    .fetch_max(requested_tlb, Ordering::Release);
+                    .fetch_max(requested_tlb, Ordering::Release)
+                    .max(requested_tlb);
             }
             if maintenance.needs_icache() {
-                icache_flush_count = icache_flush_count.saturating_add(1);
-                mailbox
+                completed_icache = mailbox
                     .completed_icache_epoch
-                    .fetch_max(requested_icache, Ordering::Release);
+                    .fetch_max(requested_icache, Ordering::Release)
+                    .max(requested_icache);
             }
         }
+
+        Ok(ShootdownService {
+            completed_tlb_epoch: completed_tlb,
+            completed_icache_epoch: completed_icache,
+            tlb_flush_count: usize::from(pending.is_some_and(CpuMaintenance::needs_tlb)),
+            icache_flush_count: usize::from(pending.is_some_and(CpuMaintenance::needs_icache)),
+        })
     }
 
     /// Returns a read-only mailbox snapshot for bounded timeout diagnostics.
@@ -710,21 +713,36 @@ impl<'domain, const MAX_CPUS: usize> ShootdownRequest<'domain, MAX_CPUS> {
         self.targets.iter().filter(|targeted| **targeted).count()
     }
 
+    /// Returns whether `cpu` is a target still pending this exact request.
+    ///
+    /// This query ignores unrelated maintenance classes and newer epochs. It
+    /// returns `false` for an invalid CPU index or a CPU not targeted by this
+    /// request.
+    pub fn target_pending(&self, cpu: usize) -> bool {
+        let Some(true) = self.targets.get(cpu).copied() else {
+            return false;
+        };
+        let mailbox = &self.domain.cpus[cpu];
+        (self.maintenance.needs_tlb()
+            && mailbox.completed_tlb_epoch.load(Ordering::Acquire) < self.epoch)
+            || (self.maintenance.needs_icache()
+                && mailbox.completed_icache_epoch.load(Ordering::Acquire) < self.epoch)
+    }
+
+    /// Returns whether `cpu` is a target that completed this exact request.
+    ///
+    /// This query ignores unrelated maintenance classes and newer epochs. It
+    /// returns `false` for an invalid CPU index or a CPU not targeted by this
+    /// request.
+    pub fn target_complete(&self, cpu: usize) -> bool {
+        self.targets(cpu) && !self.target_pending(cpu)
+    }
+
     /// Returns grace only when every target in this request acknowledged it.
     pub fn try_complete(&self) -> Option<ShootdownGrace<'domain, MAX_CPUS>> {
         for (cpu, targeted) in self.targets.iter().copied().enumerate() {
-            if targeted {
-                let mailbox = &self.domain.cpus[cpu];
-                if self.maintenance.needs_tlb()
-                    && mailbox.completed_tlb_epoch.load(Ordering::Acquire) < self.epoch
-                {
-                    return None;
-                }
-                if self.maintenance.needs_icache()
-                    && mailbox.completed_icache_epoch.load(Ordering::Acquire) < self.epoch
-                {
-                    return None;
-                }
+            if targeted && self.target_pending(cpu) {
+                return None;
             }
         }
         Some(ShootdownGrace {
@@ -770,6 +788,12 @@ mod tests {
         assert!(request.needs_kick(0));
         assert!(request.needs_kick(2));
         assert!(request.needs_kick(3));
+        assert!(request.target_pending(0));
+        assert!(!request.target_complete(0));
+        assert!(!request.target_pending(1));
+        assert!(!request.target_complete(1));
+        assert!(!request.target_pending(4));
+        assert!(!request.target_complete(4));
         assert!(request.try_complete().is_none());
     }
 
@@ -799,8 +823,120 @@ mod tests {
         assert_eq!(service.tlb_flush_count(), 1);
         assert_eq!(service.icache_flush_count(), 0);
         assert_eq!(flushes.load(Ordering::Relaxed), 1);
+        assert!(first.target_complete(1));
+        assert!(second.target_complete(1));
         assert_eq!(first.try_complete().unwrap().epoch(), first.epoch());
         assert_eq!(second.try_complete().unwrap().epoch(), second.epoch());
+    }
+
+    #[test]
+    fn publication_after_reason_take_before_service_is_not_lost() {
+        let domain = TlbShootdown::<2>::new();
+        online(&domain);
+
+        let first = domain.issue_after_local_flush(0).unwrap();
+        assert_eq!(
+            domain.take_pending_reasons(1).unwrap(),
+            CPU_MAINTENANCE_REASON.bit()
+        );
+        let second = domain.issue_after_local_flush(0).unwrap();
+        assert!(second.needs_kick(1));
+
+        let service = domain.service_maintenance(1, |_| {}).unwrap();
+        assert_eq!(service.completed_tlb_epoch(), second.epoch());
+        assert_eq!(service.tlb_flush_count(), 1);
+        assert!(first.target_complete(1));
+        assert!(second.target_complete(1));
+
+        // The publication raced after the reason take. Its fresh reason is
+        // harmless even though the following fixed snapshot already covered it.
+        assert_eq!(
+            domain.take_pending_reasons(1).unwrap(),
+            CPU_MAINTENANCE_REASON.bit()
+        );
+        let no_op = domain
+            .service_maintenance(1, |_| panic!("completed work must not flush again"))
+            .unwrap();
+        assert_eq!(no_op.tlb_flush_count(), 0);
+        assert_eq!(no_op.completed_tlb_epoch(), second.epoch());
+    }
+
+    #[test]
+    fn concurrent_publication_during_service_waits_for_the_next_snapshot() {
+        let domain = Arc::new(TlbShootdown::<2>::new());
+        online(&domain);
+        let first = domain.issue_after_local_flush(0).unwrap();
+        assert_eq!(
+            domain.take_pending_reasons(1).unwrap(),
+            CPU_MAINTENANCE_REASON.bit()
+        );
+
+        let (maintaining_tx, maintaining_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let service_domain = domain.clone();
+        let service_thread = thread::spawn(move || {
+            service_domain
+                .service_maintenance(1, |maintenance| {
+                    assert_eq!(maintenance, CpuMaintenance::TLB);
+                    maintaining_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                })
+                .unwrap()
+        });
+
+        maintaining_rx.recv().unwrap();
+        let second = domain.issue_after_local_flush(0).unwrap();
+        assert!(second.needs_kick(1));
+        assert!(first.target_pending(1));
+        assert!(second.target_pending(1));
+        resume_tx.send(()).unwrap();
+
+        let first_service = service_thread.join().unwrap();
+        assert_eq!(first_service.completed_tlb_epoch(), first.epoch());
+        assert_eq!(first_service.tlb_flush_count(), 1);
+        assert!(first.target_complete(1));
+        assert!(second.target_pending(1));
+        assert!(!second.target_complete(1));
+
+        assert_eq!(
+            domain.take_pending_reasons(1).unwrap(),
+            CPU_MAINTENANCE_REASON.bit()
+        );
+        let second_service = domain.service_maintenance(1, |_| {}).unwrap();
+        assert_eq!(second_service.completed_tlb_epoch(), second.epoch());
+        assert_eq!(second_service.tlb_flush_count(), 1);
+        assert!(second.target_complete(1));
+        assert!(second.try_complete().is_some());
+    }
+
+    #[test]
+    fn publication_after_service_uses_a_fresh_reason_and_exact_request_status() {
+        let domain = TlbShootdown::<2>::new();
+        online(&domain);
+        let icache = domain
+            .issue_after_local_maintenance(0, CpuMaintenance::ICACHE)
+            .unwrap();
+        assert_eq!(
+            domain.take_pending_reasons(1).unwrap(),
+            CPU_MAINTENANCE_REASON.bit()
+        );
+        domain.service_maintenance(1, |_| {}).unwrap();
+        assert!(icache.target_complete(1));
+
+        let later_tlb = domain.issue_after_local_flush(0).unwrap();
+        assert!(later_tlb.needs_kick(1));
+        assert!(later_tlb.target_pending(1));
+        // A newer, unrelated TLB request does not reopen the completed I-cache
+        // acknowledgement owned by the older request.
+        assert!(icache.target_complete(1));
+        assert!(icache.try_complete().is_some());
+
+        assert_eq!(
+            domain.take_pending_reasons(1).unwrap(),
+            CPU_MAINTENANCE_REASON.bit()
+        );
+        domain.service_maintenance(1, |_| {}).unwrap();
+        assert!(later_tlb.target_complete(1));
     }
 
     #[test]

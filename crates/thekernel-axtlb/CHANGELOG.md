@@ -11,3 +11,7 @@
 - Retain issuer admission in each live shootdown request through grace.
 - Carry fixed TLB/I-cache maintenance bits in each request and acknowledge
   their epochs independently.
+- Bound each maintenance service to one fixed snapshot and at most one local
+  callback, leaving concurrent publication for a later reason/service pass.
+- Add request-owned per-target pending and completion queries that ignore
+  unrelated maintenance and newer epochs.
