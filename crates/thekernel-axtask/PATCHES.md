@@ -75,3 +75,6 @@ SHA-256
 - Re-establish the local IRQ-enabled invariant at the guard-free idle boundary
   before entering the architecture wait instruction, so an idle continuation
   resumed from IRQ-exit scheduling cannot strand timer or IPI delivery.
+- Preserve IRQ-exit preemption for regular tasks, but defer an IRQ-off idle
+  reschedule until that boundary; the pending request remains owned by the idle
+  task and is consumed after interrupt return with local IRQs enabled.

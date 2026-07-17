@@ -1770,6 +1770,19 @@ mod mechanism_tests {
         );
     }
 
+    #[cfg(feature = "preempt")]
+    #[test]
+    fn deferred_preempt_enable_preserves_pending_reschedule() {
+        let task = TaskInner::new_init("preempt-deferred".into()).unwrap();
+        task.disable_preempt();
+        task.set_preempt_pending(true);
+
+        task.enable_preempt(false);
+
+        assert!(task.can_preempt(0));
+        assert!(task.need_resched.load(Ordering::Acquire));
+    }
+
     #[test]
     fn exited_queue_generation_exhaustion_is_explicit_and_rolls_back() {
         let task = TaskInner::new_init("exit-generation".into()).unwrap();

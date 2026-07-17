@@ -86,9 +86,24 @@ impl kernel_guard::KernelGuardIf for KernelGuardIfImpl {
 
     fn enable_preempt() {
         if let Some(curr) = current_may_uninit() {
-            curr.enable_preempt(true);
+            // IRQ-exit preemption remains enabled for regular tasks.  Idle is
+            // different: switching away while its interrupt return frame is
+            // suspended can leave the next continuation with local IRQs off.
+            // Defer that one case to run_idle's explicit safe boundary.
+            #[cfg(all(feature = "irq", target_os = "none"))]
+            let resched =
+                preempt_enable_should_reschedule(curr.is_idle(), axhal::asm::irqs_enabled());
+            #[cfg(not(all(feature = "irq", target_os = "none")))]
+            let resched = true;
+            curr.enable_preempt(resched);
         }
     }
+}
+
+#[inline]
+#[cfg(any(test, all(feature = "irq", target_os = "none")))]
+const fn preempt_enable_should_reschedule(is_idle: bool, irqs_enabled: bool) -> bool {
+    !is_idle || irqs_enabled
 }
 
 /// Gets the current task, or returns [`None`] if the current task is not
@@ -793,5 +808,18 @@ pub fn run_idle() -> ! {
         trace!("idle task: waiting for IRQs...");
         #[cfg(feature = "irq")]
         axhal::asm::wait_for_irqs();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preempt_enable_should_reschedule;
+
+    #[test]
+    fn only_irq_off_idle_defers_preempt_enable_reschedule() {
+        assert!(!preempt_enable_should_reschedule(true, false));
+        assert!(preempt_enable_should_reschedule(true, true));
+        assert!(preempt_enable_should_reschedule(false, false));
+        assert!(preempt_enable_should_reschedule(false, true));
     }
 }
