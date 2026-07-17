@@ -780,9 +780,16 @@ pub fn exit(exit_code: i32) -> ! {
 pub fn run_idle() -> ! {
     loop {
         yield_now();
+        // The idle continuation can resume from a context switch initiated at
+        // IRQ exit.  This is the first top-level, guard-free boundary after
+        // that switch, so restore the local IRQ-enabled invariant immediately.
+        #[cfg(feature = "irq")]
+        axhal::asm::enable_irqs();
         // A dispatcher running after the yield may make a blocked task ready.
         // Honor that wakeup before entering the architecture idle instruction.
         resched_if_needed();
+        #[cfg(all(feature = "irq", target_os = "none"))]
+        debug_assert!(axhal::asm::irqs_enabled());
         trace!("idle task: waiting for IRQs...");
         #[cfg(feature = "irq")]
         axhal::asm::wait_for_irqs();

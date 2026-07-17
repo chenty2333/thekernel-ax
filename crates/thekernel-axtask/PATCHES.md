@@ -72,3 +72,6 @@ SHA-256
 - Release every internal owned current-task handle before abandoning an exiting
   kernel stack, while retaining the distinct per-CPU slot and exited-queue
   ownership required for a safe final context switch and deferred reclamation.
+- Re-establish the local IRQ-enabled invariant at the guard-free idle boundary
+  before entering the architecture wait instruction, so an idle continuation
+  resumed from IRQ-exit scheduling cannot strand timer or IPI delivery.
