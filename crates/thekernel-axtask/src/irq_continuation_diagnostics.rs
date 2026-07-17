@@ -241,11 +241,25 @@ impl CpuDiagnostics {
     }
 }
 
-static CPU_DIAGNOSTICS: [CpuDiagnostics; axconfig::plat::MAX_CPU_NUM] =
-    [const { CpuDiagnostics::new() }; axconfig::plat::MAX_CPU_NUM];
+#[percpu::def_percpu]
+static CPU_DIAGNOSTICS: CpuDiagnostics = CpuDiagnostics::new();
 
-fn current_cpu_diagnostics() -> Option<&'static CpuDiagnostics> {
-    CPU_DIAGNOSTICS.get(axhal::percpu::this_cpu_id())
+fn with_current_cpu_diagnostics<R>(f: impl FnOnce(&CpuDiagnostics) -> R) -> R {
+    let _irq_guard = kernel_guard::IrqSave::new();
+    // SAFETY: IrqSave keeps this execution on one CPU until the closure
+    // returns. In particular, this raw accessor must not be replaced with
+    // this_cpu_id(): its preemption guard is implemented by the path being
+    // traced here and would recurse back into this recorder.
+    f(unsafe { CPU_DIAGNOSTICS.current_ref_raw() })
+}
+
+fn cpu_diagnostics(cpu: usize) -> Option<&'static CpuDiagnostics> {
+    if cpu >= axconfig::plat::MAX_CPU_NUM {
+        return None;
+    }
+    // SAFETY: the index is in the statically reserved per-CPU range and every
+    // field accessed through this shared reference is atomic.
+    Some(unsafe { CPU_DIAGNOSTICS.remote_ref_raw(cpu) })
 }
 
 pub(crate) fn record_event(
@@ -255,21 +269,21 @@ pub(crate) fn record_event(
     flags: u64,
     preempt_disable_count: usize,
 ) {
-    if let Some(diagnostics) = current_cpu_diagnostics() {
+    with_current_cpu_diagnostics(|diagnostics| {
         diagnostics.record(kind, task_id, peer_task_id, flags, preempt_disable_count);
-    }
+    });
 }
 
 pub(crate) fn record_timer_event() {
-    if let Some(diagnostics) = current_cpu_diagnostics() {
+    with_current_cpu_diagnostics(|diagnostics| {
         diagnostics.timer_events.fetch_add(1, Ordering::Relaxed);
-    }
+    });
 }
 
 pub fn irq_continuation_diagnostic_snapshot(
     cpu: usize,
 ) -> Option<IrqContinuationDiagnosticSnapshot> {
-    let diagnostics = CPU_DIAGNOSTICS.get(cpu)?;
+    let diagnostics = cpu_diagnostics(cpu)?;
     Some(IrqContinuationDiagnosticSnapshot {
         latest_sequence: diagnostics.published_sequence.load(Ordering::Acquire),
         timer_events: diagnostics.timer_events.load(Ordering::Acquire),
@@ -297,13 +311,37 @@ pub fn irq_continuation_diagnostic_event(
     cpu: usize,
     sequence: u64,
 ) -> Option<IrqContinuationDiagnosticEvent> {
-    let diagnostics = CPU_DIAGNOSTICS.get(cpu)?;
+    let diagnostics = cpu_diagnostics(cpu)?;
     diagnostics.events[sequence as usize % TRACE_DEPTH].snapshot(sequence)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_cpu_recorder_is_visible_through_remote_snapshot() {
+        let before =
+            irq_continuation_diagnostic_snapshot(0).expect("test CPU must have a diagnostic area");
+
+        record_event(17, 19, 23, 29, 31);
+        record_timer_event();
+
+        let after = irq_continuation_diagnostic_snapshot(0)
+            .expect("test CPU must retain its diagnostic area");
+        let expected_sequence = before.latest_sequence.wrapping_add(1);
+        assert_ne!(expected_sequence, 0);
+        assert_eq!(after.latest_sequence, expected_sequence);
+        assert_eq!(after.timer_events, before.timer_events.wrapping_add(1));
+        let event = irq_continuation_diagnostic_event(0, expected_sequence)
+            .expect("published current-CPU event must be remotely readable");
+        assert_eq!(event.kind, 17);
+        assert_eq!(event.task_id, 19);
+        assert_eq!(event.peer_task_id, 23);
+        assert_eq!(event.flags, 29);
+        assert_eq!(event.preempt_disable_count, 31);
+        assert!(irq_continuation_diagnostic_snapshot(axconfig::plat::MAX_CPU_NUM).is_none());
+    }
 
     #[test]
     fn event_slot_rejects_overwritten_sequence() {

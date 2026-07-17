@@ -28,7 +28,8 @@ RUSTDOCFLAGS='-D warnings' \
     cargo +1.85.0 doc -p thekernel-axpoll --no-deps --locked
 
 nightly_features='multitask irq preempt smp sched-cfs task-ext'
-nightly_test_features='test multitask irq preempt smp sched-cfs'
+diagnostic_features="$nightly_features irq-continuation-diagnostics"
+nightly_test_features='test multitask irq preempt smp sched-cfs irq-continuation-diagnostics'
 cargo +nightly-2025-05-20 check -p thekernel-axtask --no-default-features --locked
 cargo +nightly-2025-05-20 test \
     -p thekernel-axtask --all-targets --locked --features "$nightly_test_features"
@@ -37,7 +38,7 @@ cargo +nightly-2025-05-20 clippy \
     -- -D warnings
 RUSTDOCFLAGS='-D warnings' \
     cargo +nightly-2025-05-20 doc \
-        -p thekernel-axtask --no-deps --locked --features "$nightly_features"
+        -p thekernel-axtask --no-deps --locked --features "$diagnostic_features"
 
 for scheduler in sched-fifo sched-rr sched-cfs; do
     cargo +nightly-2025-05-20 check \
@@ -54,7 +55,7 @@ for target in riscv64gc-unknown-none-elf loongarch64-unknown-none; do
         -p thekernel-axtask \
         --locked \
         --target "$target" \
-        --features "$nightly_features"
+        --features "$diagnostic_features"
 done
 
 CARGO_TOOLCHAIN=1.85.0 scripts/package-unpack-original.sh
