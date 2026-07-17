@@ -15,3 +15,5 @@
   callback, leaving concurrent publication for a later reason/service pass.
 - Add request-owned per-target pending and completion queries that ignore
   unrelated maintenance and newer epochs.
+- Define `needs_kick` as the initial reason edge while permitting bounded,
+  request-owned recovery kicks for targets that remain pending.

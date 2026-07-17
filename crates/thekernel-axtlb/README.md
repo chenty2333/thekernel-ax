@@ -39,6 +39,11 @@ code cannot complete it against another domain's epochs.
 - `ShootdownRequest::target_pending` and `target_complete` report only the
   target, epoch, and maintenance classes owned by that request. Newer or
   unrelated mailbox work does not make an older request look incomplete.
+- `ShootdownRequest::needs_kick` selects only the initial hardware IPI caused
+  by a pending-reason `0 -> 1` edge. A kernel adapter may use
+  `target_pending` for bounded recovery kicks within its original deadline.
+  Recovery may race service and produce a harmless spurious IPI, but it must
+  never manufacture completion or extend the grace deadline.
 - CPU offline first closes target admission, waits for outstanding admission
   readers, drains and acknowledges the mailbox, and only then commits offline.
 - A live request retains its issuer admission through grace; target mailboxes

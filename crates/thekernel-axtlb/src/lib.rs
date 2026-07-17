@@ -490,8 +490,13 @@ impl<const MAX_CPUS: usize> TlbShootdown<MAX_CPUS> {
 
     /// Issues one global request after the caller's PTE stores and local flush.
     ///
-    /// Every online CPU except `issuer_cpu` becomes a target. Hardware IPIs must
-    /// be sent only to CPUs for which [`ShootdownRequest::needs_kick`] is true.
+    /// Every online CPU except `issuer_cpu` becomes a target.
+    /// [`ShootdownRequest::needs_kick`] identifies the initial reason-bit edge
+    /// that requires a hardware IPI. An adapter may later issue bounded recovery
+    /// kicks to exact targets for which [`ShootdownRequest::target_pending`]
+    /// remains true. Such a kick can race an in-flight service and become a
+    /// harmless spurious IPI after the request reaches grace.
+    ///
     /// Any error leaves the caller without a grace request after its local
     /// mutation, and may follow partial target publication. A real adapter must
     /// therefore fail-stop instead of reclaiming or publishing affected state.
