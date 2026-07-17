@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering, fence};
 
 pub(crate) const EVENT_PREEMPT_DISABLE_IRQ_OFF: u64 = 1;
 pub(crate) const EVENT_PREEMPT_ENABLE_IRQ_OFF: u64 = 2;
@@ -59,6 +59,7 @@ pub struct IrqContinuationDiagnosticSnapshot {
 }
 
 struct EventSlot {
+    version: AtomicU64,
     sequence: AtomicU64,
     kind: AtomicU64,
     task_id: AtomicU64,
@@ -70,6 +71,7 @@ struct EventSlot {
 impl EventSlot {
     const fn new() -> Self {
         Self {
+            version: AtomicU64::new(0),
             sequence: AtomicU64::new(0),
             kind: AtomicU64::new(0),
             task_id: AtomicU64::new(0),
@@ -88,29 +90,46 @@ impl EventSlot {
         flags: u64,
         preempt_disable_count: usize,
     ) {
-        self.sequence.store(0, Ordering::Relaxed);
+        // Event producers are serialized per CPU with IRQs off. Mark the slot
+        // odd before changing its relaxed payload, then publish it as even.
+        let writing_version = self.version.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+        debug_assert_eq!(writing_version & 1, 1);
+        self.sequence.store(sequence, Ordering::Relaxed);
         self.kind.store(kind, Ordering::Relaxed);
         self.task_id.store(task_id, Ordering::Relaxed);
         self.peer_task_id.store(peer_task_id, Ordering::Relaxed);
         self.flags.store(flags, Ordering::Relaxed);
         self.preempt_disable_count
             .store(preempt_disable_count as u64, Ordering::Relaxed);
-        self.sequence.store(sequence, Ordering::Release);
+        self.version
+            .store(writing_version.wrapping_add(1), Ordering::Release);
     }
 
     fn snapshot(&self, expected_sequence: u64) -> Option<IrqContinuationDiagnosticEvent> {
-        if expected_sequence == 0 || self.sequence.load(Ordering::Acquire) != expected_sequence {
+        if expected_sequence == 0 {
+            return None;
+        }
+        let first_version = self.version.load(Ordering::Acquire);
+        if first_version & 1 != 0 {
             return None;
         }
         let event = IrqContinuationDiagnosticEvent {
-            sequence: expected_sequence,
+            sequence: self.sequence.load(Ordering::Relaxed),
             kind: self.kind.load(Ordering::Relaxed),
             task_id: self.task_id.load(Ordering::Relaxed),
             peer_task_id: self.peer_task_id.load(Ordering::Relaxed),
             flags: self.flags.load(Ordering::Relaxed),
             preempt_disable_count: self.preempt_disable_count.load(Ordering::Relaxed),
         };
-        (self.sequence.load(Ordering::Acquire) == expected_sequence).then_some(event)
+        // Keep every payload read before the final version check. The Acquire
+        // load below only orders operations that follow it, so it cannot serve
+        // as this read-side seqlock barrier by itself.
+        fence(Ordering::Acquire);
+        let second_version = self.version.load(Ordering::Acquire);
+        (first_version == second_version
+            && second_version & 1 == 0
+            && event.sequence == expected_sequence)
+            .then_some(event)
     }
 }
 
@@ -289,7 +308,9 @@ mod tests {
     #[test]
     fn event_slot_rejects_overwritten_sequence() {
         let slot = EventSlot::new();
+        assert!(slot.snapshot(7).is_none());
         slot.publish(7, 3, 11, 13, 5, 2);
+        assert_eq!(slot.version.load(Ordering::Acquire), 2);
         assert!(slot.snapshot(6).is_none());
         let event = slot
             .snapshot(7)
@@ -300,5 +321,47 @@ mod tests {
         assert_eq!(event.peer_task_id, 13);
         assert_eq!(event.flags, 5);
         assert_eq!(event.preempt_disable_count, 2);
+
+        slot.publish(23, 17, 19, 29, 31, 37);
+        assert_eq!(slot.version.load(Ordering::Acquire), 4);
+        assert!(slot.snapshot(7).is_none());
+        let event = slot
+            .snapshot(23)
+            .unwrap_or(IrqContinuationDiagnosticEvent::EMPTY);
+        assert_eq!(event.sequence, 23);
+        assert_eq!(event.kind, 17);
+        assert_eq!(event.task_id, 19);
+        assert_eq!(event.peer_task_id, 29);
+        assert_eq!(event.flags, 31);
+        assert_eq!(event.preempt_disable_count, 37);
+    }
+
+    #[test]
+    fn event_slot_rejects_an_in_progress_publication() {
+        let slot = EventSlot::new();
+        slot.publish(7, 3, 11, 13, 5, 2);
+
+        let writing_version = slot.version.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+        assert_eq!(writing_version & 1, 1);
+        slot.sequence.store(23, Ordering::Relaxed);
+        slot.kind.store(17, Ordering::Relaxed);
+        slot.task_id.store(19, Ordering::Relaxed);
+        slot.peer_task_id.store(29, Ordering::Relaxed);
+        slot.flags.store(31, Ordering::Relaxed);
+        slot.preempt_disable_count.store(37, Ordering::Relaxed);
+        assert!(slot.snapshot(7).is_none());
+        assert!(slot.snapshot(23).is_none());
+
+        slot.version
+            .store(writing_version.wrapping_add(1), Ordering::Release);
+        let event = slot
+            .snapshot(23)
+            .unwrap_or(IrqContinuationDiagnosticEvent::EMPTY);
+        assert_eq!(event.sequence, 23);
+        assert_eq!(event.kind, 17);
+        assert_eq!(event.task_id, 19);
+        assert_eq!(event.peer_task_id, 29);
+        assert_eq!(event.flags, 31);
+        assert_eq!(event.preempt_disable_count, 37);
     }
 }
