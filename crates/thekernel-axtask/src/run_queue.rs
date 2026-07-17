@@ -1406,6 +1406,30 @@ impl AxRunQueue {
             return;
         }
 
+        #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
+        {
+            let mut flags = 0;
+            if axhal::asm::irqs_enabled() {
+                flags |= crate::irq_continuation_diagnostics::FLAG_IRQS_ENABLED;
+            }
+            if prev_task.is_idle() {
+                flags |= crate::irq_continuation_diagnostics::FLAG_IDLE;
+            }
+            if next_task.is_idle() {
+                flags |= crate::irq_continuation_diagnostics::FLAG_PEER_IDLE;
+            }
+            if prev_task.preempt_pending() {
+                flags |= crate::irq_continuation_diagnostics::FLAG_NEED_RESCHED;
+            }
+            crate::irq_continuation_diagnostics::record_event(
+                crate::irq_continuation_diagnostics::EVENT_CONTEXT_SWITCH,
+                prev_task.id().as_u64(),
+                next_task.id().as_u64(),
+                flags,
+                prev_task.preempt_disable_count(),
+            );
+        }
+
         // Claim the task as running, we do this before switching to it
         // such that any running task will have this set.
         #[cfg(feature = "smp")]
@@ -1443,6 +1467,28 @@ impl AxRunQueue {
             CurrentTask::set_current(prev_task, next_task);
 
             (*prev_ctx_ptr).switch_to(&*next_ctx_ptr);
+
+            #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
+            {
+                let curr = crate::current();
+                let mut flags = 0;
+                if axhal::asm::irqs_enabled() {
+                    flags |= crate::irq_continuation_diagnostics::FLAG_IRQS_ENABLED;
+                }
+                if curr.is_idle() {
+                    flags |= crate::irq_continuation_diagnostics::FLAG_IDLE;
+                }
+                if curr.preempt_pending() {
+                    flags |= crate::irq_continuation_diagnostics::FLAG_NEED_RESCHED;
+                }
+                crate::irq_continuation_diagnostics::record_event(
+                    crate::irq_continuation_diagnostics::EVENT_CONTEXT_SWITCH_RETURN,
+                    curr.id().as_u64(),
+                    0,
+                    flags,
+                    curr.preempt_disable_count(),
+                );
+            }
 
             // Current it's **next_task** running on this CPU, clear the `prev_task`'s `on_cpu` field
             // to indicate that it has finished its scheduling process and no longer running on this CPU.

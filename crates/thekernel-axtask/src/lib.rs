@@ -59,6 +59,10 @@ cfg_if::cfg_if! {
         mod api;
         mod wait_queue;
 
+        #[cfg(feature = "irq-continuation-diagnostics")]
+        #[cfg_attr(not(target_os = "none"), allow(dead_code))]
+        mod irq_continuation_diagnostics;
+
         #[cfg(feature = "irq")]
         mod timers;
 
@@ -68,6 +72,11 @@ cfg_if::cfg_if! {
         #[doc(cfg(feature = "multitask"))]
         pub use self::api::*;
         pub use self::api::{sleep, sleep_until, yield_now};
+        #[cfg(feature = "irq-continuation-diagnostics")]
+        pub use self::irq_continuation_diagnostics::{
+            IrqContinuationDiagnosticEvent, IrqContinuationDiagnosticSnapshot,
+            irq_continuation_diagnostic_event, irq_continuation_diagnostic_snapshot,
+        };
     } else {
         mod api_s;
         pub use self::api_s::{can_block_current, sleep, sleep_until, yield_now};

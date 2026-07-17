@@ -80,13 +80,68 @@ struct KernelGuardIfImpl;
 impl kernel_guard::KernelGuardIf for KernelGuardIfImpl {
     fn disable_preempt() {
         if let Some(curr) = current_may_uninit() {
+            #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
+            if !axhal::asm::irqs_enabled() {
+                let mut flags = 0;
+                if curr.is_idle() {
+                    flags |= crate::irq_continuation_diagnostics::FLAG_IDLE;
+                }
+                if curr.preempt_pending() {
+                    flags |= crate::irq_continuation_diagnostics::FLAG_NEED_RESCHED;
+                }
+                crate::irq_continuation_diagnostics::record_event(
+                    crate::irq_continuation_diagnostics::EVENT_PREEMPT_DISABLE_IRQ_OFF,
+                    curr.id().as_u64(),
+                    0,
+                    flags,
+                    curr.preempt_disable_count(),
+                );
+            }
             curr.disable_preempt();
         }
     }
 
     fn enable_preempt() {
         if let Some(curr) = current_may_uninit() {
+            #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
+            let irq_off = !axhal::asm::irqs_enabled();
+            #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
+            if irq_off {
+                let mut flags = 0;
+                if curr.is_idle() {
+                    flags |= crate::irq_continuation_diagnostics::FLAG_IDLE;
+                }
+                if curr.preempt_pending() {
+                    flags |= crate::irq_continuation_diagnostics::FLAG_NEED_RESCHED;
+                }
+                flags |= crate::irq_continuation_diagnostics::FLAG_RESCHED_ALLOWED;
+                crate::irq_continuation_diagnostics::record_event(
+                    crate::irq_continuation_diagnostics::EVENT_PREEMPT_ENABLE_IRQ_OFF,
+                    curr.id().as_u64(),
+                    0,
+                    flags,
+                    curr.preempt_disable_count(),
+                );
+            }
             curr.enable_preempt(true);
+            #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
+            if irq_off && !axhal::asm::irqs_enabled() {
+                let mut flags = 0;
+                if curr.is_idle() {
+                    flags |= crate::irq_continuation_diagnostics::FLAG_IDLE;
+                }
+                if curr.preempt_pending() {
+                    flags |= crate::irq_continuation_diagnostics::FLAG_NEED_RESCHED;
+                }
+                flags |= crate::irq_continuation_diagnostics::FLAG_RESCHED_ALLOWED;
+                crate::irq_continuation_diagnostics::record_event(
+                    crate::irq_continuation_diagnostics::EVENT_PREEMPT_ENABLE_RETURN_IRQ_OFF,
+                    curr.id().as_u64(),
+                    0,
+                    flags,
+                    curr.preempt_disable_count(),
+                );
+            }
         }
     }
 }
@@ -206,6 +261,8 @@ pub fn init_scheduler_secondary() -> Result<(), TaskRuntimeInitError> {
 #[cfg(feature = "irq")]
 #[doc(cfg(feature = "irq"))]
 pub fn on_timer_event() {
+    #[cfg(feature = "irq-continuation-diagnostics")]
+    crate::irq_continuation_diagnostics::record_timer_event();
     crate::timers::check_events();
 }
 
@@ -727,10 +784,46 @@ pub fn set_task_affinity(task: &AxTaskRef, cpumask: AxCpuMask) -> AxResult {
 /// Current task gives up the CPU time voluntarily, and switches to another
 /// ready task.
 pub fn yield_now() {
+    #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
+    if !axhal::asm::irqs_enabled() {
+        let curr = current();
+        let mut flags = 0;
+        if curr.is_idle() {
+            flags |= crate::irq_continuation_diagnostics::FLAG_IDLE;
+        }
+        if curr.preempt_pending() {
+            flags |= crate::irq_continuation_diagnostics::FLAG_NEED_RESCHED;
+        }
+        crate::irq_continuation_diagnostics::record_event(
+            crate::irq_continuation_diagnostics::EVENT_YIELD_ENTER_IRQ_OFF,
+            curr.id().as_u64(),
+            0,
+            flags,
+            curr.preempt_disable_count(),
+        );
+    }
     #[cfg(feature = "smp")]
     retire_allowed_migration_current();
     run_deferred_work();
     current_run_queue::<NoPreemptIrqSave>().yield_current();
+    #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
+    if !axhal::asm::irqs_enabled() {
+        let curr = current();
+        let mut flags = 0;
+        if curr.is_idle() {
+            flags |= crate::irq_continuation_diagnostics::FLAG_IDLE;
+        }
+        if curr.preempt_pending() {
+            flags |= crate::irq_continuation_diagnostics::FLAG_NEED_RESCHED;
+        }
+        crate::irq_continuation_diagnostics::record_event(
+            crate::irq_continuation_diagnostics::EVENT_YIELD_RETURN_IRQ_OFF,
+            curr.id().as_u64(),
+            0,
+            flags,
+            curr.preempt_disable_count(),
+        );
+    }
     run_deferred_work();
     #[cfg(feature = "preempt")]
     TaskInner::current_check_preempt_pending();
@@ -780,6 +873,21 @@ pub fn exit(exit_code: i32) -> ! {
 pub fn run_idle() -> ! {
     loop {
         yield_now();
+        #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
+        if !axhal::asm::irqs_enabled() {
+            let curr = current();
+            let mut flags = crate::irq_continuation_diagnostics::FLAG_IDLE;
+            if curr.preempt_pending() {
+                flags |= crate::irq_continuation_diagnostics::FLAG_NEED_RESCHED;
+            }
+            crate::irq_continuation_diagnostics::record_event(
+                crate::irq_continuation_diagnostics::EVENT_IDLE_AFTER_YIELD_IRQ_OFF,
+                curr.id().as_u64(),
+                0,
+                flags,
+                curr.preempt_disable_count(),
+            );
+        }
         // A dispatcher running after the yield may make a blocked task ready.
         // Honor that wakeup before entering the architecture idle instruction.
         resched_if_needed();

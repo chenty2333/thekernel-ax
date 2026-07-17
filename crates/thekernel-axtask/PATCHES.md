@@ -72,3 +72,6 @@ SHA-256
 - Release every internal owned current-task handle before abandoning an exiting
   kernel stack, while retaining the distinct per-CPU slot and exited-queue
   ownership required for a safe final context switch and deferred reclamation.
+- Provide an opt-in, allocation-free per-CPU IRQ-continuation diagnostic ring.
+  It records only context switches and suspicious IRQ-off scheduler boundaries;
+  production builds pay no cost unless the diagnostic feature is selected.

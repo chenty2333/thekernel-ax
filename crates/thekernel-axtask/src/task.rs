@@ -1117,9 +1117,21 @@ impl TaskInner {
     }
 
     #[inline]
+    #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
+    pub(crate) fn preempt_pending(&self) -> bool {
+        self.need_resched.load(Ordering::Acquire)
+    }
+
+    #[inline]
     #[cfg(feature = "preempt")]
     pub(crate) fn can_preempt(&self, current_disable_count: usize) -> bool {
         self.preempt_disable_count.load(Ordering::Acquire) == current_disable_count
+    }
+
+    #[inline]
+    #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
+    pub(crate) fn preempt_disable_count(&self) -> usize {
+        self.preempt_disable_count.load(Ordering::Acquire)
     }
 
     #[inline]
@@ -1159,6 +1171,25 @@ impl TaskInner {
     pub(crate) fn current_check_preempt_pending() {
         use kernel_guard::NoPreemptIrqSave;
         let curr = crate::current();
+        #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
+        let irq_off = !axhal::asm::irqs_enabled();
+        #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
+        if irq_off {
+            let mut flags = 0;
+            if curr.is_idle() {
+                flags |= crate::irq_continuation_diagnostics::FLAG_IDLE;
+            }
+            if curr.preempt_pending() {
+                flags |= crate::irq_continuation_diagnostics::FLAG_NEED_RESCHED;
+            }
+            crate::irq_continuation_diagnostics::record_event(
+                crate::irq_continuation_diagnostics::EVENT_PREEMPT_CHECK_IRQ_OFF,
+                curr.id().as_u64(),
+                0,
+                flags,
+                curr.preempt_disable_count(),
+            );
+        }
         if curr.need_resched.load(Ordering::Acquire) && curr.can_preempt(0) {
             // Note: if we want to print log msg during `preempt_resched`, we have to
             // disable preemption here, because the axlog may cause preemption.
@@ -1172,6 +1203,23 @@ impl TaskInner {
             // own IRQ/preemption checks, so calls originating in a still-unsafe
             // outer context remain deferred.
             crate::run_deferred_work();
+        }
+        #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
+        if irq_off && !axhal::asm::irqs_enabled() {
+            let mut flags = 0;
+            if curr.is_idle() {
+                flags |= crate::irq_continuation_diagnostics::FLAG_IDLE;
+            }
+            if curr.preempt_pending() {
+                flags |= crate::irq_continuation_diagnostics::FLAG_NEED_RESCHED;
+            }
+            crate::irq_continuation_diagnostics::record_event(
+                crate::irq_continuation_diagnostics::EVENT_PREEMPT_CHECK_RETURN_IRQ_OFF,
+                curr.id().as_u64(),
+                0,
+                flags,
+                curr.preempt_disable_count(),
+            );
         }
     }
 

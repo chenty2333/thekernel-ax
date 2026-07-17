@@ -39,6 +39,10 @@ irq = ["axhal/irq"]
 tls = []
 preempt = ["irq", "percpu?/preempt", "kernel_guard/preempt"]
 smp = ["kspin/smp"]
+# Allocation-free, lock-free trace snapshots for diagnosing IRQ-return
+# scheduling. This is intentionally opt-in because it adds atomics to context
+# switch and suspicious IRQ-off preemption paths.
+irq-continuation-diagnostics = ["multitask", "preempt", "smp"]
 sched-fifo = ["multitask"]
 sched-rr = ["multitask", "preempt"]
 sched-cfs = ["multitask", "preempt"]
