@@ -108,6 +108,46 @@ fn interruptible_pending_result_consumes_the_interrupt() {
     assert!(!curr.is_interrupted());
 }
 
+#[test]
+fn block_on_consumes_a_self_wake_without_losing_the_session() {
+    let _lock = SERIAL.lock();
+    init_for_test();
+    let polls = AtomicUsize::new(0);
+
+    let result = crate::future::block_on(poll_fn(|cx| {
+        if polls.fetch_add(1, Ordering::AcqRel) == 0 {
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        } else {
+            Poll::Ready(23_u32)
+        }
+    }))
+    .unwrap();
+
+    assert_eq!(result, 23);
+    assert_eq!(polls.load(Ordering::Acquire), 2);
+    assert_eq!(current().wake_fault(), None);
+}
+
+#[test]
+fn block_on_rejects_pending_work_while_preemption_is_disabled() {
+    let _lock = SERIAL.lock();
+    init_for_test();
+    let curr = current();
+    let polls = AtomicUsize::new(0);
+
+    curr.disable_preempt();
+    let result = crate::future::block_on(poll_fn(|_| {
+        polls.fetch_add(1, Ordering::AcqRel);
+        Poll::<()>::Pending
+    }));
+    curr.enable_preempt(false);
+
+    assert_eq!(result, Err(crate::future::BlockOnError::CannotBlock));
+    assert_eq!(polls.load(Ordering::Acquire), 1);
+    assert_eq!(curr.wake_fault(), None);
+}
+
 fn other_deferred_dispatcher() {}
 
 #[test]

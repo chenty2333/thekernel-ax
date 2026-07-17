@@ -116,8 +116,8 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Test axtask feature and architecture matrix
         run: |
-          features='multitask irq preempt smp sched-cfs task-ext'
-          test_features='test multitask irq preempt smp sched-cfs'
+          features='multitask irq preempt smp sched-cfs task-ext irq-continuation-diagnostics'
+          test_features='test multitask irq preempt smp sched-cfs irq-continuation-diagnostics'
           cargo +nightly-2025-05-20 check -p thekernel-axtask --no-default-features --locked
           cargo +nightly-2025-05-20 test -p thekernel-axtask --all-targets --locked --features "$test_features"
           cargo +nightly-2025-05-20 clippy -p thekernel-axtask --all-targets --locked --features "$test_features" -- -D warnings

@@ -163,18 +163,26 @@ pub fn current() -> CurrentTask {
 
 /// Returns whether the current context may block the running task.
 ///
-/// Blocking through [`WaitQueue`] must not happen while a caller holds an
-/// extra preemption guard. Low-level drivers use this to choose between a real
-/// sleep and a bounded non-blocking fallback.
+/// Blocking through [`WaitQueue`] requires a non-idle running task, no extra
+/// preemption guard, and (on bare metal) enabled local interrupts. Low-level
+/// drivers use this to choose between a real sleep and a bounded non-blocking
+/// fallback.
 pub fn can_block_current() -> bool {
+    let Some(curr) = current_may_uninit() else {
+        return false;
+    };
+    if !curr.is_running() || curr.is_idle() {
+        return false;
+    }
     #[cfg(feature = "preempt")]
-    {
-        current_may_uninit().is_some_and(|curr| curr.can_preempt(0))
+    if !curr.can_preempt(0) {
+        return false;
     }
-    #[cfg(not(feature = "preempt"))]
-    {
-        current_may_uninit().is_some()
+    #[cfg(all(feature = "irq", target_os = "none"))]
+    if !axhal::asm::irqs_enabled() {
+        return false;
     }
+    true
 }
 
 /// Installs the single task-context deferred-work dispatcher.

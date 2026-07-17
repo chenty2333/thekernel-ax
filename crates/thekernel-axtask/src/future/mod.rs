@@ -14,9 +14,9 @@ use kernel_guard::NoPreemptIrqSave;
 
 use crate::{
     AxTask, AxTaskRef, current, current_run_queue,
-    run_queue::WakeTaskOutcome,
+    run_queue::{BlockReschedOutcome, WakeTaskOutcome},
     select_run_queue,
-    task::{BeginBlockWaitError, BlockWaitCommit, BlockWakeAction, EndBlockWaitError},
+    task::{BeginBlockWaitError, BlockWakeAction, EndBlockWaitError},
 };
 
 #[cfg(feature = "irq")]
@@ -92,10 +92,9 @@ fn task_waker(task: &AxTaskRef) -> Waker {
 
 fn contain_block_state_loss(
     task: &AxTaskRef,
-    token: crate::task::BlockWaitToken,
     stage: &'static str,
+    cleanup: Result<(), EndBlockWaitError>,
 ) -> BlockOnError {
-    let cleanup = task.end_block_wait(token);
     task.record_wake_fault(crate::TaskWakeFault::SchedulerInvariant);
     error!(
         "task {} lost block ownership during {}: cleanup={:?}",
@@ -113,6 +112,8 @@ pub enum BlockOnError {
     Busy,
     /// The per-task block-session generation space is exhausted.
     GenerationExhausted,
+    /// The current execution context cannot yield or block safely.
+    CannotBlock,
     /// The task/runqueue block transition lost its internal ownership state.
     StateLost,
 }
@@ -124,6 +125,7 @@ impl fmt::Display for BlockOnError {
             Self::GenerationExhausted => {
                 formatter.write_str("block-session generation space is exhausted")
             }
+            Self::CannotBlock => formatter.write_str("the current context cannot block"),
             Self::StateLost => formatter.write_str("block-session ownership state was lost"),
         }
     }
@@ -136,6 +138,7 @@ impl From<BlockOnError> for AxError {
         match error {
             BlockOnError::Busy => AxError::ResourceBusy,
             BlockOnError::GenerationExhausted => AxError::OutOfRange,
+            BlockOnError::CannotBlock => AxError::BadState,
             BlockOnError::StateLost => AxError::BadState,
         }
     }
@@ -162,7 +165,8 @@ pub fn block_on<F: IntoFuture>(f: F) -> Result<F::Output, BlockOnError> {
 
     loop {
         if task.prepare_block_poll(token).is_err() {
-            return Err(contain_block_state_loss(&task, token, "poll preparation"));
+            let cleanup = task.end_block_wait(token);
+            return Err(contain_block_state_loss(&task, "poll preparation", cleanup));
         }
         match fut.as_mut().poll(&mut cx) {
             Poll::Pending => {
@@ -170,33 +174,57 @@ pub fn block_on<F: IntoFuture>(f: F) -> Result<F::Output, BlockOnError> {
                 // so this is not a proven deferred-work safe point. Kernel
                 // entry/exit, yield, idle, and syscall boundaries perform the
                 // dispatcher wakeups instead.
+                if !crate::can_block_current() {
+                    return match task.end_block_wait(token) {
+                        Ok(()) => Err(BlockOnError::CannotBlock),
+                        Err(error) => Err(contain_block_state_loss(
+                            &task,
+                            "non-blocking-context cleanup",
+                            Err(error),
+                        )),
+                    };
+                }
                 if task.is_block_woken(token) {
                     crate::yield_now();
                     continue;
                 }
                 let mut rq = current_run_queue::<NoPreemptIrqSave>();
                 match rq.blocked_resched_atomic(token) {
-                    BlockWaitCommit::Blocked => {}
-                    BlockWaitCommit::Woken => {
+                    BlockReschedOutcome::Blocked => {}
+                    BlockReschedOutcome::Woken => {
                         drop(rq);
                         crate::yield_now();
                     }
-                    BlockWaitCommit::Stale => {
+                    BlockReschedOutcome::CannotBlock => {
                         drop(rq);
+                        return match task.end_block_wait(token) {
+                            Ok(()) => Err(BlockOnError::CannotBlock),
+                            Err(error) => Err(contain_block_state_loss(
+                                &task,
+                                "runqueue context cleanup",
+                                Err(error),
+                            )),
+                        };
+                    }
+                    BlockReschedOutcome::StateLost => {
+                        drop(rq);
+                        let cleanup = task.end_block_wait(token);
                         return Err(contain_block_state_loss(
                             &task,
-                            token,
                             "blocked-state commit",
+                            cleanup,
                         ));
                     }
                 }
             }
             Poll::Ready(output) => {
-                task.end_block_wait(token).map_err(|error| match error {
-                    EndBlockWaitError::Stale | EndBlockWaitError::TransitionInProgress => {
-                        BlockOnError::StateLost
-                    }
-                })?;
+                if let Err(error) = task.end_block_wait(token) {
+                    return Err(contain_block_state_loss(
+                        &task,
+                        "ready-result cleanup",
+                        Err(error),
+                    ));
+                }
                 return Ok(output);
             }
         }

@@ -45,7 +45,7 @@ cargo +1.85.0 test -p thekernel-axtlb --all-targets --locked
 cargo +1.85.0 test -p thekernel-axtlb --doc --locked
 cargo +1.85.0 test -p thekernel-axpoll --all-targets --locked
 cargo +nightly-2025-05-20 test -p thekernel-axtask --all-targets --locked \
-  --features "multitask irq preempt smp sched-cfs task-ext"
+  --features "test multitask irq preempt smp sched-cfs irq-continuation-diagnostics"
 python3 scripts/check_registry_dependencies.py
 scripts/package-unpack-original.sh
 scripts/publish-dry-run.sh

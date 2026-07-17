@@ -1762,6 +1762,30 @@ mod mechanism_tests {
     }
 
     #[test]
+    fn block_wait_consumes_wake_published_before_claim() {
+        let state = BlockWaitState::new();
+        let token = state.begin().unwrap();
+
+        state.prepare_poll(token).unwrap();
+        assert_eq!(state.mark_woken(), BlockWakeAction::Unblock);
+        assert_eq!(state.claim_block(token), BlockWaitClaim::Woken);
+        state.end(token).unwrap();
+    }
+
+    #[test]
+    fn block_wait_publishes_wake_after_block_commit() {
+        let state = BlockWaitState::new();
+        let token = state.begin().unwrap();
+
+        state.prepare_poll(token).unwrap();
+        assert_eq!(state.claim_block(token), BlockWaitClaim::Claimed);
+        assert_eq!(state.commit_block(token, || {}), BlockWaitCommit::Blocked);
+        assert_eq!(state.mark_woken(), BlockWakeAction::Unblock);
+        assert!(state.is_woken(token));
+        state.end(token).unwrap();
+    }
+
+    #[test]
     fn block_wait_rejects_stale_owner_but_allows_spurious_raw_wake() {
         let state = BlockWaitState::new();
         let old = state.begin().unwrap();

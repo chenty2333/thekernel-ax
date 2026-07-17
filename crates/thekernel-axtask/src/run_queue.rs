@@ -521,6 +521,14 @@ pub(crate) enum WakeTaskOutcome {
     Rejected(TaskEnqueueError),
 }
 
+pub(crate) enum BlockReschedOutcome {
+    Blocked,
+    Woken,
+    #[cfg_attr(not(feature = "preempt"), allow(dead_code))]
+    CannotBlock,
+    StateLost,
+}
+
 enum PutTaskOutcome {
     Enqueued,
     #[cfg(feature = "smp")]
@@ -1141,23 +1149,23 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
     /// normal unblock, or marks the claim so this owner restores `Running`.
     /// No waker waits for the owner and no wake can fall between the state
     /// check and the scheduler handoff.
-    pub(crate) fn blocked_resched_atomic(&mut self, token: BlockWaitToken) -> BlockWaitCommit {
+    pub(crate) fn blocked_resched_atomic(&mut self, token: BlockWaitToken) -> BlockReschedOutcome {
         let curr = self.current_task();
         if !curr.is_running() || curr.is_idle() {
-            return BlockWaitCommit::Stale;
+            return BlockReschedOutcome::StateLost;
         }
         #[cfg(all(feature = "preempt", target_os = "none"))]
         if !curr.can_preempt(1) {
-            return BlockWaitCommit::Stale;
+            return BlockReschedOutcome::CannotBlock;
         }
         #[cfg(all(feature = "preempt", not(target_os = "none")))]
         if !curr.can_preempt(0) {
-            return BlockWaitCommit::Stale;
+            return BlockReschedOutcome::CannotBlock;
         }
 
         match curr.claim_block_wait(token) {
-            BlockWaitClaim::Woken => return BlockWaitCommit::Woken,
-            BlockWaitClaim::Stale => return BlockWaitCommit::Stale,
+            BlockWaitClaim::Woken => return BlockReschedOutcome::Woken,
+            BlockWaitClaim::Stale => return BlockReschedOutcome::StateLost,
             BlockWaitClaim::Claimed => {}
         }
 
@@ -1174,9 +1182,10 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
             BlockWaitCommit::Blocked => {
                 debug!("task block: id={}", curr.id().as_u64());
                 self.inner.resched();
-                BlockWaitCommit::Blocked
+                BlockReschedOutcome::Blocked
             }
-            outcome => outcome,
+            BlockWaitCommit::Woken => BlockReschedOutcome::Woken,
+            BlockWaitCommit::Stale => BlockReschedOutcome::StateLost,
         }
     }
 
