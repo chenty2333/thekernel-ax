@@ -78,5 +78,11 @@ SHA-256
 - Add the coordinated `irq-exit` consumer contract. A maintained `axhal`
   reports explicit per-CPU IRQ nesting and invokes one callback after the
   outermost handler guard drops; axtask defers all ordinary IRQ guard-release
-  scheduling and consumes `need_resched` only at that exit phase. TheKernel
-  enables this feature as part of its maintained HAL release set.
+  scheduling, rejects ordinary task IRQ-off safe points, and consumes
+  `need_resched` through the explicit exit boundary. The dispatch
+  owner is task-local, drains racing publications with a fixed pass budget
+  without recursive stack growth, preserves later publications at scheduler
+  selection, and releases its preemption-disable unit without rescheduling.
+  A consumer-injected `crate_interface` keeps the reusable crate independent
+  of an unpublished HAL fork; TheKernel provides it from the matching maintained
+  HAL release set.

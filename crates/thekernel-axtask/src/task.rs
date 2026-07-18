@@ -595,6 +595,29 @@ impl TryFrom<u8> for TaskState {
 unsafe impl Send for TaskInner {}
 unsafe impl Sync for TaskInner {}
 
+#[cfg(feature = "preempt")]
+struct PreemptDispatchGuard<'a>(&'a TaskInner);
+
+#[cfg(feature = "preempt")]
+const MAX_PREEMPT_DISPATCH_PASSES: usize = 8;
+
+#[cfg(feature = "preempt")]
+impl<'a> PreemptDispatchGuard<'a> {
+    fn new(task: &'a TaskInner) -> Self {
+        task.disable_preempt();
+        PreemptDispatchGuard(task)
+    }
+}
+
+#[cfg(feature = "preempt")]
+impl Drop for PreemptDispatchGuard<'_> {
+    fn drop(&mut self) {
+        // The owner drains `need_resched` iteratively. Its final decrement must
+        // never re-enter the dispatcher synchronously.
+        self.0.enable_preempt(false);
+    }
+}
+
 impl TaskInner {
     /// Fallibly creates a new unpublished task.
     ///
@@ -1117,6 +1140,20 @@ impl TaskInner {
     }
 
     #[inline]
+    #[cfg(feature = "preempt")]
+    pub(crate) fn take_preempt_pending(&self) -> bool {
+        self.need_resched.swap(false, Ordering::AcqRel)
+    }
+
+    #[inline]
+    #[cfg(all(feature = "preempt", feature = "smp"))]
+    pub(crate) fn preserve_preempt_if_cpu_disallowed(&self, cpu_id: usize) {
+        if !self.cpumask().get(cpu_id) {
+            self.set_preempt_pending(true);
+        }
+    }
+
+    #[inline]
     #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
     pub(crate) fn preempt_pending(&self) -> bool {
         self.need_resched.load(Ordering::Acquire)
@@ -1156,7 +1193,7 @@ impl TaskInner {
             Ordering::Acquire,
             |count| count.checked_sub(1),
         ) {
-            Ok(1) if resched => {
+            Ok(1) if resched && self.need_resched.load(Ordering::Acquire) => {
                 // If current task is pending to be preempted, do rescheduling.
                 Self::current_check_preempt_pending();
             }
@@ -1169,13 +1206,30 @@ impl TaskInner {
 
     #[cfg(feature = "preempt")]
     pub(crate) fn current_check_preempt_pending() {
-        use kernel_guard::NoPreemptIrqSave;
+        Self::current_check_preempt_pending_from(false);
+    }
+
+    #[cfg(all(feature = "preempt", feature = "irq-exit"))]
+    pub(crate) fn current_check_preempt_pending_at_irq_exit() {
+        Self::current_check_preempt_pending_from(true);
+    }
+
+    #[cfg(feature = "preempt")]
+    fn current_check_preempt_pending_from(_at_irq_exit: bool) {
+        use kernel_guard::IrqSave;
         #[cfg(feature = "irq-exit")]
-        if !crate::irq_exit::may_check_preempt(
-            crate::irq_exit::in_irq_context(),
-            crate::irq_exit::in_irq_exit_phase(),
-        ) {
-            return;
+        {
+            #[cfg(target_os = "none")]
+            let irqs_enabled = axhal::asm::irqs_enabled();
+            #[cfg(not(target_os = "none"))]
+            let irqs_enabled = true;
+            if !crate::irq_exit::may_check_preempt(
+                crate::irq_exit::in_irq_context(),
+                irqs_enabled,
+                _at_irq_exit,
+            ) {
+                return;
+            }
         }
         let curr = crate::current();
         #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
@@ -1189,6 +1243,10 @@ impl TaskInner {
             if curr.preempt_pending() {
                 flags |= crate::irq_continuation_diagnostics::FLAG_NEED_RESCHED;
             }
+            // Ordinary IRQ-off task safe points returned above. Reaching this
+            // event with IRQs masked therefore proves the explicit outermost
+            // IRQ-exit transport authorized this check.
+            flags |= crate::irq_continuation_diagnostics::FLAG_RESCHED_ALLOWED;
             crate::irq_continuation_diagnostics::record_event(
                 crate::irq_continuation_diagnostics::EVENT_PREEMPT_CHECK_IRQ_OFF,
                 curr.id().as_u64(),
@@ -1197,18 +1255,33 @@ impl TaskInner {
                 curr.preempt_disable_count(),
             );
         }
+        let mut dispatched = false;
         if curr.need_resched.load(Ordering::Acquire) && curr.can_preempt(0) {
-            // Note: if we want to print log msg during `preempt_resched`, we have to
-            // disable preemption here, because the axlog may cause preemption.
+            // Keep one task-owned preemption-disable unit across every switch.
+            // A task selected while this stack is suspended has its own count,
+            // unlike a per-CPU IRQ-exit marker. The no-resched release also
+            // prevents a guard drop from recursively growing this stack.
             {
-                let mut rq = crate::current_run_queue::<NoPreemptIrqSave>();
-                if curr.need_resched.load(Ordering::Acquire) {
-                    rq.preempt_resched()
+                let _dispatch = PreemptDispatchGuard::new(&curr);
+                let mut passes = 0;
+                while passes < MAX_PREEMPT_DISPATCH_PASSES
+                    && curr.need_resched.load(Ordering::Acquire)
+                    && curr.can_preempt(1)
+                {
+                    let mut rq = crate::current_run_queue::<IrqSave>();
+                    if !curr.need_resched.load(Ordering::Acquire) {
+                        break;
+                    }
+                    passes += 1;
+                    rq.preempt_resched();
+                    dispatched = true;
                 }
             }
-            // The runqueue guard has been released. The runner performs its
-            // own IRQ/preemption checks, so calls originating in a still-unsafe
-            // outer context remain deferred.
+        }
+        if dispatched {
+            // The task-owned dispatch guard has been released. The deferred
+            // worker performs its own IRQ/preemption checks, so an IRQ-exit
+            // caller leaves the work pending for a later task-context point.
             crate::run_deferred_work();
         }
         #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
@@ -1847,6 +1920,61 @@ mod mechanism_tests {
             overflow.wake_fault(),
             Some(TaskWakeFault::SchedulerInvariant)
         );
+    }
+
+    #[cfg(feature = "preempt")]
+    #[test]
+    fn preempt_dispatch_guard_is_task_owned_and_releases_without_resched() {
+        let owner = TaskInner::new_init("preempt-dispatch-owner".into()).unwrap();
+        let peer = TaskInner::new_init("preempt-dispatch-peer".into()).unwrap();
+        owner.set_preempt_pending(true);
+
+        {
+            let _dispatch = PreemptDispatchGuard::new(&owner);
+            assert!(owner.can_preempt(1));
+            assert!(peer.can_preempt(0));
+
+            // Model a nested guard release while the dispatcher owns the task.
+            owner.disable_preempt();
+            assert!(owner.can_preempt(2));
+            owner.enable_preempt(true);
+            assert!(owner.can_preempt(1));
+        }
+
+        assert!(owner.can_preempt(0));
+        assert!(owner.need_resched.load(Ordering::Acquire));
+    }
+
+    #[cfg(feature = "preempt")]
+    #[test]
+    fn selected_task_clear_does_not_consume_a_later_publication() {
+        let selected = TaskInner::new_init("selected-preempt-publication".into()).unwrap();
+        selected.set_preempt_pending(true);
+
+        assert!(selected.take_preempt_pending());
+        assert!(!selected.need_resched.load(Ordering::Acquire));
+
+        // Model a remote affinity/wake publisher after the scheduler has
+        // removed this task from its ready queue and released the scheduler
+        // lock. The later publication must remain pending for the task.
+        selected.set_preempt_pending(true);
+        assert!(selected.need_resched.load(Ordering::Acquire));
+    }
+
+    #[cfg(all(feature = "preempt", feature = "smp"))]
+    #[test]
+    fn selected_task_preserves_an_already_published_affinity_exclusion() {
+        let selected = TaskInner::new_init("selected-affinity-publication".into()).unwrap();
+        // The host test axconfig has one CPU, so an empty mask is used only to
+        // model the local "CPU 0 excluded" predicate. Public SMP admission
+        // still rejects empty masks and requires another online target.
+        selected.set_cpumask(AxCpuMask::new());
+        selected.set_preempt_pending(true);
+
+        assert!(selected.take_preempt_pending());
+        selected.preserve_preempt_if_cpu_disallowed(0);
+
+        assert!(selected.need_resched.load(Ordering::Acquire));
     }
 
     #[test]

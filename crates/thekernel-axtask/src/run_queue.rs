@@ -1049,7 +1049,9 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
     /// This function is used to preempt the current task and reschedule
     /// to next task on current run queue.
     ///
-    /// This function is called by `current_check_preempt_pending` with IRQs and preemption disabled.
+    /// This function is called by `current_check_preempt_pending` with IRQs
+    /// disabled and one task-owned preemption-disable unit held across the
+    /// complete dispatch loop.
     ///
     /// Note:
     /// preemption may happened in `enable_preempt`, which is called
@@ -1061,10 +1063,9 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
         let curr = self.current_task().clone();
         assert!(curr.is_running());
 
-        // When we call `preempt_resched()`, both IRQs and preemption must
-        // have been disabled by `kernel_guard::NoPreemptIrqSave`. So we need
-        // to set `current_disable_count` to 1 in `can_preempt()` to obtain
-        // the preemption permission.
+        // The outer dispatcher owns one preemption-disable unit while an
+        // `IrqSave` runqueue guard protects this iteration. Therefore count 1
+        // is the only state that grants preemption permission here.
         let can_preempt = curr.can_preempt(1);
 
         trace!(
@@ -1086,11 +1087,16 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
                 .put_task_with_state(curr.clone(), TaskState::Running, true)
             {
                 PutTaskOutcome::Enqueued => self.inner.resched(),
-                PutTaskOutcome::Rejected(_) | PutTaskOutcome::StateMismatch => {
-                    curr.set_preempt_pending(false)
+                PutTaskOutcome::Rejected(_) => curr.set_preempt_pending(true),
+                PutTaskOutcome::StateMismatch => {
+                    curr.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+                    curr.set_preempt_pending(true);
                 }
                 #[cfg(feature = "smp")]
-                PutTaskOutcome::Deferred => curr.set_preempt_pending(false),
+                PutTaskOutcome::Deferred => {
+                    curr.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+                    curr.set_preempt_pending(true);
+                }
             }
         } else {
             curr.set_preempt_pending(true);
@@ -1371,29 +1377,47 @@ impl AxRunQueue {
     /// Core reschedule subroutine.
     /// Pick the next task to run and switch to it.
     fn resched(&self) {
-        let next = match self.scheduler.lock().pick_next_task() {
-            Some(next) => {
-                assert!(
-                    next.is_ready(),
-                    "selected task id={} is not ready: {:?}",
-                    next.id().as_u64(),
-                    next.state()
-                );
-                next
+        let next = {
+            let mut scheduler = self.scheduler.lock();
+            let next = match scheduler.pick_next_task() {
+                Some(next) => {
+                    assert!(
+                        next.is_ready(),
+                        "selected task id={} is not ready: {:?}",
+                        next.id().as_u64(),
+                        next.state()
+                    );
+                    next
+                }
+                None => {
+                    let idle = unsafe {
+                        // Safety: IRQs must be disabled at this time.
+                        IDLE_TASK.current_ref_raw().get_unchecked().clone()
+                    };
+                    assert!(
+                        is_valid_idle_fallback(&idle),
+                        "idle fallback id={} has invalid state: {:?}",
+                        idle.id().as_u64(),
+                        idle.state()
+                    );
+                    idle
+                }
+            };
+            #[cfg(feature = "preempt")]
+            {
+                // Consume only publications ordered before this selection.
+                // Ready-task migration uses the same scheduler lock; any
+                // publisher racing after removal sets the bit after this clear
+                // and `switch_to` must preserve it.
+                let _ = next.take_preempt_pending();
+                #[cfg(feature = "smp")]
+                // An affinity mask can be published after the previous task's
+                // migration check but before it re-enters this scheduler. The
+                // selection consumes ordinary reschedule reasons, then
+                // revalidates this distinct constraint so it cannot be lost.
+                next.preserve_preempt_if_cpu_disallowed(self.cpu_id);
             }
-            None => {
-                let idle = unsafe {
-                    // Safety: IRQs must be disabled at this time.
-                    IDLE_TASK.current_ref_raw().get_unchecked().clone()
-                };
-                assert!(
-                    is_valid_idle_fallback(&idle),
-                    "idle fallback id={} has invalid state: {:?}",
-                    idle.id().as_u64(),
-                    idle.state()
-                );
-                idle
-            }
+            next
         };
         self.switch_to(crate::current(), next);
     }
@@ -1410,8 +1434,6 @@ impl AxRunQueue {
             prev_task.id().as_u64(),
             next_task.id().as_u64()
         );
-        #[cfg(feature = "preempt")]
-        next_task.set_preempt_pending(false);
         next_task.set_state(TaskState::Running);
         if prev_task.ptr_eq(&next_task) {
             return;

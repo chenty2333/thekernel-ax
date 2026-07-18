@@ -32,10 +32,16 @@ contract and both architectures pass it.
 The `irq-exit` feature is a coordinated lower-layer contract, not a dormant
 performance option. TheKernel enables it unconditionally when consuming its
 maintained `axhal` fork. That HAL exposes explicit per-CPU IRQ nesting and one
-outermost-exit callback; ordinary preemption-guard releases inside an IRQ only
-lower the guard count, while the exit callback owns the single pending
-reschedule check. Registry-only consumers must leave this feature disabled
-until their `axhal` provides the same API and ordering.
+outermost-exit callback; ordinary preemption-guard releases inside an IRQ or an
+IRQ-off task critical section only lower the guard count, while the exit
+callback owns the single IRQ-off pending-reschedule check. The dispatcher holds
+one task-owned preemption-disable unit
+across a bounded `need_resched` drain and releases it without rescheduling, so
+an IRQ-exit context switch cannot leak state to the next task or recurse on
+guard release. Publications that exceed the pass budget remain pending for the
+next safe point. The generic crate consumes a `crate_interface` transport
+rather than naming a HAL fork; each enabling kernel must inject the matching
+Layer 0 provider before linking its release set.
 
 The release contract requires explicit task/runqueue ownership, no aliased
 mutable runqueue references, no allocation/drop/wake callback inside IRQ-safe

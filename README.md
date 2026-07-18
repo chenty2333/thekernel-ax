@@ -45,17 +45,18 @@ cargo +1.85.0 test -p thekernel-axtlb --all-targets --locked
 cargo +1.85.0 test -p thekernel-axtlb --doc --locked
 cargo +1.85.0 test -p thekernel-axpoll --all-targets --locked
 cargo +nightly-2025-05-20 test -p thekernel-axtask --all-targets --locked \
-  --features "test multitask irq preempt smp sched-cfs irq-continuation-diagnostics"
+  --features "test multitask irq preempt smp sched-cfs irq-continuation-diagnostics irq-exit"
 python3 scripts/check_registry_dependencies.py
 scripts/package-unpack-original.sh
 scripts/publish-dry-run.sh
 scripts/package-unpack.sh
 ```
 
-The self-contained registry matrix deliberately omits `irq-exit` because the
-published `axhal` baseline does not expose that contract. TheKernel's consumer
-matrix enables it unconditionally against the coordinated maintained `axhal`;
-it is not a profile-selected optimization.
+The self-contained registry matrix type-checks and unit-tests `irq-exit` with a
+test-only transport provider. A production consumer must inject its Layer 0
+provider and prove the final link; TheKernel does so unconditionally through
+its coordinated `axruntime`/`axhal` release set. It is not a profile-selected
+optimization.
 
 The first unpack command validates the two original mechanism artifacts. The
 last command packages the coordinated three-crate maintained-fork release set,

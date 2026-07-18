@@ -61,6 +61,9 @@ cfg_if::cfg_if! {
 
         #[cfg(feature = "irq-exit")]
         mod irq_exit;
+        #[cfg(feature = "irq-exit")]
+        #[doc(hidden)]
+        pub use self::irq_exit::IrqExitIf;
 
         #[cfg(feature = "irq-continuation-diagnostics")]
         #[cfg_attr(not(target_os = "none"), allow(dead_code))]
