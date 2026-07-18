@@ -1,6 +1,8 @@
 use alloc::sync::Arc;
 #[cfg(feature = "smp")]
 use alloc::sync::Weak;
+#[cfg(feature = "irq")]
+use core::sync::atomic::AtomicU32;
 use core::{
     fmt,
     future::poll_fn,
@@ -203,19 +205,88 @@ impl ExitedTaskQueue {
 struct GcWake {
     pending: AtomicBool,
     waiter: AtomicWaker,
+    #[cfg(feature = "irq")]
+    retry_ticks: AtomicU32,
+    #[cfg(feature = "irq")]
+    retry_delay: AtomicU32,
 }
+
+#[cfg(feature = "irq")]
+const GC_RETRY_MIN_TICKS: u32 = 1;
+#[cfg(feature = "irq")]
+pub(crate) const GC_RETRY_MAX_TICKS: u32 = 64;
 
 impl GcWake {
     const fn new() -> Self {
         Self {
             pending: AtomicBool::new(false),
             waiter: AtomicWaker::new(),
+            #[cfg(feature = "irq")]
+            retry_ticks: AtomicU32::new(0),
+            #[cfg(feature = "irq")]
+            retry_delay: AtomicU32::new(GC_RETRY_MIN_TICKS),
         }
     }
 
-    fn notify(&self) {
+    fn publish(&self) {
         self.pending.store(true, Ordering::Release);
         self.waiter.wake();
+    }
+
+    /// Publishes genuinely new exited-task work and supersedes an older
+    /// retained-owner retry deadline. The next scan will install a fresh
+    /// deadline if an external owner still keeps any task alive.
+    fn notify_new_work(&self) {
+        #[cfg(feature = "irq")]
+        self.retry_ticks.store(0, Ordering::Release);
+        self.publish();
+    }
+
+    /// Arms one allocation-free, per-CPU retry after a retained-owner scan.
+    ///
+    /// The delay backs off exponentially to a fixed ceiling. A held public
+    /// task handle therefore cannot make the recycler self-wake, while its
+    /// eventual release is observed within at most `GC_RETRY_MAX_TICKS`
+    /// periodic timer ticks once the ceiling is reached.
+    #[cfg(feature = "irq")]
+    fn arm_retained_retry(&self) {
+        let delay = self
+            .retry_delay
+            .load(Ordering::Relaxed)
+            .clamp(GC_RETRY_MIN_TICKS, GC_RETRY_MAX_TICKS);
+        self.retry_delay.store(
+            delay.saturating_mul(2).min(GC_RETRY_MAX_TICKS),
+            Ordering::Relaxed,
+        );
+        self.retry_ticks.store(delay, Ordering::Release);
+    }
+
+    #[cfg(feature = "irq")]
+    fn reset_retained_retry(&self) {
+        self.retry_ticks.store(0, Ordering::Release);
+        self.retry_delay
+            .store(GC_RETRY_MIN_TICKS, Ordering::Relaxed);
+    }
+
+    /// Advances the per-CPU retry lease by one periodic timer tick.
+    ///
+    /// This deliberately performs at most one compare-exchange. A racing
+    /// task-context arm/cancel may defer the retry by one tick, but cannot
+    /// create an IRQ-side retry loop or lose the durable exited-task owner.
+    #[cfg(feature = "irq")]
+    fn retry_timer_tick(&self) {
+        let ticks = self.retry_ticks.load(Ordering::Acquire);
+        if ticks == 0 {
+            return;
+        }
+        if self
+            .retry_ticks
+            .compare_exchange(ticks, ticks - 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            && ticks == 1
+        {
+            self.publish();
+        }
     }
 
     fn consume_pending(&self) -> bool {
@@ -253,6 +324,9 @@ percpu_static! {
 
 const MIB: usize = 1024 * 1024;
 static IDLE_TICKS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+static GC_RECLAIM_ROUNDS: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn idle_ticks() -> u64 {
     IDLE_TICKS.load(Ordering::Relaxed)
@@ -1323,17 +1397,21 @@ impl AxRunQueue {
             .map_err(TaskSchedError::from)
     }
 
-    /// Create a new run queue for the specified CPU.
-    /// The run queue is initialized with a per-CPU gc task in its scheduler.
-    fn new(cpu_id: usize) -> Result<Self, TaskRuntimeInitError> {
+    fn new_gc_task(cpu_id: usize) -> Result<AxTaskRef, TaskRuntimeInitError> {
         let gc_task = TaskInner::new(
             || -> () { gc_main() },
             "gc".into(),
             axconfig::TASK_STACK_SIZE,
         )?
         .into_arc()?;
-        // gc task should be pinned to the current CPU.
+
+        // A blocked task's raw waker routes by cpu_id in this maintained fork,
+        // while affinity remains the scheduler admission policy. Publish both
+        // halves before bypassing AxRunQueueRef::add_task below.
         gc_task.set_cpumask(AxCpuMask::one_shot(cpu_id));
+        #[cfg(feature = "smp")]
+        gc_task.set_cpu_id(cpu_id as u32);
+
         #[cfg(feature = "sched-cfs")]
         gc_task
             .configure(axsched::CfsTaskParams {
@@ -1345,6 +1423,17 @@ impl AxRunQueue {
                 rt_priority: 0,
             })
             .map_err(TaskRuntimeInitError::Scheduler)?;
+
+        Ok(gc_task)
+    }
+
+    /// Create a new run queue for the specified CPU.
+    /// The run queue is initialized with a per-CPU gc task in its scheduler.
+    fn new(cpu_id: usize) -> Result<Self, TaskRuntimeInitError> {
+        let gc_task = Self::new_gc_task(cpu_id)?;
+        #[cfg(feature = "smp")]
+        debug_assert_eq!(gc_task.cpu_id() as usize, cpu_id);
+        debug_assert_eq!(gc_task.cpumask(), AxCpuMask::one_shot(cpu_id));
 
         let mut scheduler = Scheduler::new();
         scheduler
@@ -1589,7 +1678,24 @@ fn gc_main() -> ! {
             crate::exit(-1);
         }
 
-        reclaim_exited_tasks_current_cpu();
+        #[cfg(test)]
+        GC_RECLAIM_ROUNDS.fetch_add(1, Ordering::Relaxed);
+
+        let (retained, remaining) = reclaim_exited_tasks_current_cpu_batch(None);
+        #[cfg(not(feature = "irq"))]
+        let _ = (retained, remaining);
+        #[cfg(feature = "irq")]
+        {
+            // Safety: the GC task is permanently pinned to this CPU. Only its
+            // periodic timer IRQ and ordinary task context mutate this fixed
+            // per-CPU retry lease.
+            let wake = unsafe { GC_WAKE.current_ref_raw() };
+            if retained && remaining {
+                wake.arm_retained_retry();
+            } else if !remaining {
+                wake.reset_retained_retry();
+            }
+        }
         // Reclaim can run arbitrary TaskInner/TaskExt destructors. Dispatch
         // any work they deferred only after both the exited-queue access and
         // the GC block session have ended.
@@ -1608,14 +1714,14 @@ fn push_exited_task(task: AxTaskRef) -> Result<(), ExitedTaskEnqueueError> {
     EXITED_TASKS.with_current(|exited_tasks| exited_tasks.push_back(task))?;
     // Safety: exit_current runs with IRQs + preemption disabled on the CPU
     // which owns both the intrusive queue and this coalesced wake state.
-    unsafe { GC_WAKE.current_ref_raw() }.notify();
+    unsafe { GC_WAKE.current_ref_raw() }.notify_new_work();
     Ok(())
 }
 
 fn requeue_retained_exited_task(task: AxTaskRef) -> Result<(), ExitedTaskEnqueueError> {
     // A retained task is not new work: immediately waking the GC would spin it
-    // against the same external Arc. A later exit publishes a new pending edge,
-    // while explicit reclaim callers can retry after their own bounded yield.
+    // against the same external Arc. The dedicated recycler installs a bounded
+    // low-frequency timer retry after completing this whole snapshot batch.
     EXITED_TASKS.with_current(|exited_tasks| exited_tasks.push_back(task))
 }
 
@@ -1671,15 +1777,30 @@ fn reclaim_exited_tasks_current_cpu_batch(max_tasks: Option<usize>) -> (bool, bo
         }
     }
     let remaining = !EXITED_TASKS.with_current(|exited_tasks| exited_tasks.is_empty());
+    #[cfg(feature = "irq")]
+    if !remaining {
+        // An opportunistic explicit reclaim can drain a queue before the GC
+        // task consumes its retry. Reset both the deadline and backoff so the
+        // next unrelated exit starts from the short initial observation.
+        unsafe { GC_WAKE.current_ref_raw() }.reset_retained_retry();
+    }
     (retained, remaining)
-}
-
-pub(crate) fn reclaim_exited_tasks_current_cpu() -> bool {
-    reclaim_exited_tasks_current_cpu_batch(None).0
 }
 
 pub(crate) fn reclaim_exited_tasks_current_cpu_bounded(max_tasks: usize) -> bool {
     reclaim_exited_tasks_current_cpu_batch(Some(max_tasks)).1
+}
+
+#[cfg(feature = "irq")]
+pub(crate) fn gc_retry_timer_tick() {
+    // Safety: on_timer_tick runs with IRQs and preemption disabled on the CPU
+    // whose fixed recycler wake state is being advanced.
+    unsafe { GC_WAKE.current_ref_raw() }.retry_timer_tick();
+}
+
+#[cfg(test)]
+pub(crate) fn gc_reclaim_rounds_for_test() -> u64 {
+    GC_RECLAIM_ROUNDS.load(Ordering::Relaxed)
 }
 
 /// The task routine for migrating the current task to the correct CPU.
@@ -1824,8 +1945,8 @@ mod exited_queue_tests {
         let wake = GcWake::new();
         let mut context = Context::from_waker(Waker::noop());
 
-        wake.notify();
-        wake.notify();
+        wake.notify_new_work();
+        wake.notify_new_work();
 
         assert_eq!(wake.poll(&mut context), Poll::Ready(()));
         assert_eq!(wake.poll(&mut context), Poll::Pending);
@@ -1838,10 +1959,74 @@ mod exited_queue_tests {
 
         // Model an exit after poll's fast check but before waker registration.
         assert!(!wake.consume_pending());
-        wake.notify();
+        wake.notify_new_work();
 
         assert_eq!(wake.register_and_recheck(&mut context), Poll::Ready(()));
         assert_eq!(wake.poll(&mut context), Poll::Pending);
+    }
+
+    #[cfg(feature = "irq")]
+    #[test]
+    fn gc_retained_retry_is_tick_bounded_and_does_not_self_wake() {
+        let wake = GcWake::new();
+        let mut context = Context::from_waker(Waker::noop());
+
+        wake.arm_retained_retry();
+        assert_eq!(wake.retry_ticks.load(Ordering::Acquire), 1);
+        assert_eq!(wake.retry_delay.load(Ordering::Relaxed), 2);
+
+        // Polling or yielding without a periodic timer edge cannot turn a held
+        // external Arc into a recycler busy loop.
+        for _ in 0..128 {
+            assert_eq!(wake.poll(&mut context), Poll::Pending);
+        }
+
+        wake.retry_timer_tick();
+        assert_eq!(wake.poll(&mut context), Poll::Ready(()));
+        assert_eq!(wake.poll(&mut context), Poll::Pending);
+
+        wake.arm_retained_retry();
+        assert_eq!(wake.retry_ticks.load(Ordering::Acquire), 2);
+        wake.retry_timer_tick();
+        assert_eq!(wake.poll(&mut context), Poll::Pending);
+        wake.retry_timer_tick();
+        assert_eq!(wake.poll(&mut context), Poll::Ready(()));
+
+        // Genuine new work supersedes the old deadline without losing its
+        // durable wake edge. Draining resets the exponential backoff.
+        wake.arm_retained_retry();
+        assert_ne!(wake.retry_ticks.load(Ordering::Acquire), 0);
+        wake.notify_new_work();
+        assert_eq!(wake.retry_ticks.load(Ordering::Acquire), 0);
+        assert_eq!(wake.poll(&mut context), Poll::Ready(()));
+        wake.reset_retained_retry();
+        assert_eq!(wake.retry_delay.load(Ordering::Relaxed), 1);
+
+        let capped = GcWake::new();
+        for expected in [1, 2, 4, 8, 16, 32, 64, 64] {
+            capped.arm_retained_retry();
+            assert_eq!(capped.retry_ticks.load(Ordering::Acquire), expected);
+        }
+        assert_eq!(
+            capped.retry_delay.load(Ordering::Relaxed),
+            GC_RETRY_MAX_TICKS
+        );
+    }
+
+    #[cfg(feature = "smp")]
+    #[test]
+    fn gc_task_construction_publishes_affinity_and_wake_owner_together() {
+        for cpu_id in 0..axconfig::plat::MAX_CPU_NUM {
+            let run_queue = AxRunQueue::new(cpu_id).unwrap();
+            let task = {
+                let mut scheduler = run_queue.scheduler.lock();
+                let task = scheduler.pick_next_task().unwrap();
+                assert!(scheduler.pick_next_task().is_none());
+                task
+            };
+            assert_eq!(task.cpu_id() as usize, cpu_id);
+            assert_eq!(task.cpumask(), AxCpuMask::one_shot(cpu_id));
+        }
     }
 
     fn pop_clean(queue: &mut ExitedTaskQueue) -> AxTaskRef {

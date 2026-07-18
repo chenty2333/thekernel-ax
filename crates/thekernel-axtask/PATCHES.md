@@ -72,6 +72,11 @@ SHA-256
 - Release every internal owned current-task handle before abandoning an exiting
   kernel stack, while retaining the distinct per-CPU slot and exited-queue
   ownership required for a safe final context switch and deferred reclamation.
+- Run exited-task reclamation, `TaskExt` destruction, and deferred callbacks
+  outside the recycler's wait-only block session. Publish each recycler's
+  affinity and raw-waker CPU owner together before scheduler admission, and use
+  one fixed per-CPU timer state with capped exponential retry for externally
+  retained tasks instead of either permanent retention or a GC self-wake loop.
 - Provide an opt-in, allocation-free per-CPU IRQ-continuation diagnostic ring.
   It records only context switches and suspicious IRQ-off scheduler boundaries;
   production builds pay no cost unless the diagnostic feature is selected.

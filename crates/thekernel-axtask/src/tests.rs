@@ -610,7 +610,7 @@ fn direct_exit_releases_internal_current_task_owners() {
     assert!(!axtask::reclaim_exited_tasks_until_clear(128));
 }
 
-#[cfg(feature = "task-ext")]
+#[cfg(all(feature = "task-ext", feature = "irq"))]
 #[test]
 fn gc_runs_task_ext_destructors_outside_its_block_session() {
     let _lock = SERIAL.lock();
@@ -625,21 +625,47 @@ fn gc_runs_task_ext_destructors_outside_its_block_session() {
     .unwrap();
     *inner.task_ext_mut() = Some(crate::AxTaskExt::from_impl(GcDropProbe(outcome.clone())));
 
+    let rounds_before = crate::run_queue::gc_reclaim_rounds_for_test();
     let task = axtask::spawn_task(inner).unwrap();
     assert_eq!(task.join().unwrap(), 0);
+
+    // The first exit edge makes the recycler observe the still-held public
+    // handle and install a timer-backed retry.
+    for _ in 0..256 {
+        if crate::run_queue::gc_reclaim_rounds_for_test() != rounds_before {
+            break;
+        }
+        axtask::yield_now();
+    }
+    let first_round = crate::run_queue::gc_reclaim_rounds_for_test();
+    assert!(first_round > rounds_before);
+    assert_eq!(outcome.load(Ordering::Acquire), 0);
+
+    // Ordinary scheduler yields are not retry edges. A retained handle cannot
+    // turn GC into a runnable self-wake loop.
+    for _ in 0..256 {
+        axtask::yield_now();
+    }
+    assert_eq!(crate::run_queue::gc_reclaim_rounds_for_test(), first_round);
+
+    // Exponential timer retries occur at ticks 1, 3, and 7, not on every
+    // yield/tick. Keep the handle live to prove each failed unwrap remains
+    // bounded and requeues exactly one ownership unit.
+    for _ in 0..8 {
+        axtask::on_timer_tick();
+        axtask::yield_now();
+    }
+    let held_rounds = crate::run_queue::gc_reclaim_rounds_for_test() - first_round;
+    assert!((1..=4).contains(&held_rounds));
+    assert_eq!(outcome.load(Ordering::Acquire), 0);
+
     drop(task);
 
-    // A retained exit is deliberately requeued without self-waking. Publish a
-    // fresh exit after releasing the external handle so the dedicated GC task
-    // gets a deterministic new edge and revisits the queue.
-    let kick = axtask::spawn(|| {}).unwrap();
-    assert_eq!(kick.join().unwrap(), 0);
-    drop(kick);
-
-    for _ in 0..256 {
+    for _ in 0..=crate::run_queue::GC_RETRY_MAX_TICKS {
         if outcome.load(Ordering::Acquire) != 0 {
             break;
         }
+        axtask::on_timer_tick();
         axtask::yield_now();
     }
 

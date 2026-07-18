@@ -294,6 +294,7 @@ pub fn on_timer_event() {
 pub fn on_timer_tick() {
     use kernel_guard::NoOp;
     on_timer_event();
+    crate::run_queue::gc_retry_timer_tick();
     // Since irq and preemption are both disabled here,
     // we can get current run queue with the default `kernel_guard::NoOp`.
     current_run_queue::<NoOp>().scheduler_timer_tick();
@@ -549,8 +550,9 @@ pub fn set_sched_state(task: &AxTaskRef, sched_state: SchedState) -> Result<(), 
 /// necessary.
 ///
 /// Returns `true` if tasks are still queued after this reclaim pass. That means
-/// at least one exited task is still held by another scheduler-side reference
-/// and a later scheduling point is needed before it can be freed.
+/// at least one exited task is still held by another reference. IRQ-enabled
+/// runtimes also retain a bounded per-CPU timer retry; cooperative runtimes
+/// without timer ticks require a later exit or another explicit reclaim pass.
 pub fn reclaim_exited_tasks() -> bool {
     const DEFAULT_RECLAIM_BATCH: usize = 128;
 

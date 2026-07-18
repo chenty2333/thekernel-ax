@@ -46,9 +46,11 @@ Layer 0 provider before linking its release set.
 The release contract requires explicit task/runqueue ownership, no aliased
 mutable runqueue references, no allocation/drop/wake callback inside IRQ-safe
 critical sections, monotonic mechanism-only task identities, an intrusive
-allocation-free exited-task FIFO, finite cancellable timer/IRQ registrations,
+allocation-free exited-task FIFO, owner-CPU recycler publication, bounded
+timer-backed retained-owner retries, finite cancellable timer/IRQ registrations,
 creation-CPU timer ownership, bounded remote handoff, lost-wake-safe blocking,
-and typed scheduler/lifecycle failures. IRQ waiter registration is deliberately
+and typed scheduler/lifecycle failures. Recycler destructors and deferred work
+run outside its wait-only block session. IRQ waiter registration is deliberately
 separate from driver-owned source validation, enable/disable, masking, and
 acknowledgement. See `PATCHES.md` and `VENDOR.md` for the maintained delta and
 source identity.
