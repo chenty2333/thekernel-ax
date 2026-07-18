@@ -546,28 +546,24 @@ pub fn set_sched_state(task: &AxTaskRef, sched_state: SchedState) -> Result<(), 
         .set_task_sched_state(task, sched_state)
 }
 
-/// Opportunistically reclaims exited tasks queued on the current CPU.
+/// Requests reclamation of exited tasks queued on the current CPU.
 ///
 /// This complements the dedicated GC task for workloads that reap large child
 /// bursts and immediately continue with more forks, where waiting for the GC
 /// task to run can retain many dead task stacks and address spaces longer than
 /// necessary.
 ///
-/// Returns `true` if tasks are still queued after this reclaim pass. That means
-/// at least one exited task is still held by another reference. IRQ-enabled
-/// runtimes also retain a bounded per-CPU timer retry; cooperative runtimes
-/// without timer ticks require a later exit or another explicit reclaim pass.
+/// The public caller only observes the queue and publishes an owner-local wake
+/// inside one short no-migration interval. The permanently pinned per-CPU GC
+/// task remains the sole owner of queue removal, stack recycling, and
+/// `TaskInner`/`TaskExt` destruction.
+///
+/// Returns `true` if that current-CPU observation found queued tasks.
+/// IRQ-enabled runtimes also retain a bounded per-CPU timer retry; cooperative
+/// runtimes without timer ticks require a later exit or another explicit
+/// reclaim request.
 pub fn reclaim_exited_tasks() -> bool {
-    const DEFAULT_RECLAIM_BATCH: usize = 128;
-
-    if crate::run_queue::has_exited_tasks() {
-        crate::run_queue::reclaim_exited_tasks_current_cpu_bounded(DEFAULT_RECLAIM_BATCH);
-    }
-    let remains = crate::run_queue::has_exited_tasks();
-    // Reclaim may have run arbitrary TaskInner/TaskExt destructors. Dispatch
-    // only after the per-CPU exited queue operations have returned.
-    run_deferred_work();
-    remains
+    crate::run_queue::request_exited_task_reclaim_current_cpu()
 }
 
 pub(crate) fn drive_reclaim_until_clear(
@@ -584,8 +580,9 @@ pub(crate) fn drive_reclaim_until_clear(
     reclaim()
 }
 
-/// Reclaims exited tasks, yielding between bounded passes while scheduler-side
-/// handoff references still keep some task objects alive.
+/// Requests exited-task reclamation, yielding between bounded owner-local
+/// requests while scheduler-side handoff references still keep some task
+/// objects alive.
 ///
 /// Returns `true` when tasks still remain after the bounded yield budget.
 pub fn reclaim_exited_tasks_until_clear(max_yields: usize) -> bool {

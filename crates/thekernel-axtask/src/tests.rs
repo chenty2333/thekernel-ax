@@ -791,11 +791,16 @@ fn gc_runs_task_ext_destructors_outside_its_block_session() {
     assert_eq!(outcome.load(Ordering::Acquire), 0);
 
     // Ordinary scheduler yields are not retry edges. A retained handle cannot
-    // turn GC into a runnable self-wake loop.
+    // turn GC into a runnable self-wake loop. The process-global round counter
+    // may still observe one already-published, coalesced notification from the
+    // shared test runtime; the GcWake unit test proves the exact local
+    // no-self-wake state transition.
     for _ in 0..256 {
         axtask::yield_now();
     }
-    assert_eq!(crate::run_queue::gc_reclaim_rounds_for_test(), first_round);
+    let ordinary_yield_rounds = crate::run_queue::gc_reclaim_rounds_for_test() - first_round;
+    assert!(ordinary_yield_rounds <= 1);
+    assert_eq!(outcome.load(Ordering::Acquire), 0);
 
     // Exponential timer retries occur at ticks 1, 3, and 7, not on every
     // yield/tick. Keep the handle live to prove each failed unwrap remains
@@ -819,6 +824,62 @@ fn gc_runs_task_ext_destructors_outside_its_block_session() {
     }
 
     assert_eq!(outcome.load(Ordering::Acquire), GC_DROP_OK);
+    assert!(!axtask::reclaim_exited_tasks_until_clear(128));
+}
+
+#[cfg(all(feature = "task-ext", feature = "irq"))]
+#[test]
+fn explicit_gc_request_defers_destruction_to_the_pinned_recycler() {
+    let _lock = SERIAL.lock();
+    init_for_test();
+
+    let outcome = alloc::sync::Arc::new(AtomicUsize::new(0));
+    let mut inner = crate::TaskInner::new(
+        || {},
+        "gc-explicit-owner".into(),
+        crate::MIN_KERNEL_STACK_SIZE,
+    )
+    .unwrap();
+    *inner.task_ext_mut() = Some(crate::AxTaskExt::from_impl(GcDropProbe(outcome.clone())));
+
+    let rounds_before = crate::run_queue::gc_reclaim_rounds_for_test();
+    let task = axtask::spawn_task(inner).unwrap();
+    assert_eq!(task.join().unwrap(), 0);
+
+    // Let the pinned recycler observe the public handle retained by this test
+    // and requeue exactly one owner before any explicit request is issued.
+    for _ in 0..256 {
+        if crate::run_queue::gc_reclaim_rounds_for_test() != rounds_before {
+            break;
+        }
+        axtask::yield_now();
+    }
+    let retained_round = crate::run_queue::gc_reclaim_rounds_for_test();
+    assert!(retained_round > rounds_before);
+    assert_eq!(outcome.load(Ordering::Acquire), 0);
+
+    drop(task);
+
+    // The public edge may only publish an owner-local wake. In particular, it
+    // cannot run TaskExt destruction in this ordinary, migratable caller.
+    assert!(axtask::reclaim_exited_tasks());
+    assert_eq!(
+        crate::run_queue::gc_reclaim_rounds_for_test(),
+        retained_round
+    );
+    assert_eq!(outcome.load(Ordering::Acquire), 0);
+
+    // No new task exits and no synthetic timer tick occurs below. The explicit
+    // request alone lets the pinned recycler finish the retained owner.
+    for _ in 0..256 {
+        if outcome.load(Ordering::Acquire) != 0 {
+            break;
+        }
+        axtask::yield_now();
+    }
+
+    assert_eq!(outcome.load(Ordering::Acquire), GC_DROP_OK);
+    assert!(crate::run_queue::gc_reclaim_rounds_for_test() > retained_round);
     assert!(!axtask::reclaim_exited_tasks_until_clear(128));
 }
 

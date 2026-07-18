@@ -77,8 +77,10 @@ SHA-256
   affinity and raw-waker CPU owner together before scheduler admission, and use
   one fixed per-CPU timer state with capped exponential retry in IRQ-enabled
   runtimes for externally retained tasks instead of either permanent retention
-  or a GC self-wake loop. Cooperative runtimes require a later exit or explicit
-  reclaim edge.
+  or a GC self-wake loop. The permanently pinned recycler is the sole
+  destructive consumer of its exited-task queue; public reclaim calls only
+  observe and wake that same CPU inside a short no-migration interval.
+  Cooperative runtimes require a later exit or explicit reclaim request.
 - Provide an opt-in, allocation-free per-CPU IRQ-continuation diagnostic ring.
   It records only context switches and suspicious IRQ-off scheduler boundaries;
   production builds pay no cost unless the diagnostic feature is selected.

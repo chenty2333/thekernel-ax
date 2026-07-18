@@ -242,6 +242,18 @@ impl GcWake {
         self.publish();
     }
 
+    /// Requests an immediate owner-local scan without claiming that a new
+    /// exited task was published.
+    ///
+    /// An explicit request supersedes the current retry deadline. If an
+    /// external handle still retains a task, the pinned recycler installs the
+    /// next bounded deadline after that scan.
+    fn request_reclaim(&self) {
+        #[cfg(feature = "irq")]
+        self.retry_ticks.store(0, Ordering::Release);
+        self.publish();
+    }
+
     /// Arms one allocation-free, per-CPU retry after a retained-owner scan.
     ///
     /// The delay backs off exponentially to a fixed ceiling. A held public
@@ -1681,7 +1693,7 @@ fn gc_main() -> ! {
         #[cfg(test)]
         GC_RECLAIM_ROUNDS.fetch_add(1, Ordering::Relaxed);
 
-        let (retained, remaining) = reclaim_exited_tasks_current_cpu_batch(None);
+        let (retained, remaining) = reclaim_exited_tasks_pinned_gc_batch();
         #[cfg(not(feature = "irq"))]
         let _ = (retained, remaining);
         #[cfg(feature = "irq")]
@@ -1725,18 +1737,33 @@ fn requeue_retained_exited_task(task: AxTaskRef) -> Result<(), ExitedTaskEnqueue
     EXITED_TASKS.with_current(|exited_tasks| exited_tasks.push_back(task))
 }
 
-pub(crate) fn has_exited_tasks() -> bool {
-    !EXITED_TASKS.with_current(|exited_tasks| exited_tasks.is_empty())
+/// Requests one scan from the pinned recycler which owns the current CPU.
+///
+/// Query and publication share one short IRQ/preemption-disabled interval so
+/// an affinity migration cannot redirect this CPU's queue observation to a
+/// different CPU's wake state. No exited task is removed or destroyed here.
+pub(crate) fn request_exited_task_reclaim_current_cpu() -> bool {
+    let _guard = kernel_guard::NoPreemptIrqSave::new();
+    // Safety: the guard keeps both raw per-CPU accesses on one CPU. The exited
+    // queue is mutated only by that CPU, and GcWake is internally atomic.
+    let remains = !unsafe { EXITED_TASKS.current_ref_raw() }.is_empty();
+    if remains {
+        unsafe { GC_WAKE.current_ref_raw() }.request_reclaim();
+    }
+    remains
 }
 
-fn reclaim_exited_tasks_current_cpu_batch(max_tasks: Option<usize>) -> (bool, bool) {
+/// Drains one finite queue snapshot from the permanently pinned GC task.
+///
+/// This is the only destructive exited-task consumer. In particular, public
+/// reclaim requests never pop, unwrap, recycle, or drop task ownership.
+fn reclaim_exited_tasks_pinned_gc_batch() -> (bool, bool) {
     // Snapshot the current queue depth so that tasks re-pushed because
     // Arc::try_unwrap failed are deferred to a later round rather than
     // keeping this loop spinning forever.
     let n = EXITED_TASKS.with_current(|exited_tasks| exited_tasks.reclaim_len());
-    let budget = max_tasks.map_or(n, |max_tasks| n.min(max_tasks.max(1)));
     let mut retained = false;
-    for _ in 0..budget {
+    for _ in 0..n {
         let Some(dequeued) = EXITED_TASKS.with_current(|exited_tasks| exited_tasks.pop_front())
         else {
             break;
@@ -1777,17 +1804,7 @@ fn reclaim_exited_tasks_current_cpu_batch(max_tasks: Option<usize>) -> (bool, bo
         }
     }
     let remaining = !EXITED_TASKS.with_current(|exited_tasks| exited_tasks.is_empty());
-    // Do not reset GC_WAKE here. This helper is also called by opportunistic
-    // reclaimers which may migrate after the exited-queue guard is released;
-    // using current_ref_raw() after that boundary could apply this CPU's empty
-    // observation to another CPU's retained-owner retry. The pinned recycler
-    // owns retry reset after its scan. At worst, an opportunistic drain leaves
-    // one bounded stale timer wake for that owner CPU.
     (retained, remaining)
-}
-
-pub(crate) fn reclaim_exited_tasks_current_cpu_bounded(max_tasks: usize) -> bool {
-    reclaim_exited_tasks_current_cpu_batch(Some(max_tasks)).1
 }
 
 #[cfg(feature = "irq")]
@@ -2010,6 +2027,26 @@ mod exited_queue_tests {
             capped.retry_delay.load(Ordering::Relaxed),
             GC_RETRY_MAX_TICKS
         );
+    }
+
+    #[cfg(feature = "irq")]
+    #[test]
+    fn explicit_gc_request_supersedes_one_retry_without_self_waking() {
+        let wake = GcWake::new();
+        let mut context = Context::from_waker(Waker::noop());
+
+        wake.arm_retained_retry();
+        assert_ne!(wake.retry_ticks.load(Ordering::Acquire), 0);
+
+        wake.request_reclaim();
+        assert_eq!(wake.retry_ticks.load(Ordering::Acquire), 0);
+        assert_eq!(wake.poll(&mut context), Poll::Ready(()));
+        assert_eq!(wake.poll(&mut context), Poll::Pending);
+
+        for _ in 0..GC_RETRY_MAX_TICKS * 2 {
+            wake.retry_timer_tick();
+            assert_eq!(wake.poll(&mut context), Poll::Pending);
+        }
     }
 
     #[cfg(feature = "smp")]

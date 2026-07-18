@@ -50,8 +50,13 @@ allocation-free exited-task FIFO, owner-CPU recycler publication, bounded
 timer-backed retained-owner retries in IRQ-enabled runtimes, finite cancellable
 timer/IRQ registrations,
 creation-CPU timer ownership, bounded remote handoff, lost-wake-safe blocking,
-and typed scheduler/lifecycle failures. Recycler destructors and deferred work
-run outside its wait-only block session. IRQ waiter registration is deliberately
+and typed scheduler/lifecycle failures. Only the permanently pinned owner-CPU
+recycler removes exited tasks, recycles their stacks, and runs their
+destructors; public reclaim calls publish an owner-local scan request instead
+of destroying tasks in a possibly migrating caller. Recycler destructors and
+deferred work run outside its wait-only block session. Retained tasks use a
+timer-driven bounded exponential retry from 1 through 64 ticks, never a GC
+self-wake or CPU busy-spin loop. IRQ waiter registration is deliberately
 separate from driver-owned source validation, enable/disable, masking, and
 acknowledgement. See `PATCHES.md` and `VENDOR.md` for the maintained delta and
 source identity.
