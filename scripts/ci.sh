@@ -29,7 +29,7 @@ RUSTDOCFLAGS='-D warnings' \
 
 nightly_features='multitask irq preempt smp sched-cfs task-ext'
 diagnostic_features="$nightly_features irq-continuation-diagnostics irq-exit"
-nightly_test_features='test multitask irq preempt smp sched-cfs irq-continuation-diagnostics irq-exit'
+nightly_test_features='test multitask irq preempt smp sched-cfs task-ext irq-continuation-diagnostics irq-exit'
 cargo +nightly-2025-05-20 check -p thekernel-axtask --no-default-features --locked
 cargo +nightly-2025-05-20 test \
     -p thekernel-axtask --all-targets --locked --features "$nightly_test_features"

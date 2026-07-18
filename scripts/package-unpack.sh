@@ -212,7 +212,7 @@ CARGO_TARGET_DIR="$tmp/test-target/axtask" \
         --all-targets \
         --locked \
         --offline \
-        --features "test multitask irq preempt smp sched-cfs irq-exit" \
+        --features "test multitask irq preempt smp sched-cfs task-ext irq-exit" \
         "${patches[@]}"
 for target in riscv64gc-unknown-none-elf loongarch64-unknown-none; do
     CARGO_TARGET_DIR="$tmp/test-target/axtask-$target" \

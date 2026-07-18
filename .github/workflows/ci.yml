@@ -117,7 +117,7 @@ jobs:
       - name: Test axtask feature and architecture matrix
         run: |
           features='multitask irq preempt smp sched-cfs task-ext irq-continuation-diagnostics irq-exit'
-          test_features='test multitask irq preempt smp sched-cfs irq-continuation-diagnostics irq-exit'
+          test_features='test multitask irq preempt smp sched-cfs task-ext irq-continuation-diagnostics irq-exit'
           cargo +nightly-2025-05-20 check -p thekernel-axtask --no-default-features --locked
           cargo +nightly-2025-05-20 test -p thekernel-axtask --all-targets --locked --features "$test_features"
           cargo +nightly-2025-05-20 clippy -p thekernel-axtask --all-targets --locked --features "$test_features" -- -D warnings

@@ -8,6 +8,8 @@ use std::sync::{Mutex, Once};
 
 use axerrno::AxError;
 
+#[cfg(feature = "task-ext")]
+use crate::TaskInner;
 use crate::{WaitQueue, api as axtask, current};
 
 static INIT: Once = Once::new();
@@ -15,6 +17,33 @@ static DEFERRED_INIT: Once = Once::new();
 static SERIAL: Mutex<()> = Mutex::new(());
 static DEFERRED_CALLS: AtomicUsize = AtomicUsize::new(0);
 static DEFERRED_REENTER: AtomicBool = AtomicBool::new(false);
+
+#[cfg(feature = "task-ext")]
+const GC_DROP_OK: usize = 1;
+#[cfg(feature = "task-ext")]
+const GC_DROP_NESTED_BUSY: usize = 2;
+#[cfg(feature = "task-ext")]
+const GC_DROP_OTHER_ERROR: usize = 3;
+
+#[cfg(feature = "task-ext")]
+struct GcDropProbe(alloc::sync::Arc<AtomicUsize>);
+
+#[cfg(feature = "task-ext")]
+#[extern_trait::extern_trait]
+impl crate::TaskExt for GcDropProbe {}
+
+#[cfg(feature = "task-ext")]
+impl Drop for GcDropProbe {
+    fn drop(&mut self) {
+        let result = crate::future::block_on(async {});
+        let outcome = match result {
+            Ok(()) => GC_DROP_OK,
+            Err(crate::future::BlockOnError::Busy) => GC_DROP_NESTED_BUSY,
+            Err(_) => GC_DROP_OTHER_ERROR,
+        };
+        self.0.store(outcome, Ordering::Release);
+    }
+}
 
 fn init_for_test() {
     INIT.call_once(|| axtask::init_scheduler().unwrap());
@@ -438,6 +467,43 @@ fn direct_exit_releases_internal_current_task_owners() {
     let task = axtask::spawn(|| axtask::exit(37)).unwrap();
     assert_eq!(task.join().unwrap(), 37);
     drop(task);
+    assert!(!axtask::reclaim_exited_tasks_until_clear(128));
+}
+
+#[cfg(feature = "task-ext")]
+#[test]
+fn gc_runs_task_ext_destructors_outside_its_block_session() {
+    let _lock = SERIAL.lock();
+    init_for_test();
+
+    let outcome = alloc::sync::Arc::new(AtomicUsize::new(0));
+    let mut inner = crate::TaskInner::new(
+        || {},
+        "gc-drop-boundary".into(),
+        crate::MIN_KERNEL_STACK_SIZE,
+    )
+    .unwrap();
+    *inner.task_ext_mut() = Some(crate::AxTaskExt::from_impl(GcDropProbe(outcome.clone())));
+
+    let task = axtask::spawn_task(inner).unwrap();
+    assert_eq!(task.join().unwrap(), 0);
+    drop(task);
+
+    // A retained exit is deliberately requeued without self-waking. Publish a
+    // fresh exit after releasing the external handle so the dedicated GC task
+    // gets a deterministic new edge and revisits the queue.
+    let kick = axtask::spawn(|| {}).unwrap();
+    assert_eq!(kick.join().unwrap(), 0);
+    drop(kick);
+
+    for _ in 0..256 {
+        if outcome.load(Ordering::Acquire) != 0 {
+            break;
+        }
+        axtask::yield_now();
+    }
+
+    assert_eq!(outcome.load(Ordering::Acquire), GC_DROP_OK);
     assert!(!axtask::reclaim_exited_tasks_until_clear(128));
 }
 

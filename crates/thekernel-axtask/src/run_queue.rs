@@ -4,7 +4,7 @@ use alloc::sync::Weak;
 use core::{
     fmt,
     future::poll_fn,
-    sync::atomic::{AtomicPtr, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
     task::{Context, Poll},
 };
 
@@ -195,10 +195,55 @@ impl ExitedTaskQueue {
     }
 }
 
+/// Coalesced, allocation-free wake state for one CPU's exited-task recycler.
+///
+/// The pending bit is the durable event; the waker is only a scheduling hint.
+/// Producers publish the bit before waking so an exit that races the GC task's
+/// first poll, or happens before the task has registered a waker, is retained.
+struct GcWake {
+    pending: AtomicBool,
+    waiter: AtomicWaker,
+}
+
+impl GcWake {
+    const fn new() -> Self {
+        Self {
+            pending: AtomicBool::new(false),
+            waiter: AtomicWaker::new(),
+        }
+    }
+
+    fn notify(&self) {
+        self.pending.store(true, Ordering::Release);
+        self.waiter.wake();
+    }
+
+    fn consume_pending(&self) -> bool {
+        self.pending.swap(false, Ordering::AcqRel)
+    }
+
+    fn register_and_recheck(&self, cx: &mut Context<'_>) -> Poll<()> {
+        self.waiter.register(cx.waker());
+        if self.consume_pending() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn poll(&self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.consume_pending() {
+            Poll::Ready(())
+        } else {
+            self.register_and_recheck(cx)
+        }
+    }
+}
+
 percpu_static! {
     RUN_QUEUE: LazyInit<AxRunQueue> = LazyInit::new(),
     EXITED_TASKS: ExitedTaskQueue = ExitedTaskQueue::new(),
-    WAIT_FOR_EXIT: AtomicWaker = AtomicWaker::new(),
+    GC_WAKE: GcWake = GcWake::new(),
     STACK_CACHE: kspin::SpinNoIrq<PerCpuStackCache> = kspin::SpinNoIrq::new(PerCpuStackCache::new()),
     IDLE_TASK: LazyInit<AxTaskRef> = LazyInit::new(),
     /// Stores the weak reference to the previous task that is running on this CPU.
@@ -1118,7 +1163,11 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
         assert!(curr.is_running(), "task is not running: {:?}", curr.state());
         assert!(!curr.is_idle());
         if curr.is_init() {
-            clear_exited_tasks();
+            // This path still owns the IRQ-saving runqueue guard. Exited task
+            // and TaskExt destructors may sleep, join, or take scheduler-aware
+            // locks, so attempting a tidy drain here can deadlock shutdown.
+            // System power-off is terminal: retain the queue-owned Arc units
+            // and let the machine boundary reclaim their memory.
             axhal::power::system_off();
         } else {
             // Notify the joiner task.
@@ -1278,12 +1327,7 @@ impl AxRunQueue {
     /// The run queue is initialized with a per-CPU gc task in its scheduler.
     fn new(cpu_id: usize) -> Result<Self, TaskRuntimeInitError> {
         let gc_task = TaskInner::new(
-            || {
-                if let Err(error) = block_on(poll_fn(poll_gc)) {
-                    error!("exited-task recycler stopped: {error}");
-                    crate::exit(-1);
-                }
-            },
+            || -> () { gc_main() },
             "gc".into(),
             axconfig::TASK_STACK_SIZE,
         )?
@@ -1535,56 +1579,44 @@ fn is_valid_idle_fallback(task: &AxTaskRef) -> bool {
     task.is_idle() && (task.is_ready() || task.is_running())
 }
 
-fn poll_gc(cx: &mut Context<'_>) -> Poll<()> {
+/// Runs one wait-only block session and then performs reclamation in ordinary
+/// task context. In particular, no TaskInner/TaskExt destructor and no
+/// deferred-work callback can observe the GC task as already blocking.
+fn gc_main() -> ! {
     loop {
-        let retained = reclaim_exited_tasks_current_cpu();
-        // Note: we cannot block current task with preemption disabled,
-        // use `current_ref_raw` to get the `WAIT_FOR_EXIT`'s reference here to avoid
-        // the use of `NoPreemptGuard`. Since gc task is pinned to the current
-        // CPU, there is no affection if the gc task is preempted during the process.
-        unsafe { WAIT_FOR_EXIT.current_ref_raw() }.register(cx.waker());
-
-        // New tasks might be added during the above section, recheck it to
-        // prevent us from sleeping indefinitely.
-        if EXITED_TASKS.with_current(|exited_tasks| exited_tasks.is_empty()) {
-            break;
-        }
-        // A just-exited child can still be held by the clone/wakeup path that
-        // spawned it. Re-polling immediately would spin the GC task against a
-        // transient reference and steal CPU from fork/thread-heavy workloads.
-        // Later exits wake the GC again, and explicit reclaim points in clone
-        // and wait drain any retained task once that reference is gone.
-        if retained {
-            break;
+        if let Err(error) = block_on(poll_fn(poll_gc_wait)) {
+            error!("exited-task recycler stopped: {error}");
+            crate::exit(-1);
         }
 
-        crate::yield_now();
+        reclaim_exited_tasks_current_cpu();
+        // Reclaim can run arbitrary TaskInner/TaskExt destructors. Dispatch
+        // any work they deferred only after both the exited-queue access and
+        // the GC block session have ended.
+        crate::run_deferred_work();
     }
+}
 
-    Poll::Pending
+fn poll_gc_wait(cx: &mut Context<'_>) -> Poll<()> {
+    // Avoid a NoPreemptGuard while the block executor is deciding whether it
+    // may sleep. The GC task is permanently pinned to this CPU and GcWake is
+    // internally synchronized for a racing exit notification.
+    unsafe { GC_WAKE.current_ref_raw() }.poll(cx)
 }
 
 fn push_exited_task(task: AxTaskRef) -> Result<(), ExitedTaskEnqueueError> {
     EXITED_TASKS.with_current(|exited_tasks| exited_tasks.push_back(task))?;
-    // Safety: exit_current runs with IRQs + preemption disabled. Re-push
-    // from the reclaim loop runs under the same percpu context.
-    unsafe { WAIT_FOR_EXIT.current_ref_mut_raw().wake() };
+    // Safety: exit_current runs with IRQs + preemption disabled on the CPU
+    // which owns both the intrusive queue and this coalesced wake state.
+    unsafe { GC_WAKE.current_ref_raw() }.notify();
     Ok(())
 }
 
-fn clear_exited_tasks() {
-    while let Some(dequeued) = EXITED_TASKS.with_current(ExitedTaskQueue::pop_front) {
-        if let Some(fault) = dequeued.fault {
-            error!(
-                "exited task {} dequeued with fault: {:?}",
-                dequeued.task.id().as_u64(),
-                fault
-            );
-        }
-        // Drop after the per-CPU queue access has ended. Task/task-ext/stack
-        // destructors may run arbitrary code and must not run inside it.
-        drop(dequeued.task);
-    }
+fn requeue_retained_exited_task(task: AxTaskRef) -> Result<(), ExitedTaskEnqueueError> {
+    // A retained task is not new work: immediately waking the GC would spin it
+    // against the same external Arc. A later exit publishes a new pending edge,
+    // while explicit reclaim callers can retry after their own bounded yield.
+    EXITED_TASKS.with_current(|exited_tasks| exited_tasks.push_back(task))
 }
 
 pub(crate) fn has_exited_tasks() -> bool {
@@ -1623,7 +1655,7 @@ fn reclaim_exited_tasks_current_cpu_batch(max_tasks: Option<usize>) -> (bool, bo
                 // Still held by a joiner or scheduler handoff; push back for a
                 // later round.
                 retained = true;
-                if let Err(error) = push_exited_task(task) {
+                if let Err(error) = requeue_retained_exited_task(task) {
                     error!(
                         "cannot requeue exited task {}: {:?}",
                         error.task.id().as_u64(),
@@ -1758,6 +1790,7 @@ pub(crate) fn init_secondary() -> Result<(), TaskRuntimeInitError> {
 #[cfg(test)]
 mod exited_queue_tests {
     use super::*;
+    use core::task::Waker;
 
     fn task(name: &str) -> AxTaskRef {
         TaskInner::new_init(name.into())
@@ -1784,6 +1817,31 @@ mod exited_queue_tests {
         assert!(is_valid_idle_fallback(&idle));
         idle.set_state(TaskState::Blocked);
         assert!(!is_valid_idle_fallback(&idle));
+    }
+
+    #[test]
+    fn gc_wake_is_durable_and_coalesces_notifications() {
+        let wake = GcWake::new();
+        let mut context = Context::from_waker(Waker::noop());
+
+        wake.notify();
+        wake.notify();
+
+        assert_eq!(wake.poll(&mut context), Poll::Ready(()));
+        assert_eq!(wake.poll(&mut context), Poll::Pending);
+    }
+
+    #[test]
+    fn gc_wake_closes_the_check_register_race() {
+        let wake = GcWake::new();
+        let mut context = Context::from_waker(Waker::noop());
+
+        // Model an exit after poll's fast check but before waker registration.
+        assert!(!wake.consume_pending());
+        wake.notify();
+
+        assert_eq!(wake.register_and_recheck(&mut context), Poll::Ready(()));
+        assert_eq!(wake.poll(&mut context), Poll::Pending);
     }
 
     fn pop_clean(queue: &mut ExitedTaskQueue) -> AxTaskRef {
