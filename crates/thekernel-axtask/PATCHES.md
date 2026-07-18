@@ -75,8 +75,10 @@ SHA-256
 - Run exited-task reclamation, `TaskExt` destruction, and deferred callbacks
   outside the recycler's wait-only block session. Publish each recycler's
   affinity and raw-waker CPU owner together before scheduler admission, and use
-  one fixed per-CPU timer state with capped exponential retry for externally
-  retained tasks instead of either permanent retention or a GC self-wake loop.
+  one fixed per-CPU timer state with capped exponential retry in IRQ-enabled
+  runtimes for externally retained tasks instead of either permanent retention
+  or a GC self-wake loop. Cooperative runtimes require a later exit or explicit
+  reclaim edge.
 - Provide an opt-in, allocation-free per-CPU IRQ-continuation diagnostic ring.
   It records only context switches and suspicious IRQ-off scheduler boundaries;
   production builds pay no cost unless the diagnostic feature is selected.

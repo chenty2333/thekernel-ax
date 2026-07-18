@@ -1777,13 +1777,12 @@ fn reclaim_exited_tasks_current_cpu_batch(max_tasks: Option<usize>) -> (bool, bo
         }
     }
     let remaining = !EXITED_TASKS.with_current(|exited_tasks| exited_tasks.is_empty());
-    #[cfg(feature = "irq")]
-    if !remaining {
-        // An opportunistic explicit reclaim can drain a queue before the GC
-        // task consumes its retry. Reset both the deadline and backoff so the
-        // next unrelated exit starts from the short initial observation.
-        unsafe { GC_WAKE.current_ref_raw() }.reset_retained_retry();
-    }
+    // Do not reset GC_WAKE here. This helper is also called by opportunistic
+    // reclaimers which may migrate after the exited-queue guard is released;
+    // using current_ref_raw() after that boundary could apply this CPU's empty
+    // observation to another CPU's retained-owner retry. The pinned recycler
+    // owns retry reset after its scan. At worst, an opportunistic drain leaves
+    // one bounded stale timer wake for that owner CPU.
     (retained, remaining)
 }
 

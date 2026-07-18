@@ -289,6 +289,10 @@ pub fn on_timer_event() {
 /// Handles periodic timer ticks for the task manager.
 ///
 /// For example, advance scheduler states, checks timed events, etc.
+///
+/// This entry point is called from the local periodic timer interrupt. The
+/// caller must already have local IRQs and preemption disabled so per-CPU
+/// scheduler and recycler state remain owned by the interrupted CPU.
 #[cfg(feature = "irq")]
 #[doc(cfg(feature = "irq"))]
 pub fn on_timer_tick() {
