@@ -79,6 +79,8 @@ struct TimerInner {
     slots: [TimerSlot; TIMER_FUTURE_CAPACITY],
     next: usize,
     len: usize,
+    #[cfg(test)]
+    admissions: usize,
 }
 
 impl TimerInner {
@@ -87,6 +89,8 @@ impl TimerInner {
             slots: [const { TimerSlot::new() }; TIMER_FUTURE_CAPACITY],
             next: 0,
             len: 0,
+            #[cfg(test)]
+            admissions: 0,
         }
     }
 
@@ -114,6 +118,10 @@ impl TimerInner {
         entry.deadline = deadline;
         entry.occupied = true;
         self.len += 1;
+        #[cfg(test)]
+        {
+            self.admissions += 1;
+        }
         self.next = if slot + 1 == TIMER_FUTURE_CAPACITY {
             0
         } else {
@@ -301,19 +309,28 @@ impl Drop for TimerFuture {
     }
 }
 
-/// Crate-private ownership of one absolute-deadline reservation.
+/// Ownership of one bounded absolute-deadline reservation.
 ///
-/// Unlike [`TimerFuture`], this lease may be polled by several consecutive
-/// synchronous block sessions. Callers disarm it after every session so a
-/// task waker is retained only while that task is actually waiting. Dropping
-/// the lease refunds a still-live reservation exactly once.
+/// Unlike [`TimerFuture`], this reservation may cover several consecutive
+/// synchronous block sessions without repeating timer admission. Use
+/// [`DeadlineReservation::race`] to borrow it for each block session. The
+/// borrowed future removes its task waker when that session completes or is
+/// dropped while retaining the reservation for a later session. Dropping the
+/// reservation refunds a still-live timer slot exactly once.
+///
+/// The registry token remains private so callers cannot poll, disarm, or
+/// cancel another reservation accidentally.
 #[must_use = "a deadline reservation must be retained until it is elapsed or cancelled"]
-pub(crate) struct DeadlineLease {
+pub struct DeadlineReservation {
     token: Option<TimerToken>,
 }
 
-impl DeadlineLease {
-    pub(crate) fn reserve(deadline: TimeValue) -> Result<Self, TimerRegistrationError> {
+impl DeadlineReservation {
+    /// Reserves one timer-registry slot for `deadline`.
+    ///
+    /// An already elapsed deadline needs no slot and produces a reservation
+    /// whose first race reports [`Elapsed`] unless the other future is ready.
+    pub fn reserve(deadline: TimeValue) -> Result<Self, TimerRegistrationError> {
         if deadline <= wall_time() {
             return Ok(Self { token: None });
         }
@@ -323,7 +340,34 @@ impl DeadlineLease {
         Ok(Self { token: Some(token) })
     }
 
-    pub(crate) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+    /// Races `future` against this reservation without repeating admission.
+    ///
+    /// The wrapped future is checked before the deadline and rechecked after
+    /// observing expiration, so work completed in the same observation window
+    /// wins. Each returned future is one borrowed wait session. Finishing or
+    /// dropping that session automatically removes its registered task waker,
+    /// while an unexpired reservation remains available for another call.
+    pub async fn race<F: IntoFuture>(&mut self, future: F) -> Result<F::Output, Elapsed> {
+        let session = DeadlineSession { reservation: self };
+        let mut future = core::pin::pin!(future.into_future());
+
+        core::future::poll_fn(|cx| {
+            if let Poll::Ready(output) = future.as_mut().poll(cx) {
+                return Poll::Ready(Ok(output));
+            }
+            if session.reservation.poll_deadline(cx).is_pending() {
+                return Poll::Pending;
+            }
+
+            match future.as_mut().poll(cx) {
+                Poll::Ready(output) => Poll::Ready(Ok(output)),
+                Poll::Pending => Poll::Ready(Err(Elapsed)),
+            }
+        })
+        .await
+    }
+
+    fn poll_deadline(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         let Some(token) = self.token else {
             return Poll::Ready(());
         };
@@ -334,20 +378,28 @@ impl DeadlineLease {
         result
     }
 
-    /// Removes the current block session's task waker without releasing the
-    /// absolute deadline reservation.
-    pub(crate) fn disarm(&mut self) {
+    fn disarm(&mut self) {
         if let Some(token) = self.token {
             runtime_for(token.owner_cpu).disarm(token);
         }
     }
 }
 
-impl Drop for DeadlineLease {
+impl Drop for DeadlineReservation {
     fn drop(&mut self) {
         if let Some(token) = self.token.take() {
             runtime_for(token.owner_cpu).cancel(token);
         }
+    }
+}
+
+struct DeadlineSession<'a> {
+    reservation: &'a mut DeadlineReservation,
+}
+
+impl Drop for DeadlineSession<'_> {
+    fn drop(&mut self) {
+        self.reservation.disarm();
     }
 }
 
@@ -374,6 +426,12 @@ pub(crate) fn timer_future_waker_count_for_test() -> usize {
         .iter()
         .filter(|slot| slot.occupied && slot.waker.is_some())
         .count()
+}
+
+#[cfg(test)]
+pub(crate) fn timer_reservation_admission_count_for_test() -> usize {
+    let cpu_id = axhal::percpu::this_cpu_id();
+    runtime_for(cpu_id).0.lock().admissions
 }
 
 /// Waits until `duration` has elapsed.

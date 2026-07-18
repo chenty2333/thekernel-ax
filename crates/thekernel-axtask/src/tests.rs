@@ -403,55 +403,204 @@ fn timed_wait_final_predicate_beats_interrupt_and_deadline() {
 }
 
 #[test]
+fn deadline_reservation_rechecks_operation_at_elapsed_boundary() {
+    let _lock = SERIAL.lock();
+    init_for_test();
+
+    let timer_count = crate::future::timer_future_count_for_test();
+    let timer_wakers = crate::future::timer_future_waker_count_for_test();
+    let admissions = crate::future::timer_reservation_admission_count_for_test();
+    let mut reservation =
+        crate::future::DeadlineReservation::reserve(axhal::time::wall_time()).unwrap();
+    let mut polls = 0;
+
+    assert_eq!(
+        crate::future::block_on(reservation.race(poll_fn(|_| {
+            polls += 1;
+            if polls == 1 {
+                Poll::Pending
+            } else {
+                Poll::Ready(29_u8)
+            }
+        }))),
+        Ok(Ok(29))
+    );
+    assert_eq!(polls, 2);
+    assert_eq!(
+        crate::future::block_on(reservation.race(pending::<()>())),
+        Ok(Err(crate::future::Elapsed))
+    );
+    assert_eq!(crate::future::timer_future_count_for_test(), timer_count);
+    assert_eq!(
+        crate::future::timer_future_waker_count_for_test(),
+        timer_wakers
+    );
+    assert_eq!(
+        crate::future::timer_reservation_admission_count_for_test(),
+        admissions
+    );
+}
+
+#[test]
+fn deadline_reservation_race_reuses_admission_disarms_sessions_and_refunds() {
+    let _lock = SERIAL.lock();
+    init_for_test();
+
+    let timer_count = crate::future::timer_future_count_for_test();
+    let timer_wakers = crate::future::timer_future_waker_count_for_test();
+    let admissions = crate::future::timer_reservation_admission_count_for_test();
+    let deadline = axhal::time::wall_time()
+        .checked_add(Duration::from_secs(60))
+        .unwrap();
+    let mut reservation = crate::future::DeadlineReservation::reserve(deadline).unwrap();
+
+    assert_eq!(
+        crate::future::timer_future_count_for_test(),
+        timer_count + 1
+    );
+    assert_eq!(
+        crate::future::timer_reservation_admission_count_for_test(),
+        admissions + 1
+    );
+
+    for expected in 1_u8..=3 {
+        let mut first_poll = true;
+        assert_eq!(
+            crate::future::block_on(reservation.race(poll_fn(|cx| {
+                if core::mem::take(&mut first_poll) {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                } else {
+                    Poll::Ready(expected)
+                }
+            }))),
+            Ok(Ok(expected))
+        );
+        assert_eq!(
+            crate::future::timer_future_count_for_test(),
+            timer_count + 1
+        );
+        assert_eq!(
+            crate::future::timer_future_waker_count_for_test(),
+            timer_wakers
+        );
+        assert_eq!(
+            crate::future::timer_reservation_admission_count_for_test(),
+            admissions + 1
+        );
+    }
+
+    let curr = current();
+    curr.disable_preempt();
+    let cancelled = crate::future::block_on(reservation.race(pending::<()>()));
+    curr.enable_preempt(false);
+    assert_eq!(cancelled, Err(crate::future::BlockOnError::CannotBlock));
+    assert_eq!(
+        crate::future::timer_future_count_for_test(),
+        timer_count + 1
+    );
+    assert_eq!(
+        crate::future::timer_future_waker_count_for_test(),
+        timer_wakers
+    );
+    assert_eq!(
+        crate::future::timer_reservation_admission_count_for_test(),
+        admissions + 1
+    );
+    assert_eq!(
+        crate::future::block_on(reservation.race(async { 4_u8 })),
+        Ok(Ok(4))
+    );
+
+    drop(reservation);
+    assert_eq!(crate::future::timer_future_count_for_test(), timer_count);
+    assert_eq!(
+        crate::future::timer_future_waker_count_for_test(),
+        timer_wakers
+    );
+    assert_eq!(
+        crate::future::timer_reservation_admission_count_for_test(),
+        admissions + 1
+    );
+}
+
+#[test]
 fn timed_wait_reuses_one_reservation_and_disarms_between_sessions() {
     let _lock = SERIAL.lock();
     init_for_test();
 
     static WAIT: WaitQueue = WaitQueue::new();
-    static ARMED: AtomicBool = AtomicBool::new(false);
-    static WAKE_SENT: AtomicBool = AtomicBool::new(false);
-    ARMED.store(false, Ordering::Release);
-    WAKE_SENT.store(false, Ordering::Release);
+    static REQUESTED: AtomicUsize = AtomicUsize::new(0);
+    static SENT: AtomicUsize = AtomicUsize::new(0);
+    static ACKED: AtomicUsize = AtomicUsize::new(0);
+    REQUESTED.store(0, Ordering::Release);
+    SENT.store(0, Ordering::Release);
+    ACKED.store(0, Ordering::Release);
 
     let timer_count = crate::future::timer_future_count_for_test();
     let timer_wakers = crate::future::timer_future_waker_count_for_test();
+    let admissions = crate::future::timer_reservation_admission_count_for_test();
     let notifier = axtask::spawn(|| {
-        while !ARMED.load(Ordering::Acquire) {
-            axtask::yield_now();
+        for session in 1..=3 {
+            while REQUESTED.load(Ordering::Acquire) < session {
+                axtask::yield_now();
+            }
+            SENT.store(session, Ordering::Release);
+            WAIT.notify_one(false);
+            while ACKED.load(Ordering::Acquire) < session {
+                axtask::yield_now();
+            }
         }
-        WAKE_SENT.store(true, Ordering::Release);
-        WAIT.notify_one(false);
     })
     .unwrap();
 
     let mut checks = 0;
+    let mut observed = 0;
     assert_eq!(
         WAIT.wait_timeout_until(Duration::from_secs(1), || {
             checks += 1;
-            if checks == 2 {
-                ARMED.store(true, Ordering::Release);
+            let sent = SENT.load(Ordering::Acquire);
+            if sent > observed {
+                assert_eq!(sent, observed + 1);
+                assert_eq!(
+                    crate::future::timer_future_count_for_test(),
+                    timer_count + 1
+                );
+                assert_eq!(
+                    crate::future::timer_future_waker_count_for_test(),
+                    timer_wakers
+                );
+                assert_eq!(
+                    crate::future::timer_reservation_admission_count_for_test(),
+                    admissions + 1
+                );
+                observed = sent;
+                ACKED.store(observed, Ordering::Release);
+                if observed == 3 {
+                    return true;
+                }
             }
-            if !WAKE_SENT.load(Ordering::Acquire) {
-                return false;
+
+            // The first call precedes listener publication. Every later call
+            // runs after this session's listener has been armed.
+            if checks > 1 {
+                REQUESTED.store(observed + 1, Ordering::Release);
             }
-            assert_eq!(
-                crate::future::timer_future_count_for_test(),
-                timer_count + 1
-            );
-            assert_eq!(
-                crate::future::timer_future_waker_count_for_test(),
-                timer_wakers
-            );
-            true
+            false
         }),
         Ok(false)
     );
     notifier.join().unwrap();
-    assert_eq!(checks, 3);
+    assert_eq!(checks, 5);
+    assert_eq!(observed, 3);
     assert_eq!(crate::future::timer_future_count_for_test(), timer_count);
     assert_eq!(
         crate::future::timer_future_waker_count_for_test(),
         timer_wakers
+    );
+    assert_eq!(
+        crate::future::timer_reservation_admission_count_for_test(),
+        admissions + 1
     );
 }
 

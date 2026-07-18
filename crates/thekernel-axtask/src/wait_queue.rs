@@ -4,7 +4,7 @@ use axerrno::AxError;
 use axhal::time::{TimeValue, wall_time};
 use event_listener::{Event, listener};
 
-use crate::future::{BlockOnError, DeadlineLease, TimerRegistrationError, block_on};
+use crate::future::{BlockOnError, DeadlineReservation, Elapsed, TimerRegistrationError, block_on};
 
 /// Failure while waiting on a [`WaitQueue`].
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -76,7 +76,6 @@ fn checked_wait_deadline(now: TimeValue, dur: Duration) -> Result<TimeValue, Wai
 enum WaitWake {
     Notified,
     Interrupted,
-    Deadline,
 }
 
 fn poll_listener<L>(mut listener: Pin<&mut L>, cx: &mut core::task::Context<'_>) -> Poll<WaitWake>
@@ -110,53 +109,6 @@ where
         Poll::Ready(WaitWake::Interrupted)
     } else {
         Poll::Pending
-    }
-}
-
-fn poll_listener_deadline<L>(
-    mut listener: Pin<&mut L>,
-    deadline: &mut DeadlineLease,
-    cx: &mut core::task::Context<'_>,
-) -> Poll<WaitWake>
-where
-    L: Future<Output = ()> + ?Sized,
-{
-    if let Poll::Ready(wake) = poll_listener(listener.as_mut(), cx) {
-        return Poll::Ready(wake);
-    }
-    if deadline.poll(cx).is_pending() {
-        return Poll::Pending;
-    }
-
-    // A notification published while the timer was being polled still owns
-    // the same observation window and therefore wins the deadline boundary.
-    match poll_listener(listener, cx) {
-        Poll::Ready(wake) => Poll::Ready(wake),
-        Poll::Pending => Poll::Ready(WaitWake::Deadline),
-    }
-}
-
-fn poll_listener_interrupt_deadline<L>(
-    mut listener: Pin<&mut L>,
-    deadline: &mut DeadlineLease,
-    task: &crate::AxTask,
-    cx: &mut core::task::Context<'_>,
-) -> Poll<WaitWake>
-where
-    L: Future<Output = ()> + ?Sized,
-{
-    if let Poll::Ready(wake) = poll_listener_interruptible(listener.as_mut(), task, cx) {
-        return Poll::Ready(wake);
-    }
-    if deadline.poll(cx).is_pending() {
-        return Poll::Pending;
-    }
-
-    // Re-observe both higher-priority sources after observing the timer. An
-    // interrupt consumed by the listener recheck is restored by that helper.
-    match poll_listener_interruptible(listener, task, cx) {
-        Poll::Ready(wake) => Poll::Ready(wake),
-        Poll::Pending => Poll::Ready(WaitWake::Deadline),
     }
 }
 
@@ -245,7 +197,7 @@ impl WaitQueue {
     pub fn wait_timeout(&self, dur: Duration) -> Result<bool, WaitError> {
         let deadline = checked_wait_deadline(wall_time(), dur)?;
         listener!(self.event => listener);
-        let mut deadline = match DeadlineLease::reserve(deadline) {
+        let mut deadline = match DeadlineReservation::reserve(deadline) {
             Ok(deadline) => deadline,
             Err(error) => {
                 let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
@@ -256,14 +208,14 @@ impl WaitQueue {
                 };
             }
         };
-        let blocked = block_on(poll_fn(|cx| {
-            poll_listener_deadline(Pin::new(&mut listener), &mut deadline, cx)
-        }));
-        deadline.disarm();
+        let blocked =
+            block_on(deadline.race(poll_fn(|cx| poll_listener(Pin::new(&mut listener), cx))));
         match blocked.map_err(WaitError::Block)? {
-            WaitWake::Notified => Ok(false),
-            WaitWake::Deadline => Ok(true),
-            WaitWake::Interrupted => unreachable!("non-interruptible wait reported interruption"),
+            Ok(WaitWake::Notified) => Ok(false),
+            Ok(WaitWake::Interrupted) => {
+                unreachable!("non-interruptible wait reported interruption")
+            }
+            Err(Elapsed) => Ok(true),
         }
     }
 
@@ -284,7 +236,7 @@ impl WaitQueue {
             return Ok(false);
         }
         let deadline = checked_wait_deadline(wall_time(), dur)?;
-        let mut deadline = match DeadlineLease::reserve(deadline) {
+        let mut deadline = match DeadlineReservation::reserve(deadline) {
             Ok(deadline) => deadline,
             Err(error) => {
                 return if condition() {
@@ -300,16 +252,14 @@ impl WaitQueue {
             if condition() {
                 return Ok(false);
             }
-            let blocked = block_on(poll_fn(|cx| {
-                poll_listener_deadline(Pin::new(&mut listener), &mut deadline, cx)
-            }));
-            deadline.disarm();
+            let blocked =
+                block_on(deadline.race(poll_fn(|cx| poll_listener(Pin::new(&mut listener), cx))));
             match blocked.map_err(WaitError::Block)? {
-                WaitWake::Notified => {}
-                WaitWake::Deadline => return Ok(!condition()),
-                WaitWake::Interrupted => {
+                Ok(WaitWake::Notified) => {}
+                Ok(WaitWake::Interrupted) => {
                     unreachable!("non-interruptible wait reported interruption")
                 }
+                Err(Elapsed) => return Ok(!condition()),
             }
         }
     }
@@ -338,7 +288,7 @@ impl WaitQueue {
         }
         let deadline = checked_wait_deadline(wall_time(), dur)?;
         let task = crate::current().clone();
-        let mut deadline = match DeadlineLease::reserve(deadline) {
+        let mut deadline = match DeadlineReservation::reserve(deadline) {
             Ok(deadline) => deadline,
             Err(error) => {
                 if condition() {
@@ -364,20 +314,19 @@ impl WaitQueue {
             if condition() {
                 return Ok(false);
             }
-            let blocked = block_on(poll_fn(|cx| {
-                poll_listener_interrupt_deadline(Pin::new(&mut listener), &mut deadline, &task, cx)
-            }));
-            deadline.disarm();
+            let blocked = block_on(deadline.race(poll_fn(|cx| {
+                poll_listener_interruptible(Pin::new(&mut listener), &task, cx)
+            })));
             match blocked.map_err(WaitError::Block)? {
-                WaitWake::Notified => {}
-                WaitWake::Interrupted => {
+                Ok(WaitWake::Notified) => {}
+                Ok(WaitWake::Interrupted) => {
                     if condition() {
                         task.interrupt();
                         return Ok(false);
                     }
                     return Err(WaitError::Interrupted);
                 }
-                WaitWake::Deadline => return Ok(!condition()),
+                Err(Elapsed) => return Ok(!condition()),
             }
         }
     }

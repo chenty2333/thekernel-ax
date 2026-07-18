@@ -74,7 +74,10 @@ or cancelled.
 `WaitQueue::wait_timeout_until_interruptible` uses one complete deadline rather
 than hidden short-slice polling. It returns condition versus timeout explicitly
 and preserves separate block-session, interruption, and bounded timer-admission
-errors. A satisfied condition wins when observed with an interrupt or timeout.
+errors. `future::DeadlineReservation` exposes the same one-admission mechanism
+to generic consumers: each borrowed `race` future automatically disarms its
+task waker while retaining an unexpired reservation for the next wait session.
+A satisfied condition wins when observed with an interrupt or timeout.
 The generic `future::interruptible` adapter follows the same condition-first
 rule: it checks the wrapped future before consuming an interrupt and rechecks
 after installing the interrupt waker. If both become ready in that race, the
