@@ -1,13 +1,10 @@
-use core::{fmt, time::Duration};
+use core::{fmt, future::Future, future::poll_fn, pin::Pin, task::Poll, time::Duration};
 
 use axerrno::AxError;
 use axhal::time::{TimeValue, wall_time};
 use event_listener::{Event, listener};
 
-use crate::future::{
-    BlockOnError, Interrupted, TimeoutError, TimerRegistrationError, block_on, interruptible,
-    timeout_at,
-};
+use crate::future::{BlockOnError, DeadlineLease, TimerRegistrationError, block_on};
 
 /// Failure while waiting on a [`WaitQueue`].
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -75,6 +72,99 @@ fn checked_wait_deadline(now: TimeValue, dur: Duration) -> Result<TimeValue, Wai
         .ok_or(WaitError::Timer(TimerRegistrationError::DeadlineOverflow))
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum WaitWake {
+    Notified,
+    Interrupted,
+    Deadline,
+}
+
+fn poll_listener<L>(mut listener: Pin<&mut L>, cx: &mut core::task::Context<'_>) -> Poll<WaitWake>
+where
+    L: Future<Output = ()> + ?Sized,
+{
+    listener.as_mut().poll(cx).map(|()| WaitWake::Notified)
+}
+
+fn poll_listener_interruptible<L>(
+    mut listener: Pin<&mut L>,
+    task: &crate::AxTask,
+    cx: &mut core::task::Context<'_>,
+) -> Poll<WaitWake>
+where
+    L: Future<Output = ()> + ?Sized,
+{
+    if let Poll::Ready(wake) = poll_listener(listener.as_mut(), cx) {
+        return Poll::Ready(wake);
+    }
+
+    let interrupted = task.poll_interrupt(cx).is_ready();
+    if let Poll::Ready(wake) = poll_listener(listener, cx) {
+        if interrupted {
+            task.interrupt();
+        }
+        return Poll::Ready(wake);
+    }
+
+    if interrupted {
+        Poll::Ready(WaitWake::Interrupted)
+    } else {
+        Poll::Pending
+    }
+}
+
+fn poll_listener_deadline<L>(
+    mut listener: Pin<&mut L>,
+    deadline: &mut DeadlineLease,
+    cx: &mut core::task::Context<'_>,
+) -> Poll<WaitWake>
+where
+    L: Future<Output = ()> + ?Sized,
+{
+    if let Poll::Ready(wake) = poll_listener(listener.as_mut(), cx) {
+        return Poll::Ready(wake);
+    }
+    if deadline.poll(cx).is_pending() {
+        return Poll::Pending;
+    }
+
+    // A notification published while the timer was being polled still owns
+    // the same observation window and therefore wins the deadline boundary.
+    match poll_listener(listener, cx) {
+        Poll::Ready(wake) => Poll::Ready(wake),
+        Poll::Pending => Poll::Ready(WaitWake::Deadline),
+    }
+}
+
+fn poll_listener_interrupt_deadline<L>(
+    mut listener: Pin<&mut L>,
+    deadline: &mut DeadlineLease,
+    task: &crate::AxTask,
+    cx: &mut core::task::Context<'_>,
+) -> Poll<WaitWake>
+where
+    L: Future<Output = ()> + ?Sized,
+{
+    if let Poll::Ready(wake) = poll_listener_interruptible(listener.as_mut(), task, cx) {
+        return Poll::Ready(wake);
+    }
+    if deadline.poll(cx).is_pending() {
+        return Poll::Pending;
+    }
+
+    // Re-observe both higher-priority sources after observing the timer. An
+    // interrupt consumed by the listener recheck is restored by that helper.
+    match poll_listener_interruptible(listener, task, cx) {
+        Poll::Ready(wake) => Poll::Ready(wake),
+        Poll::Pending => Poll::Ready(WaitWake::Deadline),
+    }
+}
+
+fn poll_interrupt_now(task: &crate::AxTask) -> bool {
+    let cx = core::task::Context::from_waker(core::task::Waker::noop());
+    task.poll_interrupt(&cx).is_ready()
+}
+
 impl Default for WaitQueue {
     fn default() -> Self {
         Self::new()
@@ -100,69 +190,89 @@ impl WaitQueue {
     /// `condition` becomes true.
     ///
     /// Note that even other tasks notify this task, it will not wake up until
-    /// the condition becomes true.
+    /// the condition becomes true. The predicate is evaluated outside the
+    /// internal synchronous block session, so it may acquire sleeping locks;
+    /// listener publication is protected by a check-arm-check sequence.
     pub fn wait_until<F>(&self, mut condition: F) -> Result<(), WaitError>
     where
         F: FnMut() -> bool,
     {
-        block_on(async {
-            loop {
-                if condition() {
-                    break;
-                }
-                listener!(self.event => listener);
-                if condition() {
-                    break;
-                }
-                listener.await;
+        loop {
+            if condition() {
+                return Ok(());
             }
-        })
-        .map_err(WaitError::Block)
+            listener!(self.event => listener);
+            if condition() {
+                return Ok(());
+            }
+            block_on(listener).map_err(WaitError::Block)?;
+        }
     }
 
     /// Blocks the current task until the given `condition` becomes true, or
-    /// the task is interrupted.
+    /// the task is interrupted. The predicate remains outside the internal
+    /// synchronous block session.
     pub fn wait_until_interruptible<F>(&self, mut condition: F) -> Result<(), WaitError>
     where
         F: FnMut() -> bool,
     {
-        block_on(interruptible(async {
-            loop {
-                if condition() {
-                    break;
-                }
-                listener!(self.event => listener);
-                if condition() {
-                    break;
-                }
-                listener.await;
+        let task = crate::current().clone();
+        loop {
+            if condition() {
+                return Ok(());
             }
-        }))
-        .map_err(WaitError::Block)?
-        .map_err(|Interrupted| WaitError::Interrupted)
+            listener!(self.event => listener);
+            if condition() {
+                return Ok(());
+            }
+
+            let wake = block_on(poll_fn(|cx| {
+                poll_listener_interruptible(Pin::new(&mut listener), &task, cx)
+            }))
+            .map_err(WaitError::Block)?;
+            if wake == WaitWake::Interrupted {
+                if condition() {
+                    task.interrupt();
+                    return Ok(());
+                }
+                return Err(WaitError::Interrupted);
+            }
+        }
     }
 
     /// Blocks the current task and put it into the wait queue, until other tasks
     /// notify it, or the given duration has elapsed.
     pub fn wait_timeout(&self, dur: Duration) -> Result<bool, WaitError> {
         let deadline = checked_wait_deadline(wall_time(), dur)?;
-        block_on(async {
-            listener!(self.event => listener);
-            match timeout_at(Some(deadline), listener).await {
-                Ok(()) => Ok(false),
-                Err(TimeoutError::Elapsed(_)) => Ok(true),
-                Err(TimeoutError::Timer(error)) => Err(error),
+        listener!(self.event => listener);
+        let mut deadline = match DeadlineLease::reserve(deadline) {
+            Ok(deadline) => deadline,
+            Err(error) => {
+                let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+                return if poll_listener(Pin::new(&mut listener), &mut cx).is_ready() {
+                    Ok(false)
+                } else {
+                    Err(WaitError::Timer(error))
+                };
             }
-        })
-        .map_err(WaitError::Block)?
-        .map_err(WaitError::Timer)
+        };
+        let blocked = block_on(poll_fn(|cx| {
+            poll_listener_deadline(Pin::new(&mut listener), &mut deadline, cx)
+        }));
+        deadline.disarm();
+        match blocked.map_err(WaitError::Block)? {
+            WaitWake::Notified => Ok(false),
+            WaitWake::Deadline => Ok(true),
+            WaitWake::Interrupted => unreachable!("non-interruptible wait reported interruption"),
+        }
     }
 
     /// Blocks the current task and put it into the wait queue, until the given
     /// `condition` becomes true, or the given duration has elapsed.
     ///
     /// Note that even other tasks notify this task, it will not wake up until
-    /// the above conditions are met.
+    /// the above conditions are met. The predicate remains outside the
+    /// internal synchronous block session.
     pub fn wait_timeout_until<F>(&self, dur: Duration, mut condition: F) -> Result<bool, WaitError>
     where
         F: FnMut() -> bool,
@@ -174,26 +284,34 @@ impl WaitQueue {
             return Ok(false);
         }
         let deadline = checked_wait_deadline(wall_time(), dur)?;
-        block_on(async {
-            loop {
-                if condition() {
-                    return Ok(false);
-                }
-                if wall_time() >= deadline {
-                    return Ok(true);
-                }
-                listener!(self.event => listener);
-                if condition() {
-                    return Ok(false);
-                }
-                match timeout_at(Some(deadline), listener).await {
-                    Ok(()) | Err(TimeoutError::Elapsed(_)) => {}
-                    Err(TimeoutError::Timer(error)) => return Err(error),
+        let mut deadline = match DeadlineLease::reserve(deadline) {
+            Ok(deadline) => deadline,
+            Err(error) => {
+                return if condition() {
+                    Ok(false)
+                } else {
+                    Err(WaitError::Timer(error))
+                };
+            }
+        };
+
+        loop {
+            listener!(self.event => listener);
+            if condition() {
+                return Ok(false);
+            }
+            let blocked = block_on(poll_fn(|cx| {
+                poll_listener_deadline(Pin::new(&mut listener), &mut deadline, cx)
+            }));
+            deadline.disarm();
+            match blocked.map_err(WaitError::Block)? {
+                WaitWake::Notified => {}
+                WaitWake::Deadline => return Ok(!condition()),
+                WaitWake::Interrupted => {
+                    unreachable!("non-interruptible wait reported interruption")
                 }
             }
-        })
-        .map_err(WaitError::Block)?
-        .map_err(WaitError::Timer)
+        }
     }
 
     /// Blocks until `condition` becomes true, the complete duration elapses,
@@ -205,7 +323,8 @@ impl WaitQueue {
     /// covers the whole wait; this method does not approximate the deadline by
     /// repeatedly sleeping for short polling slices. The condition has priority
     /// when it becomes true in the same observation window as interruption or
-    /// timeout.
+    /// timeout, and is never evaluated inside the internal synchronous block
+    /// session.
     pub fn wait_timeout_until_interruptible<F>(
         &self,
         dur: Duration,
@@ -218,34 +337,49 @@ impl WaitQueue {
             return Ok(false);
         }
         let deadline = checked_wait_deadline(wall_time(), dur)?;
-        block_on(async {
-            let wait = interruptible(async {
-                loop {
-                    if condition() {
-                        break;
-                    }
-                    listener!(self.event => listener);
-                    if condition() {
-                        break;
-                    }
-                    listener.await;
+        let task = crate::current().clone();
+        let mut deadline = match DeadlineLease::reserve(deadline) {
+            Ok(deadline) => deadline,
+            Err(error) => {
+                if condition() {
+                    return Ok(false);
                 }
-            });
-
-            match timeout_at(Some(deadline), wait).await {
-                Ok(Ok(())) => Ok(false),
-                Ok(Err(Interrupted)) => {
-                    if condition() {
-                        Ok(false)
-                    } else {
-                        Err(WaitError::Interrupted)
+                let interrupted = poll_interrupt_now(&task);
+                if condition() {
+                    if interrupted {
+                        task.interrupt();
                     }
+                    return Ok(false);
                 }
-                Err(TimeoutError::Elapsed(_)) => Ok(!condition()),
-                Err(TimeoutError::Timer(error)) => Err(WaitError::Timer(error)),
+                return if interrupted {
+                    Err(WaitError::Interrupted)
+                } else {
+                    Err(WaitError::Timer(error))
+                };
             }
-        })
-        .map_err(WaitError::Block)?
+        };
+
+        loop {
+            listener!(self.event => listener);
+            if condition() {
+                return Ok(false);
+            }
+            let blocked = block_on(poll_fn(|cx| {
+                poll_listener_interrupt_deadline(Pin::new(&mut listener), &mut deadline, &task, cx)
+            }));
+            deadline.disarm();
+            match blocked.map_err(WaitError::Block)? {
+                WaitWake::Notified => {}
+                WaitWake::Interrupted => {
+                    if condition() {
+                        task.interrupt();
+                        return Ok(false);
+                    }
+                    return Err(WaitError::Interrupted);
+                }
+                WaitWake::Deadline => return Ok(!condition()),
+            }
+        }
     }
 
     /// Wakes up one task in the wait queue, usually the first one.

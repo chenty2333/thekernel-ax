@@ -325,6 +325,137 @@ fn interruptible_timed_wait_rechecks_condition_after_listener_publication() {
 }
 
 #[test]
+fn wait_queue_predicates_run_outside_synchronous_block_sessions() {
+    let _lock = SERIAL.lock();
+    init_for_test();
+    current().clear_interrupt();
+
+    let mut checks = 0;
+    WaitQueue::new()
+        .wait_until(|| {
+            checks += 1;
+            assert_eq!(crate::future::block_on(async { 11_u32 }), Ok(11));
+            true
+        })
+        .unwrap();
+    assert_eq!(checks, 1);
+
+    checks = 0;
+    WaitQueue::new()
+        .wait_until_interruptible(|| {
+            checks += 1;
+            assert_eq!(crate::future::block_on(async { 13_u32 }), Ok(13));
+            true
+        })
+        .unwrap();
+    assert_eq!(checks, 1);
+
+    checks = 0;
+    assert_eq!(
+        WaitQueue::new().wait_timeout_until(Duration::from_secs(1), || {
+            checks += 1;
+            if checks == 1 {
+                false
+            } else {
+                assert_eq!(crate::future::block_on(async { 17_u32 }), Ok(17));
+                true
+            }
+        }),
+        Ok(false)
+    );
+    assert_eq!(checks, 2);
+
+    checks = 0;
+    assert_eq!(
+        WaitQueue::new().wait_timeout_until_interruptible(Duration::from_secs(1), || {
+            checks += 1;
+            if checks == 1 {
+                false
+            } else {
+                assert_eq!(crate::future::block_on(async { 19_u32 }), Ok(19));
+                true
+            }
+        }),
+        Ok(false)
+    );
+    assert_eq!(checks, 2);
+}
+
+#[test]
+fn timed_wait_final_predicate_beats_interrupt_and_deadline() {
+    let _lock = SERIAL.lock();
+    init_for_test();
+
+    let curr = current();
+    curr.clear_interrupt();
+    curr.interrupt();
+    let mut checks = 0;
+    assert_eq!(
+        WaitQueue::new().wait_timeout_until_interruptible(Duration::ZERO, || {
+            checks += 1;
+            checks >= 3
+        }),
+        Ok(false)
+    );
+    assert_eq!(checks, 3);
+    assert!(curr.is_interrupted());
+    curr.clear_interrupt();
+}
+
+#[test]
+fn timed_wait_reuses_one_reservation_and_disarms_between_sessions() {
+    let _lock = SERIAL.lock();
+    init_for_test();
+
+    static WAIT: WaitQueue = WaitQueue::new();
+    static ARMED: AtomicBool = AtomicBool::new(false);
+    static WAKE_SENT: AtomicBool = AtomicBool::new(false);
+    ARMED.store(false, Ordering::Release);
+    WAKE_SENT.store(false, Ordering::Release);
+
+    let timer_count = crate::future::timer_future_count_for_test();
+    let timer_wakers = crate::future::timer_future_waker_count_for_test();
+    let notifier = axtask::spawn(|| {
+        while !ARMED.load(Ordering::Acquire) {
+            axtask::yield_now();
+        }
+        WAKE_SENT.store(true, Ordering::Release);
+        WAIT.notify_one(false);
+    })
+    .unwrap();
+
+    let mut checks = 0;
+    assert_eq!(
+        WAIT.wait_timeout_until(Duration::from_secs(1), || {
+            checks += 1;
+            if checks == 2 {
+                ARMED.store(true, Ordering::Release);
+            }
+            if !WAKE_SENT.load(Ordering::Acquire) {
+                return false;
+            }
+            assert_eq!(
+                crate::future::timer_future_count_for_test(),
+                timer_count + 1
+            );
+            assert_eq!(
+                crate::future::timer_future_waker_count_for_test(),
+                timer_wakers
+            );
+            true
+        }),
+        Ok(false)
+    );
+    notifier.join().unwrap();
+    assert_eq!(checks, 3);
+    assert_eq!(crate::future::timer_future_count_for_test(), timer_count);
+    assert_eq!(
+        crate::future::timer_future_waker_count_for_test(),
+        timer_wakers
+    );
+}
+
+#[test]
 fn interruptible_timed_wait_condition_notification_cancels_timer() {
     let _lock = SERIAL.lock();
     init_for_test();
@@ -394,6 +525,15 @@ fn interruptible_timed_wait_reports_capacity_and_releases_all_test_timers() {
             crate::future::TimerRegistrationError::CapacityExhausted
         ))
     );
+
+    let curr = current();
+    curr.clear_interrupt();
+    curr.interrupt();
+    assert_eq!(
+        WaitQueue::new().wait_timeout_until_interruptible(Duration::from_secs(1), || false),
+        Err(crate::WaitError::Interrupted)
+    );
+    assert!(!curr.is_interrupted());
 
     drop(timers);
     assert_eq!(crate::future::timer_future_count_for_test(), 0);

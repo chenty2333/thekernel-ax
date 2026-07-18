@@ -179,6 +179,13 @@ impl TimerInner {
         entry.waker.take()
     }
 
+    fn disarm(&mut self, token: TimerToken) -> Option<Waker> {
+        if !self.is_live(token) {
+            return None;
+        }
+        self.slots[token.slot].waker.take()
+    }
+
     fn drain_expired(
         &mut self,
         now: TimeValue,
@@ -226,6 +233,11 @@ impl TimerRuntime {
 
     fn cancel(&self, token: TimerToken) {
         let deferred = self.0.lock().cancel(token);
+        drop(deferred);
+    }
+
+    fn disarm(&self, token: TimerToken) {
+        let deferred = self.0.lock().disarm(token);
         drop(deferred);
     }
 
@@ -289,6 +301,56 @@ impl Drop for TimerFuture {
     }
 }
 
+/// Crate-private ownership of one absolute-deadline reservation.
+///
+/// Unlike [`TimerFuture`], this lease may be polled by several consecutive
+/// synchronous block sessions. Callers disarm it after every session so a
+/// task waker is retained only while that task is actually waiting. Dropping
+/// the lease refunds a still-live reservation exactly once.
+#[must_use = "a deadline reservation must be retained until it is elapsed or cancelled"]
+pub(crate) struct DeadlineLease {
+    token: Option<TimerToken>,
+}
+
+impl DeadlineLease {
+    pub(crate) fn reserve(deadline: TimeValue) -> Result<Self, TimerRegistrationError> {
+        if deadline <= wall_time() {
+            return Ok(Self { token: None });
+        }
+
+        let owner_cpu = axhal::percpu::this_cpu_id();
+        let token = runtime_for(owner_cpu).reserve(owner_cpu, deadline)?;
+        Ok(Self { token: Some(token) })
+    }
+
+    pub(crate) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        let Some(token) = self.token else {
+            return Poll::Ready(());
+        };
+        let result = runtime_for(token.owner_cpu).poll(token, cx);
+        if result.is_ready() {
+            self.token = None;
+        }
+        result
+    }
+
+    /// Removes the current block session's task waker without releasing the
+    /// absolute deadline reservation.
+    pub(crate) fn disarm(&mut self) {
+        if let Some(token) = self.token {
+            runtime_for(token.owner_cpu).disarm(token);
+        }
+    }
+}
+
+impl Drop for DeadlineLease {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            runtime_for(token.owner_cpu).cancel(token);
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn reserve_timer_for_test(
     deadline: TimeValue,
@@ -300,6 +362,18 @@ pub(crate) fn reserve_timer_for_test(
 pub(crate) fn timer_future_count_for_test() -> usize {
     let cpu_id = axhal::percpu::this_cpu_id();
     runtime_for(cpu_id).0.lock().len
+}
+
+#[cfg(test)]
+pub(crate) fn timer_future_waker_count_for_test() -> usize {
+    let cpu_id = axhal::percpu::this_cpu_id();
+    runtime_for(cpu_id)
+        .0
+        .lock()
+        .slots
+        .iter()
+        .filter(|slot| slot.occupied && slot.waker.is_some())
+        .count()
 }
 
 /// Waits until `duration` has elapsed.
@@ -394,7 +468,18 @@ pub async fn timeout_at<F: IntoFuture>(
 
 #[cfg(test)]
 mod tests {
+    use alloc::{sync::Arc, task::Wake};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+
+    struct Counter(AtomicUsize);
+
+    impl Wake for Counter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Release);
+        }
+    }
 
     #[test]
     fn timer_inner_is_bounded_and_generation_checked() {
@@ -414,5 +499,29 @@ mod tests {
             inner.reserve(0, deadline),
             Err(TimerRegistrationError::CapacityExhausted)
         );
+    }
+
+    #[test]
+    fn timer_disarm_retains_reservation_and_releases_owned_waker() {
+        let mut inner = TimerInner::new();
+        let token = inner.reserve(0, Duration::from_secs(2)).unwrap();
+        let counter = Arc::new(Counter(AtomicUsize::new(0)));
+        let waker = Waker::from(counter.clone());
+        let baseline = Arc::strong_count(&counter);
+
+        let (poll, deferred) = inner.poll(token, &waker, waker.clone(), Duration::from_secs(1));
+        drop(deferred);
+        assert_eq!(poll, Poll::Pending);
+        assert_eq!(inner.len, 1);
+        assert_eq!(Arc::strong_count(&counter), baseline + 1);
+
+        drop(inner.disarm(token));
+        assert_eq!(inner.len, 1);
+        assert!(inner.is_live(token));
+        assert_eq!(Arc::strong_count(&counter), baseline);
+
+        assert!(inner.cancel(token).is_none());
+        assert_eq!(inner.len, 0);
+        assert_eq!(counter.0.load(Ordering::Acquire), 0);
     }
 }
