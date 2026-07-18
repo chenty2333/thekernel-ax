@@ -554,6 +554,14 @@ impl PreparedTaskPublication {
         // The constructor stores the exact permanent run queue whose scheduler
         // created `reservation`; neither field is publicly mutable, and the
         // task-level mutation claim excludes parameter/affinity changes.
+        //
+        // Reservation and final publication are deliberately separate so the
+        // process adapter does not keep IRQs disabled while it commits its own
+        // lifecycle state. Re-establish the run-queue locking contract only
+        // around this final scheduler mutation. Otherwise the local timer IRQ
+        // can re-enter `scheduler_timer_tick()` and spin forever on this raw
+        // scheduler lock while publication is refreshing CFS state.
+        let _guard = kernel_guard::NoPreemptIrqSave::new();
         match self
             .run_queue
             .scheduler
@@ -884,8 +892,11 @@ pub(crate) struct AxRunQueue {
     /// The ID of the CPU this run queue is associated with.
     cpu_id: usize,
     /// The core scheduler of this run queue.
-    /// Since irq and preempt are preserved by the kernel guard hold by `AxRunQueueRef`,
-    /// we just use a simple raw spin lock here.
+    ///
+    /// Task-context access must hold the IRQ/preemption exclusion carried by
+    /// `AxRunQueueRef`, or explicitly re-establish `NoPreemptIrqSave` after a
+    /// two-phase operation released that reference. IRQ handlers may use the
+    /// raw lock only because the interrupted task cannot then own it locally.
     scheduler: SpinRaw<Scheduler>,
 }
 
