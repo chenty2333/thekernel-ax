@@ -566,6 +566,13 @@ pub fn reclaim_exited_tasks() -> bool {
     crate::run_queue::request_exited_task_reclaim_current_cpu()
 }
 
+/// Repeats a reclaim request/observation around a bounded number of yields.
+///
+/// The production request samples the CPU on which each iteration runs. Since
+/// the yield may migrate the caller, consecutive observations need not refer to
+/// the same exited-task queue. The return value is only the final iteration's
+/// observation; `false` is neither a global/per-original-CPU empty proof nor a
+/// destructor-completion barrier.
 pub(crate) fn drive_reclaim_until_clear(
     max_yields: usize,
     mut reclaim: impl FnMut() -> bool,
@@ -584,7 +591,11 @@ pub(crate) fn drive_reclaim_until_clear(
 /// requests while scheduler-side handoff references still keep some task
 /// objects alive.
 ///
-/// Returns `true` when tasks still remain after the bounded yield budget.
+/// Each iteration samples the CPU on which it runs, and the yield may migrate
+/// the caller between iterations. The returned boolean therefore reports only
+/// the final current-CPU queue observation. In particular, `false` does not
+/// prove that all CPUs, or even the CPU sampled by an earlier iteration, are
+/// empty, and it does not wait for task destructors to finish.
 pub fn reclaim_exited_tasks_until_clear(max_yields: usize) -> bool {
     drive_reclaim_until_clear(max_yields, reclaim_exited_tasks, yield_now)
 }
