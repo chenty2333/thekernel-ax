@@ -29,6 +29,14 @@ compile error in 0.1.0. The current registry `axhal` API only offers infallible
 release after the lower layer exposes a fallible allocation/initialization
 contract and both architectures pass it.
 
+The `irq-exit` feature is a coordinated lower-layer contract, not a dormant
+performance option. TheKernel enables it unconditionally when consuming its
+maintained `axhal` fork. That HAL exposes explicit per-CPU IRQ nesting and one
+outermost-exit callback; ordinary preemption-guard releases inside an IRQ only
+lower the guard count, while the exit callback owns the single pending
+reschedule check. Registry-only consumers must leave this feature disabled
+until their `axhal` provides the same API and ordering.
+
 The release contract requires explicit task/runqueue ownership, no aliased
 mutable runqueue references, no allocation/drop/wake callback inside IRQ-safe
 critical sections, monotonic mechanism-only task identities, an intrusive

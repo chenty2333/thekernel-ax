@@ -59,6 +59,9 @@ cfg_if::cfg_if! {
         mod api;
         mod wait_queue;
 
+        #[cfg(feature = "irq-exit")]
+        mod irq_exit;
+
         #[cfg(feature = "irq-continuation-diagnostics")]
         #[cfg_attr(not(target_os = "none"), allow(dead_code))]
         mod irq_continuation_diagnostics;

@@ -52,6 +52,11 @@ scripts/publish-dry-run.sh
 scripts/package-unpack.sh
 ```
 
+The self-contained registry matrix deliberately omits `irq-exit` because the
+published `axhal` baseline does not expose that contract. TheKernel's consumer
+matrix enables it unconditionally against the coordinated maintained `axhal`;
+it is not a profile-selected optimization.
+
 The first unpack command validates the two original mechanism artifacts. The
 last command packages the coordinated three-crate maintained-fork release set,
 unpacks the registry artifacts in a temporary directory, and tests them

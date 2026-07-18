@@ -103,6 +103,10 @@ impl kernel_guard::KernelGuardIf for KernelGuardIfImpl {
 
     fn enable_preempt() {
         if let Some(curr) = current_may_uninit() {
+            #[cfg(feature = "irq-exit")]
+            let resched = !crate::irq_exit::in_irq_context();
+            #[cfg(not(feature = "irq-exit"))]
+            let resched = true;
             #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
             let irq_off = !axhal::asm::irqs_enabled();
             #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
@@ -114,7 +118,9 @@ impl kernel_guard::KernelGuardIf for KernelGuardIfImpl {
                 if curr.preempt_pending() {
                     flags |= crate::irq_continuation_diagnostics::FLAG_NEED_RESCHED;
                 }
-                flags |= crate::irq_continuation_diagnostics::FLAG_RESCHED_ALLOWED;
+                if resched {
+                    flags |= crate::irq_continuation_diagnostics::FLAG_RESCHED_ALLOWED;
+                }
                 crate::irq_continuation_diagnostics::record_event(
                     crate::irq_continuation_diagnostics::EVENT_PREEMPT_ENABLE_IRQ_OFF,
                     curr.id().as_u64(),
@@ -123,7 +129,7 @@ impl kernel_guard::KernelGuardIf for KernelGuardIfImpl {
                     curr.preempt_disable_count(),
                 );
             }
-            curr.enable_preempt(true);
+            curr.enable_preempt(resched);
             #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
             if irq_off && !axhal::asm::irqs_enabled() {
                 let mut flags = 0;
@@ -176,6 +182,10 @@ pub fn can_block_current() -> bool {
     }
     #[cfg(feature = "preempt")]
     if !curr.can_preempt(0) {
+        return false;
+    }
+    #[cfg(feature = "irq-exit")]
+    if crate::irq_exit::in_irq_context() {
         return false;
     }
     #[cfg(all(feature = "irq", target_os = "none"))]
@@ -238,6 +248,9 @@ pub fn init_scheduler() -> Result<(), TaskRuntimeInitError> {
 
     // Initialize the run queue.
     crate::run_queue::init()?;
+
+    #[cfg(feature = "irq-exit")]
+    crate::irq_exit::register()?;
 
     info!("  use {} scheduler.", Scheduler::scheduler_name());
     Ok(())

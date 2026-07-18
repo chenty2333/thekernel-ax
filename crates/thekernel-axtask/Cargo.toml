@@ -39,6 +39,9 @@ irq = ["axhal/irq"]
 tls = []
 preempt = ["irq", "percpu?/preempt", "kernel_guard/preempt"]
 smp = ["kspin/smp"]
+# Explicit IRQ-entry/exit integration. TheKernel enables this only with its
+# maintained axhal boundary contract; registry-only consumers keep it off.
+irq-exit = ["multitask", "preempt", "axhal/irq"]
 # Allocation-free, lock-free trace snapshots for diagnosing IRQ-return
 # scheduling. This is intentionally opt-in because it adds atomics to context
 # switch and suspicious IRQ-off preemption paths.

@@ -1170,6 +1170,13 @@ impl TaskInner {
     #[cfg(feature = "preempt")]
     pub(crate) fn current_check_preempt_pending() {
         use kernel_guard::NoPreemptIrqSave;
+        #[cfg(feature = "irq-exit")]
+        if !crate::irq_exit::may_check_preempt(
+            crate::irq_exit::in_irq_context(),
+            crate::irq_exit::in_irq_exit_phase(),
+        ) {
+            return;
+        }
         let curr = crate::current();
         #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
         let irq_off = !axhal::asm::irqs_enabled();

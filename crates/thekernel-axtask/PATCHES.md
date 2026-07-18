@@ -75,3 +75,8 @@ SHA-256
 - Provide an opt-in, allocation-free per-CPU IRQ-continuation diagnostic ring.
   It records only context switches and suspicious IRQ-off scheduler boundaries;
   production builds pay no cost unless the diagnostic feature is selected.
+- Add the coordinated `irq-exit` consumer contract. A maintained `axhal`
+  reports explicit per-CPU IRQ nesting and invokes one callback after the
+  outermost handler guard drops; axtask defers all ordinary IRQ guard-release
+  scheduling and consumes `need_resched` only at that exit phase. TheKernel
+  enables this feature as part of its maintained HAL release set.

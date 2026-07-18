@@ -477,6 +477,8 @@ impl Drop for PreparedTaskPublication {
 /// Failure to initialize one CPU's generic task runtime.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum TaskRuntimeInitError {
+    /// The explicit IRQ-exit scheduler hook could not claim its single owner.
+    IrqExitHookUnavailable,
     Task(TaskCreateError),
     Scheduler(SchedulerError),
     DuplicateCpu(usize),
