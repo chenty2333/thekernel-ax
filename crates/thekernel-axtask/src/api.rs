@@ -299,6 +299,19 @@ pub fn on_timer_tick() {
     use kernel_guard::NoOp;
     on_timer_event();
     crate::run_queue::gc_retry_timer_tick();
+    #[cfg(feature = "task-ext")]
+    {
+        use crate::TaskExt;
+
+        let curr = current();
+        if curr
+            .task_ext()
+            .is_some_and(|extension| extension.on_timer_tick(&curr))
+        {
+            #[cfg(feature = "preempt")]
+            curr.set_preempt_pending(true);
+        }
+    }
     // Since irq and preemption are both disabled here,
     // we can get current run queue with the default `kernel_guard::NoOp`.
     current_run_queue::<NoOp>().scheduler_timer_tick();

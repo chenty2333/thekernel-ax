@@ -485,6 +485,15 @@ pub trait TaskExt {
     fn on_enter(&self, _task: &TaskInner) {}
     /// Called when the task is switched out.
     fn on_leave(&self, _task: &TaskInner) {}
+    /// Called for the current task from the periodic timer interrupt.
+    ///
+    /// Implementations must be allocation-free, non-blocking, and bounded.
+    /// They may publish a pre-admitted IRQ-safe mechanism wake, but must not
+    /// run subsystem policy, signal delivery, or scheduler recursion here.
+    /// Returning `true` requests a normal reschedule boundary after IRQ exit.
+    fn on_timer_tick(&self, _task: &TaskInner) -> bool {
+        false
+    }
 }
 
 /// The inner task structure.
