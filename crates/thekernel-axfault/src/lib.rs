@@ -753,28 +753,43 @@ where
 
     /// Finds the live request that a subsequent [`Self::admit`] would reuse.
     ///
+    /// A visible terminal is deliberately not reusable: its completion has
+    /// already been published to an earlier waiter generation, so a later
+    /// same-key fault is a new request even while those older waiters retain
+    /// the terminal record. Deferred terminals remain reusable until their
+    /// visibility boundary.
+    ///
     /// This read-only probe lets an upper policy distinguish a new request,
     /// which consumes request quota, from one additional waiter on an exact
-    /// existing request. The returned generation-tagged snapshot is advisory
-    /// until the externally serialized caller invokes `admit`; consumers must
-    /// keep both operations in the same broker critical section.
+    /// coalescible request. The returned generation-tagged snapshot is
+    /// advisory until the externally serialized caller invokes `admit`;
+    /// consumers must keep both operations in the same broker critical
+    /// section.
     pub fn matching_request(&self, handler: H, key: K) -> Option<RequestSnapshot<K, H>> {
         let slot = self.requests.iter().position(|slot| {
-            slot.record
-                .is_some_and(|record| record.handler == handler && record.key == key)
+            slot.record.is_some_and(|record| {
+                record.handler == handler
+                    && record.key == key
+                    && !matches!(record.state, RequestState::Visible(_))
+            })
         })?;
         self.snapshot_slot(slot)
     }
 
     /// Admits one exact request plus one independently cancellable waiter.
     ///
-    /// An existing live request is reused only when both `handler` and `key`
-    /// compare equal. All capacity and generation checks complete before any
-    /// request or waiter becomes visible.
+    /// An existing request is reused only when both `handler` and `key`
+    /// compare equal and its completion is not yet visible. A visible terminal
+    /// remains owned by its older waiters while a new same-key request uses a
+    /// separate bounded slot. All capacity and generation checks complete
+    /// before any request or waiter becomes visible.
     pub fn admit(&mut self, handler: H, key: K) -> Result<FaultAdmission, AdmissionError> {
         let existing = self.requests.iter().position(|slot| {
-            slot.record
-                .is_some_and(|record| record.handler == handler && record.key == key)
+            slot.record.is_some_and(|record| {
+                record.handler == handler
+                    && record.key == key
+                    && !matches!(record.state, RequestState::Visible(_))
+            })
         });
 
         let (request_slot, request_generation, coalesced) = if let Some(slot) = existing {
@@ -829,10 +844,11 @@ where
             {
                 return Err(AdmissionError::InconsistentState);
             }
-            let waiter_state = match request_record.state {
-                RequestState::Visible(completion) => WaiterState::Ready(completion),
-                _ => WaiterState::Active,
-            };
+            debug_assert!(
+                !matches!(request_record.state, RequestState::Visible(_)),
+                "visible requests end the exact-key coalescing window"
+            );
+            let waiter_state = WaiterState::Active;
             let previous = request_record.waiter_tail;
             if let Some(previous) = previous {
                 let previous_record = self
@@ -1769,6 +1785,86 @@ mod tests {
     }
 
     #[test]
+    fn visible_terminal_ends_exact_key_coalescing_window() {
+        let mut broker = Broker::try_new(2, 2).unwrap();
+        let key = Key::page(7, 11, 0x1000, Access::Read);
+        let first = broker.admit(3, key).unwrap();
+        broker
+            .complete(first.request(), 17, CompletionVisibility::Visible)
+            .unwrap();
+
+        assert!(broker.matching_request(3, key).is_none());
+        let second = broker.admit(3, key).unwrap();
+        assert!(!second.coalesced());
+        assert_ne!(first.request(), second.request());
+        assert_eq!(
+            broker.request(first.request()).unwrap().phase(),
+            RequestPhase::TerminalVisible
+        );
+        assert_eq!(
+            broker.request(second.request()).unwrap().phase(),
+            RequestPhase::Pending
+        );
+        assert_eq!(
+            broker.waiter(first.waiter()).unwrap(),
+            WaiterObservation::Ready(17)
+        );
+        assert_eq!(
+            broker.waiter(second.waiter()).unwrap(),
+            WaiterObservation::Pending
+        );
+    }
+
+    #[test]
+    fn later_waiters_coalesce_with_the_new_pending_same_key_request() {
+        static POOL: RequestCreditPool = RequestCreditPool::new(2);
+
+        {
+            let mut broker = Broker::try_new_with_credit_pool(2, 3, &POOL).unwrap();
+            let key = Key::page(7, 11, 0x1000, Access::Read);
+            let first = broker.admit(3, key).unwrap();
+            broker
+                .complete(first.request(), 17, CompletionVisibility::Visible)
+                .unwrap();
+
+            let second = broker.admit(3, key).unwrap();
+            let third = broker.admit(3, key).unwrap();
+            assert!(!second.coalesced());
+            assert!(third.coalesced());
+            assert_ne!(first.request(), second.request());
+            assert_eq!(second.request(), third.request());
+            assert_eq!(
+                broker.matching_request(3, key).unwrap().token(),
+                second.request()
+            );
+            assert_eq!(POOL.live_requests(), 2);
+
+            assert_eq!(
+                broker
+                    .take_waiter_completion(first.waiter())
+                    .unwrap()
+                    .completion(),
+                17
+            );
+            assert_eq!(POOL.live_requests(), 1);
+            assert!(
+                !broker
+                    .cancel_waiter(second.waiter())
+                    .unwrap()
+                    .request_reclaimed()
+            );
+            assert!(
+                broker
+                    .cancel_waiter(third.waiter())
+                    .unwrap()
+                    .request_reclaimed()
+            );
+            assert_eq!(POOL.live_requests(), 0);
+        }
+        assert_eq!(POOL.live_requests(), 0);
+    }
+
+    #[test]
     fn request_iterator_provides_bounded_allocation_free_policy_inspection() {
         let mut broker = Broker::try_new(3, 4).unwrap();
         let first_key = Key::page(7, 11, 0x1000, Access::Read);
@@ -2590,18 +2686,27 @@ mod tests {
     }
 
     #[test]
-    fn terminal_visible_request_coalesces_as_immediately_ready() {
+    fn visible_terminal_retains_its_slot_until_the_old_waiter_consumes() {
         let mut broker = Broker::try_new(1, 2).unwrap();
         let key = Key::page(1, 1, 0, Access::Read);
         let first = broker.admit(1, key).unwrap();
         broker
             .complete(first.request(), 5, CompletionVisibility::Visible)
             .unwrap();
+        assert_eq!(broker.admit(1, key), Err(AdmissionError::RequestCapacity));
+        assert_eq!(
+            broker
+                .take_waiter_completion(first.waiter())
+                .unwrap()
+                .completion(),
+            5
+        );
         let second = broker.admit(1, key).unwrap();
-        assert!(second.coalesced());
+        assert!(!second.coalesced());
+        assert_ne!(first.request(), second.request());
         assert_eq!(
             broker.waiter(second.waiter()).unwrap(),
-            WaiterObservation::Ready(5)
+            WaiterObservation::Pending
         );
     }
 

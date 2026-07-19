@@ -4,8 +4,9 @@
 
 - Add explicitly bounded, preallocated request and waiter registries.
 - Add broker/slot/generation request and waiter tokens that never wrap.
-- Coalesce only exact handler/request keys and retain independent waiter
-  cancellation ownership.
+- Coalesce only exact handler/request keys before terminal visibility, never
+  reuse an older visible completion for a later same-key fault, and retain
+  independent waiter cancellation ownership.
 - Add FIFO pending-to-delivered claims that never requeue a request behind
   newer work when the upper layer drops its delivery snapshot.
 - Add allocation-free per-handler pending observations derived from live

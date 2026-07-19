@@ -37,14 +37,18 @@ identity, slot, and a monotonically increasing generation; an exhausted
 generation is reported instead of wrapping or reusing an old identity.
 
 One admission always creates one independently cancellable waiter. An exact
-`(handler, key)` match coalesces onto the existing request; a different mapping
-generation or access mode must therefore be represented in the key and cannot
-coalesce accidentally. A new request in a pool-bound broker atomically consumes
-one shared credit only after all broker-local capacity and linkage checks pass.
-Exact coalescing never consumes another request credit, even when the pool is
-full. Cancelling or consuming the final waiter immediately reclaims its request
-and returns that credit in every phase. Dropping a broker returns one credit for
-each live request it still owns, so address-space teardown does not require an
+`(handler, key)` match coalesces onto the existing request only until its
+terminal result becomes visible; deferred terminals remain coalescible until
+that visibility boundary. A later same-key fault never inherits an older
+visible result: it creates a new bounded request while the old slot remains
+owned by its earlier waiters. A different mapping generation or access mode
+must therefore be represented in the key and cannot coalesce accidentally. A
+new request in a pool-bound broker atomically consumes one shared credit only
+after all broker-local capacity and linkage checks pass. Exact coalescing never
+consumes another request credit, even when the pool is full. Cancelling or
+consuming the final waiter immediately reclaims its request and returns that
+credit in every phase. Dropping a broker returns one credit for each live
+request it still owns, so address-space teardown does not require an
 adapter-maintained side ledger. Pool counts never wrap or underflow and are
 accounting snapshots, not request-state publication barriers.
 
