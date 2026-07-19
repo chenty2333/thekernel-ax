@@ -40,26 +40,39 @@ coalesce accidentally. Cancelling or consuming the final waiter immediately
 reclaims its request, including a pending or delivered request.
 
 New requests enter one FIFO pending list. `claim_next(handler)` removes the
-oldest matching request and leaves it in `Delivered`. Dropping the returned
-snapshot does not requeue the request or append it behind a newer request.
-Whether a failed upper-layer delivery is retried is deliberately outside this
-crate; the generic broker only preserves the claimed phase until completion or
-final-waiter cancellation.
+oldest matching request and leaves it in `Delivered`. A deferred result does
+not implicitly consume an unclaimed request: it remains `DeferredPending` in
+the same FIFO position and can still be claimed, becoming
+`DeferredDelivered`. Dropping the returned snapshot does not requeue the
+request or append it behind newer work. Whether a failed upper-layer delivery
+is retried is deliberately outside this crate; the generic broker preserves
+the claimed phase until release, visible completion, or final-waiter
+cancellation.
 
 `pending_count(handler)` and `has_pending(handler)` scan the fixed request-slot
-array and derive readiness from the authoritative `Pending` phase. They do not
-cache an adapter-side count. Consequently, completion before claim, range
-completion, final-waiter cancellation, handler detach, and generation-safe slot
-reuse cannot leave phantom pending work. The scan allocates no storage and is
-bounded by the request capacity selected at construction (64 in TheKernel's
-initial userfaultfd profile).
+array and derive readiness from the authoritative `Pending` and
+`DeferredPending` phases. They do not cache an adapter-side count.
+Consequently, visible completion before claim, range release, final-waiter
+cancellation, handler detach, and generation-safe slot reuse cannot leave
+phantom pending work. The scan allocates no storage and is bounded by the
+request capacity selected at construction.
 
 Completion may be immediately `Visible` or `Deferred`. Deferred completion is
-the generic mechanism used by a Linux adapter for `DONTWAKE`: the terminal
-result is fixed, but waiters remain pending until `release`, `release_where`, or
-`release_range` makes it visible. Predicate and range completion cover both
-pending and delivered requests. Handler detach completes open requests and
-releases already-deferred results without overwriting them.
+the generic mechanism for separating immutable-result installation from waiter
+publication: the terminal result is fixed and waiter visibility is held back,
+while FIFO delivery ownership remains independently claimable.
+`release`, `release_where`, or `release_range` publishes the result and removes
+any still-pending entry. Predicate and range completion cover open pending and
+delivered requests. Handler detach completes open requests and releases both
+deferred-pending and deferred-delivered results without overwriting them.
+
+`BrokerLoad` exposes five disjoint phase counts whose sum is exactly
+`live_requests`: open pending, open delivered, deferred pending, deferred
+delivered, and visible. Its aggregate `pending_requests`, `delivered_requests`,
+and `deferred_requests` observations are intentionally orthogonal delivery and
+completion dimensions; a deferred-pending request appears in both the pending
+and deferred aggregates, but only once in the exact phase counts and
+`live_requests`.
 
 The type is deliberately externally serialized. A kernel may place it inside
 the lock appropriate to its address-space/handler ownership. Keeping locks,

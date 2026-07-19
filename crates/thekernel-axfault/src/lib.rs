@@ -175,12 +175,14 @@ impl WaiterToken {
 /// Observable phase of one request without exposing its terminal payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestPhase {
-    /// The request is linked in the broker's FIFO delivery queue.
+    /// The open request is linked in the broker's FIFO delivery queue.
     Pending,
-    /// A handler claimed the request; it is no longer pending for delivery.
+    /// A handler claimed the open request; it is no longer pending for delivery.
     Delivered,
-    /// A terminal result exists but is not yet visible to waiters.
-    TerminalDeferred,
+    /// A deferred result exists and the request remains in the delivery queue.
+    DeferredPending,
+    /// A deferred result exists after a handler claimed the request.
+    DeferredDelivered,
     /// A terminal result is visible to every retained waiter.
     TerminalVisible,
 }
@@ -370,13 +372,19 @@ impl CompletionSummary {
 }
 
 /// Exact broker occupancy and phase counts.
+///
+/// The five explicit phase getters are disjoint and sum to
+/// [`Self::live_requests`]. The pending, delivered, and deferred aggregate
+/// getters project orthogonal delivery and completion dimensions, so a
+/// deferred-pending request appears in both relevant aggregates without being
+/// counted twice in the exact phase fields or live occupancy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BrokerLoad {
     request_capacity: usize,
-    live_requests: usize,
-    pending_requests: usize,
-    delivered_requests: usize,
-    deferred_requests: usize,
+    open_pending_requests: usize,
+    open_delivered_requests: usize,
+    deferred_pending_requests: usize,
+    deferred_delivered_requests: usize,
     visible_requests: usize,
     waiter_capacity: usize,
     live_waiters: usize,
@@ -391,22 +399,46 @@ impl BrokerLoad {
 
     /// Returns the number of live requests in every phase.
     pub const fn live_requests(self) -> usize {
-        self.live_requests
+        self.open_pending_requests
+            + self.open_delivered_requests
+            + self.deferred_pending_requests
+            + self.deferred_delivered_requests
+            + self.visible_requests
     }
 
-    /// Returns the number of FIFO-pending requests.
+    /// Returns the delivery-axis pending count, including deferred requests.
     pub const fn pending_requests(self) -> usize {
-        self.pending_requests
+        self.open_pending_requests + self.deferred_pending_requests
     }
 
-    /// Returns the number of handler-claimed requests.
+    /// Returns the delivery-axis claimed count, including deferred requests.
     pub const fn delivered_requests(self) -> usize {
-        self.delivered_requests
+        self.open_delivered_requests + self.deferred_delivered_requests
     }
 
-    /// Returns the number of terminal results with deferred visibility.
+    /// Returns the completion-axis deferred count across both delivery phases.
     pub const fn deferred_requests(self) -> usize {
-        self.deferred_requests
+        self.deferred_pending_requests + self.deferred_delivered_requests
+    }
+
+    /// Returns the number of open requests still pending for delivery.
+    pub const fn open_pending_requests(self) -> usize {
+        self.open_pending_requests
+    }
+
+    /// Returns the number of open requests already claimed by a handler.
+    pub const fn open_delivered_requests(self) -> usize {
+        self.open_delivered_requests
+    }
+
+    /// Returns the number of deferred requests still pending for delivery.
+    pub const fn deferred_pending_requests(self) -> usize {
+        self.deferred_pending_requests
+    }
+
+    /// Returns the number of deferred requests already claimed by a handler.
+    pub const fn deferred_delivered_requests(self) -> usize {
+        self.deferred_delivered_requests
     }
 
     /// Returns the number of terminal results visible to waiters.
@@ -434,7 +466,9 @@ impl BrokerLoad {
 enum RequestState<C> {
     Pending,
     Delivered,
-    Terminal { completion: C, visible: bool },
+    DeferredPending(C),
+    DeferredDelivered(C),
+    Visible(C),
 }
 
 impl<C> RequestState<C> {
@@ -442,8 +476,9 @@ impl<C> RequestState<C> {
         match self {
             Self::Pending => RequestPhase::Pending,
             Self::Delivered => RequestPhase::Delivered,
-            Self::Terminal { visible: false, .. } => RequestPhase::TerminalDeferred,
-            Self::Terminal { visible: true, .. } => RequestPhase::TerminalVisible,
+            Self::DeferredPending(_) => RequestPhase::DeferredPending,
+            Self::DeferredDelivered(_) => RequestPhase::DeferredDelivered,
+            Self::Visible(_) => RequestPhase::TerminalVisible,
         }
     }
 }
@@ -658,10 +693,7 @@ where
             .as_ref()
             .ok_or(AdmissionError::InconsistentState)?;
         let waiter_state = match request_record.state {
-            RequestState::Terminal {
-                completion,
-                visible: true,
-            } => WaiterState::Ready(completion),
+            RequestState::Visible(completion) => WaiterState::Ready(completion),
             _ => WaiterState::Active,
         };
         let previous = request_record.waiter_tail;
@@ -703,8 +735,9 @@ where
     /// Claims the oldest pending request for `handler`.
     ///
     /// Other handlers' requests remain linked in their original relative
-    /// order. The returned request stays `Delivered` until terminal completion
-    /// or final-waiter cancellation; it is never silently requeued.
+    /// order. An open request becomes `Delivered`; a deferred request becomes
+    /// `DeferredDelivered` without changing its immutable result. The request
+    /// is never silently requeued.
     pub fn claim_next(&mut self, handler: H) -> Option<RequestSnapshot<K, H>> {
         let mut cursor = self.pending_head;
         while let Some(slot) = cursor {
@@ -713,8 +746,18 @@ where
             if record.handler != handler {
                 continue;
             }
+            let claimed_state = match record.state {
+                RequestState::Pending => RequestState::Delivered,
+                RequestState::DeferredPending(completion) => {
+                    RequestState::DeferredDelivered(completion)
+                }
+                _ => {
+                    debug_assert!(false, "only pending requests may be FIFO-linked");
+                    continue;
+                }
+            };
             self.unlink_pending(slot);
-            self.requests[slot].record.as_mut()?.state = RequestState::Delivered;
+            self.requests[slot].record.as_mut()?.state = claimed_state;
             return self.snapshot_slot(slot);
         }
         None
@@ -732,7 +775,11 @@ where
             .iter()
             .filter(|slot| {
                 slot.record.is_some_and(|record| {
-                    record.handler == handler && matches!(record.state, RequestState::Pending)
+                    record.handler == handler
+                        && matches!(
+                            record.state,
+                            RequestState::Pending | RequestState::DeferredPending(_)
+                        )
                 })
             })
             .count()
@@ -747,7 +794,11 @@ where
     pub fn has_pending(&self, handler: H) -> bool {
         self.requests.iter().any(|slot| {
             slot.record.is_some_and(|record| {
-                record.handler == handler && matches!(record.state, RequestState::Pending)
+                record.handler == handler
+                    && matches!(
+                        record.state,
+                        RequestState::Pending | RequestState::DeferredPending(_)
+                    )
             })
         })
     }
@@ -768,7 +819,11 @@ where
         let slot = self.request_index(token)?;
         if matches!(
             self.requests[slot].record.map(|record| record.state),
-            Some(RequestState::Terminal { .. })
+            Some(
+                RequestState::DeferredPending(_)
+                    | RequestState::DeferredDelivered(_)
+                    | RequestState::Visible(_)
+            )
         ) {
             return Err(RequestError::AlreadyTerminal);
         }
@@ -823,8 +878,10 @@ where
     pub fn release(&mut self, token: RequestToken) -> Result<CompletionEffect, RequestError> {
         let slot = self.request_index(token)?;
         match self.requests[slot].record.map(|record| record.state) {
-            Some(RequestState::Terminal { visible: false, .. }) => Ok(self.release_slot(slot)),
-            Some(RequestState::Terminal { visible: true, .. }) => Ok(CompletionEffect::default()),
+            Some(RequestState::DeferredPending(_) | RequestState::DeferredDelivered(_)) => {
+                Ok(self.release_slot(slot))
+            }
+            Some(RequestState::Visible(_)) => Ok(CompletionEffect::default()),
             _ => Err(RequestError::NotTerminal),
         }
     }
@@ -839,7 +896,11 @@ where
             let Some(snapshot) = self.snapshot_slot(slot) else {
                 continue;
             };
-            if snapshot.phase == RequestPhase::TerminalDeferred && predicate(snapshot) {
+            if matches!(
+                snapshot.phase,
+                RequestPhase::DeferredPending | RequestPhase::DeferredDelivered
+            ) && predicate(snapshot)
+            {
                 let effect = self.release_slot(slot);
                 summary.record_release(effect);
             }
@@ -933,11 +994,11 @@ where
             let Some(record) = slot.record else {
                 continue;
             };
-            load.live_requests += 1;
             match record.state.phase() {
-                RequestPhase::Pending => load.pending_requests += 1,
-                RequestPhase::Delivered => load.delivered_requests += 1,
-                RequestPhase::TerminalDeferred => load.deferred_requests += 1,
+                RequestPhase::Pending => load.open_pending_requests += 1,
+                RequestPhase::Delivered => load.open_delivered_requests += 1,
+                RequestPhase::DeferredPending => load.deferred_pending_requests += 1,
+                RequestPhase::DeferredDelivered => load.deferred_delivered_requests += 1,
                 RequestPhase::TerminalVisible => load.visible_requests += 1,
             }
         }
@@ -1061,20 +1122,29 @@ where
         completion: C,
         visibility: CompletionVisibility,
     ) -> CompletionEffect {
-        if matches!(
-            self.requests[slot].record.map(|record| record.state),
-            Some(RequestState::Pending)
-        ) {
+        let state = self.requests[slot].record.map(|record| record.state);
+        let (next_state, unlink_pending, publish) = match (state, visibility) {
+            (Some(RequestState::Pending), CompletionVisibility::Deferred) => {
+                (RequestState::DeferredPending(completion), false, false)
+            }
+            (Some(RequestState::Pending), CompletionVisibility::Visible) => {
+                (RequestState::Visible(completion), true, true)
+            }
+            (Some(RequestState::Delivered), CompletionVisibility::Deferred) => {
+                (RequestState::DeferredDelivered(completion), false, false)
+            }
+            (Some(RequestState::Delivered), CompletionVisibility::Visible) => {
+                (RequestState::Visible(completion), false, true)
+            }
+            _ => return CompletionEffect::default(),
+        };
+        if unlink_pending {
             self.unlink_pending(slot);
         }
-        let visible = visibility == CompletionVisibility::Visible;
         if let Some(record) = self.requests[slot].record.as_mut() {
-            record.state = RequestState::Terminal {
-                completion,
-                visible,
-            };
+            record.state = next_state;
         }
-        let waiters_released = if visible {
+        let waiters_released = if publish {
             self.publish_waiters(slot, completion)
         } else {
             0
@@ -1083,18 +1153,17 @@ where
     }
 
     fn release_slot(&mut self, slot: usize) -> CompletionEffect {
-        let completion = match self.requests[slot].record.map(|record| record.state) {
-            Some(RequestState::Terminal {
-                completion,
-                visible: false,
-            }) => completion,
-            _ => return CompletionEffect::default(),
-        };
-        if let Some(record) = self.requests[slot].record.as_mut() {
-            record.state = RequestState::Terminal {
-                completion,
-                visible: true,
+        let (completion, unlink_pending) =
+            match self.requests[slot].record.map(|record| record.state) {
+                Some(RequestState::DeferredPending(completion)) => (completion, true),
+                Some(RequestState::DeferredDelivered(completion)) => (completion, false),
+                _ => return CompletionEffect::default(),
             };
+        if unlink_pending {
+            self.unlink_pending(slot);
+        }
+        if let Some(record) = self.requests[slot].record.as_mut() {
+            record.state = RequestState::Visible(completion);
         }
         CompletionEffect {
             waiters_released: self.publish_waiters(slot, completion),
@@ -1170,7 +1239,7 @@ where
     fn reclaim_request(&mut self, slot: usize) {
         if matches!(
             self.requests[slot].record.map(|record| record.state),
-            Some(RequestState::Pending)
+            Some(RequestState::Pending | RequestState::DeferredPending(_))
         ) {
             self.unlink_pending(slot);
         }
@@ -1450,6 +1519,12 @@ mod tests {
             0
         );
         assert_eq!(
+            broker.request(first.request()).unwrap().phase(),
+            RequestPhase::DeferredPending
+        );
+        assert_eq!(broker.pending_count(1), 2);
+        assert!(broker.has_pending(1));
+        assert_eq!(
             broker.waiter(first.waiter()).unwrap(),
             WaiterObservation::Pending
         );
@@ -1479,6 +1554,81 @@ mod tests {
     }
 
     #[test]
+    fn deferred_pending_keeps_fifo_position_and_claims_as_deferred_delivered() {
+        let mut broker = Broker::try_new(3, 3).unwrap();
+        let first = broker
+            .admit(1, Key::page(1, 1, 0x1000, Access::Read))
+            .unwrap();
+        let other = broker
+            .admit(2, Key::page(2, 1, 0x2000, Access::Read))
+            .unwrap();
+        let second = broker
+            .admit(1, Key::page(3, 1, 0x3000, Access::Read))
+            .unwrap();
+
+        broker
+            .complete(first.request(), 41, CompletionVisibility::Deferred)
+            .unwrap();
+        assert_eq!(broker.pending_count(1), 2);
+        assert_eq!(broker.pending_count(2), 1);
+        assert_eq!(
+            broker.take_waiter_completion(first.waiter()),
+            Err(WaiterError::NotReady)
+        );
+
+        assert_eq!(broker.claim_next(2).unwrap().token(), other.request());
+        let claimed = broker.claim_next(1).unwrap();
+        assert_eq!(claimed.token(), first.request());
+        assert_eq!(claimed.phase(), RequestPhase::DeferredDelivered);
+        assert_eq!(broker.pending_count(1), 1);
+        assert_eq!(broker.claim_next(1).unwrap().token(), second.request());
+        assert!(broker.claim_next(1).is_none());
+
+        assert_eq!(
+            broker.complete(first.request(), 99, CompletionVisibility::Visible),
+            Err(RequestError::AlreadyTerminal)
+        );
+        assert_eq!(
+            broker.release(first.request()).unwrap().waiters_released(),
+            1
+        );
+        assert_eq!(
+            broker
+                .take_waiter_completion(first.waiter())
+                .unwrap()
+                .completion(),
+            41
+        );
+    }
+
+    #[test]
+    fn releasing_deferred_pending_removes_only_that_fifo_entry() {
+        let mut broker = Broker::try_new(2, 2).unwrap();
+        let first = broker
+            .admit(1, Key::page(1, 1, 0x1000, Access::Read))
+            .unwrap();
+        let second = broker
+            .admit(1, Key::page(2, 1, 0x2000, Access::Read))
+            .unwrap();
+        broker
+            .complete(first.request(), 17, CompletionVisibility::Deferred)
+            .unwrap();
+
+        assert_eq!(broker.pending_count(1), 2);
+        assert_eq!(
+            broker.release(first.request()).unwrap().waiters_released(),
+            1
+        );
+        assert_eq!(broker.pending_count(1), 1);
+        assert_eq!(broker.claim_next(1).unwrap().token(), second.request());
+        assert!(broker.claim_next(1).is_none());
+        assert_eq!(
+            broker.waiter(first.waiter()).unwrap(),
+            WaiterObservation::Ready(17)
+        );
+    }
+
+    #[test]
     fn deferred_terminal_coalescing_stays_unready_until_one_release() {
         let mut broker = Broker::try_new(1, 2).unwrap();
         let key = Key::page(1, 7, 0x1000, Access::Read);
@@ -1490,6 +1640,11 @@ mod tests {
         let second = broker.admit(1, key).unwrap();
         assert!(second.coalesced());
         assert_eq!(first.request(), second.request());
+        assert_eq!(broker.pending_count(1), 1);
+        assert_eq!(
+            broker.request(first.request()).unwrap().phase(),
+            RequestPhase::DeferredPending
+        );
         assert_eq!(
             broker.waiter(first.waiter()).unwrap(),
             WaiterObservation::Pending
@@ -1499,6 +1654,11 @@ mod tests {
             WaiterObservation::Pending
         );
 
+        assert_eq!(
+            broker.claim_next(1).unwrap().phase(),
+            RequestPhase::DeferredDelivered
+        );
+        assert_eq!(broker.pending_count(1), 0);
         let released = broker.release(first.request()).unwrap();
         assert_eq!(released.waiters_released(), 2);
         assert_eq!(
@@ -1512,6 +1672,159 @@ mod tests {
         assert_eq!(
             broker.release(first.request()).unwrap().waiters_released(),
             0
+        );
+    }
+
+    #[test]
+    fn final_cancel_reclaims_both_deferred_delivery_phases() {
+        for claim_before_completion in [false, true] {
+            let mut broker = Broker::try_new(1, 1).unwrap();
+            let admission = broker.admit(1, Key::page(1, 1, 0, Access::Read)).unwrap();
+            if claim_before_completion {
+                broker.claim_next(1).unwrap();
+            }
+            broker
+                .complete(admission.request(), 7, CompletionVisibility::Deferred)
+                .unwrap();
+
+            assert_eq!(
+                broker.request(admission.request()).unwrap().phase(),
+                if claim_before_completion {
+                    RequestPhase::DeferredDelivered
+                } else {
+                    RequestPhase::DeferredPending
+                }
+            );
+            let cancelled = broker.cancel_waiter(admission.waiter()).unwrap();
+            assert_eq!(cancelled.completion(), None);
+            assert!(cancelled.request_reclaimed());
+            assert_eq!(broker.load().live_requests(), 0);
+            assert_eq!(broker.load().live_waiters(), 0);
+            assert_eq!(broker.pending_count(1), 0);
+            assert!(broker.claim_next(1).is_none());
+        }
+    }
+
+    #[test]
+    fn single_request_model_covers_deferred_delivery_and_terminal_ownership() {
+        #[derive(Clone, Copy)]
+        enum FinalAction {
+            ReleaseAndTake,
+            Cancel,
+        }
+
+        for claim_before_completion in [false, true] {
+            for claim_after_completion in [false, true] {
+                if claim_before_completion && claim_after_completion {
+                    continue;
+                }
+                for final_action in [FinalAction::ReleaseAndTake, FinalAction::Cancel] {
+                    let mut broker = Broker::try_new(1, 1).unwrap();
+                    let admission = broker.admit(1, Key::page(1, 1, 0, Access::Read)).unwrap();
+                    if claim_before_completion {
+                        assert_eq!(
+                            broker.claim_next(1).unwrap().phase(),
+                            RequestPhase::Delivered
+                        );
+                    }
+                    broker
+                        .complete(admission.request(), 71, CompletionVisibility::Deferred)
+                        .unwrap();
+                    if claim_after_completion {
+                        assert_eq!(
+                            broker.claim_next(1).unwrap().phase(),
+                            RequestPhase::DeferredDelivered
+                        );
+                    }
+
+                    let delivered = claim_before_completion || claim_after_completion;
+                    assert_eq!(
+                        broker.request(admission.request()).unwrap().phase(),
+                        if delivered {
+                            RequestPhase::DeferredDelivered
+                        } else {
+                            RequestPhase::DeferredPending
+                        }
+                    );
+                    assert_eq!(broker.pending_count(1), usize::from(!delivered));
+                    assert_eq!(
+                        broker.waiter(admission.waiter()).unwrap(),
+                        WaiterObservation::Pending
+                    );
+                    let load = broker.load();
+                    assert_eq!(load.live_requests(), 1);
+                    assert_eq!(load.deferred_pending_requests(), usize::from(!delivered));
+                    assert_eq!(load.deferred_delivered_requests(), usize::from(delivered));
+
+                    match final_action {
+                        FinalAction::ReleaseAndTake => {
+                            assert_eq!(
+                                broker
+                                    .release(admission.request())
+                                    .unwrap()
+                                    .waiters_released(),
+                                1
+                            );
+                            assert_eq!(broker.pending_count(1), 0);
+                            assert_eq!(
+                                broker.waiter(admission.waiter()).unwrap(),
+                                WaiterObservation::Ready(71)
+                            );
+                            let taken = broker.take_waiter_completion(admission.waiter()).unwrap();
+                            assert_eq!(taken.completion(), 71);
+                            assert!(taken.request_reclaimed());
+                        }
+                        FinalAction::Cancel => {
+                            let cancelled = broker.cancel_waiter(admission.waiter()).unwrap();
+                            assert_eq!(cancelled.completion(), None);
+                            assert!(cancelled.request_reclaimed());
+                        }
+                    }
+                    assert_eq!(broker.load().live_requests(), 0);
+                    assert_eq!(broker.load().live_waiters(), 0);
+                    assert!(broker.claim_next(1).is_none());
+                    assert_eq!(
+                        broker.request(admission.request()),
+                        Err(RequestError::StaleOrForeign)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn coalesced_cancel_then_release_and_take_has_one_reclamation_owner() {
+        let mut broker = Broker::try_new(1, 2).unwrap();
+        let key = Key::page(1, 1, 0, Access::Read);
+        let first = broker.admit(1, key).unwrap();
+        let second = broker.admit(1, key).unwrap();
+        broker
+            .complete(first.request(), 23, CompletionVisibility::Deferred)
+            .unwrap();
+
+        let cancelled = broker.cancel_waiter(first.waiter()).unwrap();
+        assert_eq!(cancelled.completion(), None);
+        assert!(!cancelled.request_reclaimed());
+        assert_eq!(broker.pending_count(1), 1);
+        assert_eq!(
+            broker.claim_next(1).unwrap().phase(),
+            RequestPhase::DeferredDelivered
+        );
+        assert_eq!(
+            broker.take_waiter_completion(second.waiter()),
+            Err(WaiterError::NotReady)
+        );
+
+        assert_eq!(
+            broker.release(first.request()).unwrap().waiters_released(),
+            1
+        );
+        let taken = broker.take_waiter_completion(second.waiter()).unwrap();
+        assert_eq!(taken.completion(), 23);
+        assert!(taken.request_reclaimed());
+        assert_eq!(
+            broker.request(first.request()),
+            Err(RequestError::StaleOrForeign)
         );
     }
 
@@ -1557,29 +1870,53 @@ mod tests {
 
     #[test]
     fn handler_detach_completes_open_and_releases_deferred_without_overwrite() {
-        let mut broker = Broker::try_new(4, 4).unwrap();
-        let pending = broker
+        let mut broker = Broker::try_new(6, 6).unwrap();
+        let delivered = broker
             .admit(4, Key::page(1, 1, 0x1000, Access::Read))
             .unwrap();
-        let delivered = broker
+        assert_eq!(broker.claim_next(4).unwrap().token(), delivered.request());
+        let deferred_delivered = broker
             .admit(4, Key::page(2, 1, 0x2000, Access::Read))
             .unwrap();
-        let deferred = broker
+        assert_eq!(
+            broker.claim_next(4).unwrap().token(),
+            deferred_delivered.request()
+        );
+        broker
+            .complete(
+                deferred_delivered.request(),
+                122,
+                CompletionVisibility::Deferred,
+            )
+            .unwrap();
+        let pending = broker
             .admit(4, Key::page(3, 1, 0x3000, Access::Read))
             .unwrap();
-        let other = broker
-            .admit(5, Key::page(4, 1, 0x4000, Access::Read))
+        let deferred_pending = broker
+            .admit(4, Key::page(4, 1, 0x4000, Access::Read))
             .unwrap();
-        assert_eq!(broker.claim_next(4).unwrap().token(), pending.request());
-        assert_eq!(broker.claim_next(4).unwrap().token(), delivered.request());
         broker
-            .complete(deferred.request(), 123, CompletionVisibility::Deferred)
+            .complete(
+                deferred_pending.request(),
+                123,
+                CompletionVisibility::Deferred,
+            )
             .unwrap();
+        let visible = broker
+            .admit(4, Key::page(5, 1, 0x5000, Access::Read))
+            .unwrap();
+        broker
+            .complete(visible.request(), 124, CompletionVisibility::Visible)
+            .unwrap();
+        let other = broker
+            .admit(5, Key::page(6, 1, 0x6000, Access::Read))
+            .unwrap();
+        assert_eq!(broker.pending_count(4), 2);
 
         let summary = broker.detach_handler(4, -19);
         assert_eq!(summary.requests_completed(), 2);
-        assert_eq!(summary.requests_released(), 1);
-        assert_eq!(summary.waiters_released(), 3);
+        assert_eq!(summary.requests_released(), 2);
+        assert_eq!(summary.waiters_released(), 4);
         assert_eq!(
             broker.waiter(pending.waiter()).unwrap(),
             WaiterObservation::Ready(-19)
@@ -1589,8 +1926,16 @@ mod tests {
             WaiterObservation::Ready(-19)
         );
         assert_eq!(
-            broker.waiter(deferred.waiter()).unwrap(),
+            broker.waiter(deferred_pending.waiter()).unwrap(),
             WaiterObservation::Ready(123)
+        );
+        assert_eq!(
+            broker.waiter(deferred_delivered.waiter()).unwrap(),
+            WaiterObservation::Ready(122)
+        );
+        assert_eq!(
+            broker.waiter(visible.waiter()).unwrap(),
+            WaiterObservation::Ready(124)
         );
         assert_eq!(
             broker.waiter(other.waiter()).unwrap(),
@@ -1600,6 +1945,98 @@ mod tests {
         assert!(!broker.has_pending(4));
         assert_eq!(broker.pending_count(5), 1);
         assert!(broker.has_pending(5));
+    }
+
+    #[test]
+    fn predicate_completion_and_release_cover_the_full_phase_matrix() {
+        let mut broker = Broker::try_new(5, 5).unwrap();
+        let open_pending = broker
+            .admit(1, Key::page(1, 1, 0x1000, Access::Read))
+            .unwrap();
+        let open_delivered = broker
+            .admit(2, Key::page(2, 1, 0x2000, Access::Read))
+            .unwrap();
+        assert_eq!(
+            broker.claim_next(2).unwrap().token(),
+            open_delivered.request()
+        );
+        let deferred_pending = broker
+            .admit(3, Key::page(3, 1, 0x3000, Access::Read))
+            .unwrap();
+        broker
+            .complete(
+                deferred_pending.request(),
+                30,
+                CompletionVisibility::Deferred,
+            )
+            .unwrap();
+        let deferred_delivered = broker
+            .admit(4, Key::page(4, 1, 0x4000, Access::Read))
+            .unwrap();
+        assert_eq!(
+            broker.claim_next(4).unwrap().token(),
+            deferred_delivered.request()
+        );
+        broker
+            .complete(
+                deferred_delivered.request(),
+                40,
+                CompletionVisibility::Deferred,
+            )
+            .unwrap();
+        let visible = broker
+            .admit(5, Key::page(5, 1, 0x5000, Access::Read))
+            .unwrap();
+        broker
+            .complete(visible.request(), 50, CompletionVisibility::Visible)
+            .unwrap();
+
+        let completed = broker.complete_where(|_| true, 99, CompletionVisibility::Deferred);
+        assert_eq!(completed.requests_completed(), 2);
+        assert_eq!(completed.requests_released(), 0);
+        assert_eq!(completed.waiters_released(), 0);
+        assert_eq!(
+            broker.request(open_pending.request()).unwrap().phase(),
+            RequestPhase::DeferredPending
+        );
+        assert_eq!(
+            broker.request(open_delivered.request()).unwrap().phase(),
+            RequestPhase::DeferredDelivered
+        );
+
+        let released = broker.release_where(|_| true);
+        assert_eq!(released.requests_completed(), 0);
+        assert_eq!(released.requests_released(), 4);
+        assert_eq!(released.waiters_released(), 4);
+        assert_eq!(broker.pending_count(1), 0);
+        assert_eq!(broker.pending_count(3), 0);
+        assert_eq!(
+            broker.waiter(open_pending.waiter()).unwrap(),
+            WaiterObservation::Ready(99)
+        );
+        assert_eq!(
+            broker.waiter(open_delivered.waiter()).unwrap(),
+            WaiterObservation::Ready(99)
+        );
+        assert_eq!(
+            broker.waiter(deferred_pending.waiter()).unwrap(),
+            WaiterObservation::Ready(30)
+        );
+        assert_eq!(
+            broker.waiter(deferred_delivered.waiter()).unwrap(),
+            WaiterObservation::Ready(40)
+        );
+        assert_eq!(
+            broker.waiter(visible.waiter()).unwrap(),
+            WaiterObservation::Ready(50)
+        );
+        assert_eq!(
+            broker
+                .complete_where(|_| true, -1, CompletionVisibility::Visible)
+                .requests_completed(),
+            0
+        );
+        assert_eq!(broker.release_where(|_| true).requests_released(), 0);
     }
 
     #[test]
@@ -1680,44 +2117,80 @@ mod tests {
 
     #[test]
     fn load_counts_every_phase_and_ready_waiter_exactly() {
-        let mut broker = Broker::try_new(4, 5).unwrap();
-        let pending = broker
+        let mut broker = Broker::try_new(5, 6).unwrap();
+        let open_pending = broker
             .admit(1, Key::page(1, 1, 0x1000, Access::Read))
             .unwrap();
-        let delivered = broker
-            .admit(1, Key::page(2, 1, 0x2000, Access::Read))
+        let open_delivered = broker
+            .admit(2, Key::page(2, 1, 0x2000, Access::Read))
             .unwrap();
-        let deferred = broker
-            .admit(1, Key::page(3, 1, 0x3000, Access::Read))
+        assert_eq!(
+            broker.claim_next(2).unwrap().token(),
+            open_delivered.request()
+        );
+        let deferred_pending = broker
+            .admit(3, Key::page(3, 1, 0x3000, Access::Read))
+            .unwrap();
+        broker
+            .complete(
+                deferred_pending.request(),
+                1,
+                CompletionVisibility::Deferred,
+            )
+            .unwrap();
+        let deferred_delivered = broker
+            .admit(4, Key::page(4, 1, 0x4000, Access::Read))
+            .unwrap();
+        assert_eq!(
+            broker.claim_next(4).unwrap().token(),
+            deferred_delivered.request()
+        );
+        broker
+            .complete(
+                deferred_delivered.request(),
+                2,
+                CompletionVisibility::Deferred,
+            )
             .unwrap();
         let visible = broker
-            .admit(1, Key::page(4, 1, 0x4000, Access::Read))
+            .admit(5, Key::page(5, 1, 0x5000, Access::Read))
             .unwrap();
         let coalesced = broker
-            .admit(1, Key::page(4, 1, 0x4000, Access::Read))
-            .unwrap();
-        assert_eq!(broker.claim_next(1).unwrap().token(), pending.request());
-        assert_eq!(broker.claim_next(1).unwrap().token(), delivered.request());
-        broker
-            .complete(deferred.request(), 1, CompletionVisibility::Deferred)
+            .admit(5, Key::page(5, 1, 0x5000, Access::Read))
             .unwrap();
         broker
-            .complete(visible.request(), 2, CompletionVisibility::Visible)
+            .complete(visible.request(), 3, CompletionVisibility::Visible)
             .unwrap();
 
         let load = broker.load();
-        assert_eq!(load.request_capacity(), 4);
-        assert_eq!(load.live_requests(), 4);
-        assert_eq!(load.pending_requests(), 0);
-        assert_eq!(load.delivered_requests(), 2);
-        assert_eq!(load.deferred_requests(), 1);
+        assert_eq!(load.request_capacity(), 5);
+        assert_eq!(load.live_requests(), 5);
+        assert_eq!(load.open_pending_requests(), 1);
+        assert_eq!(load.open_delivered_requests(), 1);
+        assert_eq!(load.deferred_pending_requests(), 1);
+        assert_eq!(load.deferred_delivered_requests(), 1);
         assert_eq!(load.visible_requests(), 1);
-        assert_eq!(load.waiter_capacity(), 5);
-        assert_eq!(load.live_waiters(), 5);
+        assert_eq!(
+            load.open_pending_requests()
+                + load.open_delivered_requests()
+                + load.deferred_pending_requests()
+                + load.deferred_delivered_requests()
+                + load.visible_requests(),
+            load.live_requests()
+        );
+        assert_eq!(load.pending_requests(), 2);
+        assert_eq!(load.delivered_requests(), 2);
+        assert_eq!(load.deferred_requests(), 2);
+        assert_eq!(load.waiter_capacity(), 6);
+        assert_eq!(load.live_waiters(), 6);
         assert_eq!(load.ready_waiters(), 2);
         assert_eq!(
+            broker.request(open_pending.request()).unwrap().phase(),
+            RequestPhase::Pending
+        );
+        assert_eq!(
             broker.waiter(coalesced.waiter()).unwrap(),
-            WaiterObservation::Ready(2)
+            WaiterObservation::Ready(3)
         );
     }
 
@@ -1733,10 +2206,31 @@ mod tests {
             let second = broker
                 .admit(1, Key::page(1, generation, 0, Access::Read))
                 .unwrap();
-            broker.claim_next(1).unwrap();
-            broker
-                .complete(first.request(), 0, CompletionVisibility::Visible)
-                .unwrap();
+            match generation % 3 {
+                0 => {
+                    broker
+                        .complete(first.request(), 0, CompletionVisibility::Deferred)
+                        .unwrap();
+                    assert_eq!(
+                        broker.claim_next(1).unwrap().phase(),
+                        RequestPhase::DeferredDelivered
+                    );
+                    broker.release(first.request()).unwrap();
+                }
+                1 => {
+                    broker.claim_next(1).unwrap();
+                    broker
+                        .complete(first.request(), 0, CompletionVisibility::Deferred)
+                        .unwrap();
+                    broker.release(first.request()).unwrap();
+                }
+                _ => {
+                    broker.claim_next(1).unwrap();
+                    broker
+                        .complete(first.request(), 0, CompletionVisibility::Visible)
+                        .unwrap();
+                }
+            }
             broker.take_waiter_completion(first.waiter()).unwrap();
             broker.take_waiter_completion(second.waiter()).unwrap();
         }
