@@ -26,18 +26,27 @@ later handler from being confused with the detached one.
 
 `FaultBroker::try_new(requests, waiters)` allocates and initializes the complete
 request and waiter slot arrays. `usize::MAX` is rejected as an accidental
-unbounded setting. Broker-owned storage never allocates after construction and
-cannot grow either array. Adapter-defined equality and predicate code executes
-inline; consumers that need a hard nonblocking hot path must keep that code
-allocation-free as well. Request and waiter tokens contain the broker identity,
-slot, and a monotonically increasing generation; an exhausted generation is
-reported instead of wrapping or reusing an old identity.
+unbounded setting. This constructor enforces only the broker-local request
+ceiling. `try_new_with_credit_pool` additionally binds any number of brokers to
+one static `RequestCreditPool`, providing an atomic finite ceiling over their
+combined live requests. Broker-owned storage never allocates after construction
+and cannot grow either array. Adapter-defined equality and predicate code
+executes inline; consumers that need a hard nonblocking hot path must keep that
+code allocation-free as well. Request and waiter tokens contain the broker
+identity, slot, and a monotonically increasing generation; an exhausted
+generation is reported instead of wrapping or reusing an old identity.
 
 One admission always creates one independently cancellable waiter. An exact
 `(handler, key)` match coalesces onto the existing request; a different mapping
 generation or access mode must therefore be represented in the key and cannot
-coalesce accidentally. Cancelling or consuming the final waiter immediately
-reclaims its request, including a pending or delivered request.
+coalesce accidentally. A new request in a pool-bound broker atomically consumes
+one shared credit only after all broker-local capacity and linkage checks pass.
+Exact coalescing never consumes another request credit, even when the pool is
+full. Cancelling or consuming the final waiter immediately reclaims its request
+and returns that credit in every phase. Dropping a broker returns one credit for
+each live request it still owns, so address-space teardown does not require an
+adapter-maintained side ledger. Pool counts never wrap or underflow and are
+accounting snapshots, not request-state publication barriers.
 
 New requests enter one FIFO pending list. `claim_next(handler)` removes the
 oldest matching request and leaves it in `Delivered`. A deferred result does
@@ -74,6 +83,14 @@ completion dimensions; a deferred-pending request appears in both the pending
 and deferred aggregates, but only once in the exact phase counts and
 `live_requests`.
 
+`requests()` provides the missing general read-only inspection primitive. It
+scans the preallocated request slots and yields copied `RequestSnapshot` values
+without allocation. Its private slot order is deliberately not a delivery
+ordering contract. Exact-key lookup remains `matching_request`, token lookup
+remains `request`, and mutation remains in `complete_where`/`release_where`;
+the iterator avoids duplicating those APIs while supporting bounded
+per-handler, range, phase, or policy preflight scans.
+
 The type is deliberately externally serialized. A kernel may place it inside
 the lock appropriate to its address-space/handler ownership. Keeping locks,
 Wakers, wake callbacks, and task blocking out of this crate prevents a broker
@@ -84,12 +101,17 @@ so it can publish readiness after releasing its state lock.
 ## Example
 
 ```rust
-use axfault::{CompletionVisibility, FaultBroker};
+use axfault::{CompletionVisibility, FaultBroker, RequestCreditPool};
 
-let mut broker = FaultBroker::<u64, u64, i32>::try_new(8, 16).unwrap();
+static CREDITS: RequestCreditPool = RequestCreditPool::new(8);
+
+let mut broker =
+    FaultBroker::<u64, u64, i32>::try_new_with_credit_pool(8, 16, &CREDITS)
+        .unwrap();
 let admission = broker.admit(7, 0x1000).unwrap();
 let delivered = broker.claim_next(7).unwrap();
 assert_eq!(delivered.token(), admission.request());
+assert_eq!(CREDITS.live_requests(), 1);
 
 broker
     .complete(delivered.token(), 0, CompletionVisibility::Visible)
@@ -101,6 +123,7 @@ assert_eq!(
         .completion(),
     0
 );
+assert_eq!(CREDITS.live_requests(), 0);
 ```
 
 See `CHANGELOG.md` for the public 0.1 contract.

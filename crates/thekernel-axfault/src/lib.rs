@@ -9,7 +9,7 @@ extern crate alloc;
 extern crate std;
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 static NEXT_BROKER_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -25,12 +25,111 @@ pub enum BrokerConfigError {
     BrokerIdentityExhausted,
 }
 
+/// Failure while configuring a shared live-request credit pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CreditPoolConfigError {
+    /// `usize::MAX` was supplied where an explicit finite bound is required.
+    UnboundedCapacity,
+}
+
+/// Atomic finite credit pool shared by any number of fault brokers.
+///
+/// A broker bound to this pool owns exactly one credit for every live request,
+/// independent of the number of coalesced waiters on that request. The pool is
+/// only an accounting and admission mechanism; relaxed atomic ordering is
+/// sufficient because adapters must not use its snapshots to publish or
+/// synchronize request payload state.
+#[derive(Debug)]
+pub struct RequestCreditPool {
+    capacity: usize,
+    live_requests: AtomicUsize,
+}
+
+impl RequestCreditPool {
+    /// Constructs an empty pool with one explicit finite request ceiling.
+    ///
+    /// This is convenient for `static` pool definitions.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `capacity == usize::MAX`; use [`Self::try_new`] when the
+    /// capacity is not a compile-time configuration constant.
+    pub const fn new(capacity: usize) -> Self {
+        assert!(
+            capacity != usize::MAX,
+            "a request credit pool requires a finite capacity"
+        );
+        Self {
+            capacity,
+            live_requests: AtomicUsize::new(0),
+        }
+    }
+
+    /// Constructs an empty pool with one explicit finite request ceiling.
+    ///
+    /// Zero is valid and rejects every new request.
+    pub const fn try_new(capacity: usize) -> Result<Self, CreditPoolConfigError> {
+        if capacity == usize::MAX {
+            return Err(CreditPoolConfigError::UnboundedCapacity);
+        }
+        Ok(Self::new(capacity))
+    }
+
+    /// Returns the immutable live-request ceiling.
+    pub const fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Returns one point-in-time count of credits currently owned by brokers.
+    pub fn live_requests(&self) -> usize {
+        self.live_requests.load(Ordering::Relaxed)
+    }
+
+    /// Returns one point-in-time count of credits currently available.
+    pub fn available_requests(&self) -> usize {
+        self.capacity.saturating_sub(self.live_requests())
+    }
+
+    fn try_acquire(&self) -> bool {
+        self.live_requests
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                if current >= self.capacity {
+                    None
+                } else {
+                    current.checked_add(1)
+                }
+            })
+            .is_ok()
+    }
+
+    fn try_release(&self, count: usize) -> bool {
+        if count == 0 {
+            return true;
+        }
+        self.live_requests
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_sub(count)
+            })
+            .is_ok()
+    }
+
+    fn release_exact(&self, count: usize) {
+        assert!(
+            self.try_release(count),
+            "fault-request credit ownership underflow"
+        );
+    }
+}
+
 /// Failure while admitting one request/waiter relationship.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AdmissionError {
     /// Every request slot currently contains a live request.
     RequestCapacity,
+    /// The broker's shared live-request credit pool is full.
+    RequestCreditCapacity,
     /// Every reusable free request slot exhausted its generation space.
     RequestTokenExhausted,
     /// Every waiter slot currently contains a live waiter.
@@ -525,6 +624,31 @@ enum SlotChoiceError {
     GenerationExhausted,
 }
 
+struct RequestCreditReservation {
+    pool: Option<&'static RequestCreditPool>,
+}
+
+impl RequestCreditReservation {
+    fn try_acquire(pool: Option<&'static RequestCreditPool>) -> Result<Self, AdmissionError> {
+        if pool.is_some_and(|pool| !pool.try_acquire()) {
+            return Err(AdmissionError::RequestCreditCapacity);
+        }
+        Ok(Self { pool })
+    }
+
+    fn commit(mut self) {
+        self.pool = None;
+    }
+}
+
+impl Drop for RequestCreditReservation {
+    fn drop(&mut self) {
+        if let Some(pool) = self.pool {
+            pool.release_exact(1);
+        }
+    }
+}
+
 /// Preallocated generic fault-request and waiter state machine.
 ///
 /// `K` is the exact coalescing key, `H` is a generation-scoped handler
@@ -532,12 +656,15 @@ enum SlotChoiceError {
 /// be `Copy` keeps arbitrary destructors and hidden allocations out of every
 /// hot transition. The type uses `&mut self` for mutation so a consumer can
 /// select the lock and lock-order contract appropriate to its VM design.
+/// When a credit pool is bound, live request-slot presence is the sole credit
+/// ownership ledger: no adapter-side count or per-request sidecar is required.
 pub struct FaultBroker<K, H, C> {
     id: u64,
     requests: Vec<RequestSlot<K, H, C>>,
     waiters: Vec<WaiterSlot<C>>,
     pending_head: Option<usize>,
     pending_tail: Option<usize>,
+    credit_pool: Option<&'static RequestCreditPool>,
 }
 
 impl<K, H, C> FaultBroker<K, H, C>
@@ -550,9 +677,33 @@ where
     ///
     /// Zero is a valid explicit capacity and creates an always-full registry.
     /// No method after this constructor allocates or grows either slot array.
+    /// This local-only constructor does not impose a bound shared with other
+    /// brokers; use [`Self::try_new_with_credit_pool`] when a system-wide or
+    /// subsystem-wide live-request ceiling is required.
     pub fn try_new(
         request_capacity: usize,
         waiter_capacity: usize,
+    ) -> Result<Self, BrokerConfigError> {
+        Self::try_new_inner(request_capacity, waiter_capacity, None)
+    }
+
+    /// Allocates a broker whose new requests consume one shared pool credit.
+    ///
+    /// Exact coalescing consumes only a waiter slot and therefore remains
+    /// possible while the pool is full. Credits are returned only when the
+    /// final waiter reclaims its request or when this broker is dropped.
+    pub fn try_new_with_credit_pool(
+        request_capacity: usize,
+        waiter_capacity: usize,
+        credit_pool: &'static RequestCreditPool,
+    ) -> Result<Self, BrokerConfigError> {
+        Self::try_new_inner(request_capacity, waiter_capacity, Some(credit_pool))
+    }
+
+    fn try_new_inner(
+        request_capacity: usize,
+        waiter_capacity: usize,
+        credit_pool: Option<&'static RequestCreditPool>,
     ) -> Result<Self, BrokerConfigError> {
         if request_capacity == usize::MAX || waiter_capacity == usize::MAX {
             return Err(BrokerConfigError::UnboundedCapacity);
@@ -591,6 +742,7 @@ where
             waiters,
             pending_head: None,
             pending_tail: None,
+            credit_pool,
         })
     }
 
@@ -666,7 +818,64 @@ where
             generation: waiter_generation,
         };
 
+        let (waiter_state, previous) = if coalesced {
+            let request_record = self.requests[request_slot]
+                .record
+                .as_ref()
+                .ok_or(AdmissionError::InconsistentState)?;
+            if request_record.waiter_count == 0
+                || request_record.waiter_head.is_none()
+                || request_record.waiter_tail.is_none()
+            {
+                return Err(AdmissionError::InconsistentState);
+            }
+            let waiter_state = match request_record.state {
+                RequestState::Visible(completion) => WaiterState::Ready(completion),
+                _ => WaiterState::Active,
+            };
+            let previous = request_record.waiter_tail;
+            if let Some(previous) = previous {
+                let previous_record = self
+                    .waiters
+                    .get(previous)
+                    .and_then(|entry| entry.record)
+                    .ok_or(AdmissionError::InconsistentState)?;
+                if previous_record.request != request || previous_record.next.is_some() {
+                    return Err(AdmissionError::InconsistentState);
+                }
+            }
+            (waiter_state, previous)
+        } else {
+            if self.pending_head.is_some() != self.pending_tail.is_some() {
+                return Err(AdmissionError::InconsistentState);
+            }
+            if let Some(tail) = self.pending_tail {
+                let tail_record = self
+                    .requests
+                    .get(tail)
+                    .and_then(|entry| entry.record)
+                    .ok_or(AdmissionError::InconsistentState)?;
+                if !matches!(
+                    tail_record.state,
+                    RequestState::Pending | RequestState::DeferredPending(_)
+                ) || tail_record.pending_next.is_some()
+                {
+                    return Err(AdmissionError::InconsistentState);
+                }
+            }
+            (WaiterState::Active, None)
+        };
+
+        let credit = if coalesced {
+            None
+        } else {
+            Some(RequestCreditReservation::try_acquire(self.credit_pool)?)
+        };
+
         if !coalesced {
+            credit
+                .expect("new requests always reserve their configured credit")
+                .commit();
             self.requests[request_slot].generation = request_generation;
             self.requests[request_slot].record = Some(RequestRecord {
                 key,
@@ -679,24 +888,16 @@ where
                 pending_next: None,
             });
             if let Some(tail) = self.pending_tail {
-                if let Some(record) = self.requests[tail].record.as_mut() {
-                    record.pending_next = Some(request_slot);
-                }
+                self.requests[tail]
+                    .record
+                    .as_mut()
+                    .expect("pending tail was validated before credit acquisition")
+                    .pending_next = Some(request_slot);
             } else {
                 self.pending_head = Some(request_slot);
             }
             self.pending_tail = Some(request_slot);
         }
-
-        let request_record = self.requests[request_slot]
-            .record
-            .as_ref()
-            .ok_or(AdmissionError::InconsistentState)?;
-        let waiter_state = match request_record.state {
-            RequestState::Visible(completion) => WaiterState::Ready(completion),
-            _ => WaiterState::Active,
-        };
-        let previous = request_record.waiter_tail;
 
         self.waiters[waiter_slot].generation = waiter_generation;
         self.waiters[waiter_slot].record = Some(WaiterRecord {
@@ -706,19 +907,16 @@ where
             next: None,
         });
         if let Some(previous) = previous {
-            let Some(previous_record) = self.waiters[previous].record.as_mut() else {
-                self.waiters[waiter_slot].record = None;
-                if !coalesced {
-                    self.reclaim_request(request_slot);
-                }
-                return Err(AdmissionError::InconsistentState);
-            };
-            previous_record.next = Some(waiter_slot);
+            self.waiters[previous]
+                .record
+                .as_mut()
+                .expect("waiter tail was validated before request publication")
+                .next = Some(waiter_slot);
         }
-        let Some(record) = self.requests[request_slot].record.as_mut() else {
-            self.waiters[waiter_slot].record = None;
-            return Err(AdmissionError::InconsistentState);
-        };
+        let record = self.requests[request_slot]
+            .record
+            .as_mut()
+            .expect("request slot was validated before publication");
         if record.waiter_head.is_none() {
             record.waiter_head = Some(waiter_slot);
         }
@@ -807,6 +1005,17 @@ where
     pub fn request(&self, token: RequestToken) -> Result<RequestSnapshot<K, H>, RequestError> {
         let slot = self.request_index(token)?;
         self.snapshot_slot(slot).ok_or(RequestError::StaleOrForeign)
+    }
+
+    /// Iterates over copied snapshots of every live request without allocating.
+    ///
+    /// Snapshots are yielded in private slot order, which is not FIFO delivery
+    /// order and must not be used as an ordering contract. The immutable borrow
+    /// prevents broker transitions while an adapter performs bounded policy
+    /// inspection; [`Self::matching_request`] and [`Self::request`] remain the
+    /// more direct probes for exact-key and token lookups.
+    pub fn requests(&self) -> impl Iterator<Item = RequestSnapshot<K, H>> + '_ {
+        (0..self.requests.len()).filter_map(|slot| self.snapshot_slot(slot))
     }
 
     /// Gives one pending or delivered request its immutable terminal result.
@@ -1237,6 +1446,7 @@ where
     }
 
     fn reclaim_request(&mut self, slot: usize) {
+        let had_request = self.requests[slot].record.is_some();
         if matches!(
             self.requests[slot].record.map(|record| record.state),
             Some(RequestState::Pending | RequestState::DeferredPending(_))
@@ -1244,6 +1454,24 @@ where
             self.unlink_pending(slot);
         }
         self.requests[slot].record = None;
+        if had_request {
+            if let Some(pool) = self.credit_pool {
+                pool.release_exact(1);
+            }
+        }
+    }
+}
+
+impl<K, H, C> Drop for FaultBroker<K, H, C> {
+    fn drop(&mut self) {
+        if let Some(pool) = self.credit_pool {
+            let live_requests = self
+                .requests
+                .iter()
+                .filter(|slot| slot.record.is_some())
+                .count();
+            pool.release_exact(live_requests);
+        }
     }
 }
 
@@ -1311,6 +1539,189 @@ mod tests {
     }
 
     #[test]
+    fn request_credit_pool_never_wraps_or_underflows() {
+        assert!(matches!(
+            RequestCreditPool::try_new(usize::MAX),
+            Err(CreditPoolConfigError::UnboundedCapacity)
+        ));
+
+        let zero = RequestCreditPool::new(0);
+        assert_eq!(zero.capacity(), 0);
+        assert_eq!(zero.live_requests(), 0);
+        assert_eq!(zero.available_requests(), 0);
+        assert!(!zero.try_acquire());
+        assert!(!zero.try_release(1));
+        assert_eq!(zero.live_requests(), 0);
+
+        let one = RequestCreditPool::new(1);
+        assert!(one.try_acquire());
+        assert_eq!(one.live_requests(), 1);
+        assert_eq!(one.available_requests(), 0);
+        assert!(!one.try_acquire());
+        assert_eq!(one.live_requests(), 1);
+        assert!(one.try_release(1));
+        assert_eq!(one.live_requests(), 0);
+        assert!(!one.try_release(1));
+        assert_eq!(one.live_requests(), 0);
+        assert_eq!(one.available_requests(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "a request credit pool requires a finite capacity")]
+    fn static_credit_pool_constructor_rejects_unbounded_capacity() {
+        let _ = RequestCreditPool::new(usize::MAX);
+    }
+
+    #[test]
+    fn unpublished_credit_reservation_rolls_back_on_drop() {
+        static POOL: RequestCreditPool = RequestCreditPool::new(1);
+
+        {
+            let _reservation = RequestCreditReservation::try_acquire(Some(&POOL)).unwrap();
+            assert_eq!(POOL.live_requests(), 1);
+        }
+        assert_eq!(POOL.live_requests(), 0);
+
+        let reservation = RequestCreditReservation::try_acquire(Some(&POOL)).unwrap();
+        reservation.commit();
+        assert_eq!(POOL.live_requests(), 1);
+        assert!(POOL.try_release(1));
+        assert_eq!(POOL.live_requests(), 0);
+    }
+
+    #[test]
+    fn shared_credit_charges_only_new_requests_and_releases_on_final_waiter() {
+        static POOL: RequestCreditPool = RequestCreditPool::new(1);
+
+        let mut broker = Broker::try_new_with_credit_pool(2, 3, &POOL).unwrap();
+        let key = Key::page(1, 1, 0, Access::Read);
+        let first = broker.admit(1, key).unwrap();
+        let second = broker.admit(1, key).unwrap();
+        assert!(!first.coalesced());
+        assert!(second.coalesced());
+        assert_eq!(POOL.live_requests(), 1);
+        assert_eq!(POOL.available_requests(), 0);
+
+        let before = broker.load();
+        let request_generation = broker.requests[1].generation;
+        let waiter_generation = broker.waiters[2].generation;
+        assert_eq!(
+            broker.admit(1, Key::page(2, 1, 0x1000, Access::Read)),
+            Err(AdmissionError::RequestCreditCapacity)
+        );
+        assert_eq!(broker.load(), before);
+        assert_eq!(broker.requests[1].generation, request_generation);
+        assert_eq!(broker.waiters[2].generation, waiter_generation);
+        assert_eq!(POOL.live_requests(), 1);
+
+        let cancelled = broker.cancel_waiter(first.waiter()).unwrap();
+        assert!(!cancelled.request_reclaimed());
+        assert_eq!(POOL.live_requests(), 1);
+        let cancelled = broker.cancel_waiter(second.waiter()).unwrap();
+        assert!(cancelled.request_reclaimed());
+        assert_eq!(POOL.live_requests(), 0);
+
+        let replacement = broker
+            .admit(1, Key::page(2, 1, 0x1000, Access::Read))
+            .unwrap();
+        broker
+            .complete(replacement.request(), 9, CompletionVisibility::Deferred)
+            .unwrap();
+        assert_eq!(POOL.live_requests(), 1);
+        assert_eq!(
+            broker
+                .release(replacement.request())
+                .unwrap()
+                .waiters_released(),
+            1
+        );
+        assert_eq!(POOL.live_requests(), 1);
+        let taken = broker.take_waiter_completion(replacement.waiter()).unwrap();
+        assert!(taken.request_reclaimed());
+        assert_eq!(POOL.live_requests(), 0);
+    }
+
+    #[test]
+    fn local_admission_failures_do_not_touch_shared_credits() {
+        static POOL: RequestCreditPool = RequestCreditPool::new(2);
+        let key = Key::page(1, 1, 0, Access::Read);
+
+        assert!(matches!(
+            Broker::try_new_with_credit_pool(usize::MAX, 1, &POOL),
+            Err(BrokerConfigError::UnboundedCapacity)
+        ));
+        assert_eq!(POOL.live_requests(), 0);
+
+        let mut no_requests = Broker::try_new_with_credit_pool(0, 1, &POOL).unwrap();
+        assert_eq!(
+            no_requests.admit(1, key),
+            Err(AdmissionError::RequestCapacity)
+        );
+        assert_eq!(POOL.live_requests(), 0);
+
+        let mut no_waiters = Broker::try_new_with_credit_pool(1, 0, &POOL).unwrap();
+        assert_eq!(
+            no_waiters.admit(1, key),
+            Err(AdmissionError::WaiterCapacity)
+        );
+        assert_eq!(POOL.live_requests(), 0);
+
+        let mut request_exhausted = Broker::try_new_with_credit_pool(1, 1, &POOL).unwrap();
+        request_exhausted.requests[0].generation = u64::MAX;
+        assert_eq!(
+            request_exhausted.admit(1, key),
+            Err(AdmissionError::RequestTokenExhausted)
+        );
+        assert_eq!(POOL.live_requests(), 0);
+
+        let mut waiter_exhausted = Broker::try_new_with_credit_pool(1, 1, &POOL).unwrap();
+        waiter_exhausted.waiters[0].generation = u64::MAX;
+        assert_eq!(
+            waiter_exhausted.admit(1, key),
+            Err(AdmissionError::WaiterTokenExhausted)
+        );
+        assert_eq!(POOL.live_requests(), 0);
+    }
+
+    #[test]
+    fn linkage_failures_are_rejected_before_shared_credit_publication() {
+        static POOL: RequestCreditPool = RequestCreditPool::new(2);
+        let key = Key::page(1, 1, 0, Access::Read);
+
+        let mut empty = Broker::try_new_with_credit_pool(1, 2, &POOL).unwrap();
+        empty.pending_tail = Some(0);
+        assert_eq!(empty.admit(1, key), Err(AdmissionError::InconsistentState));
+        assert_eq!(empty.load().live_requests(), 0);
+        assert_eq!(POOL.live_requests(), 0);
+        empty.pending_tail = None;
+
+        let first = empty.admit(1, key).unwrap();
+        assert_eq!(POOL.live_requests(), 1);
+        empty.waiters[first.waiter().slot()]
+            .record
+            .as_mut()
+            .unwrap()
+            .next = Some(first.waiter().slot());
+        assert_eq!(empty.admit(1, key), Err(AdmissionError::InconsistentState));
+        assert_eq!(empty.load().live_requests(), 1);
+        assert_eq!(empty.load().live_waiters(), 1);
+        assert_eq!(POOL.live_requests(), 1);
+
+        empty.waiters[first.waiter().slot()]
+            .record
+            .as_mut()
+            .unwrap()
+            .next = None;
+        assert!(
+            empty
+                .cancel_waiter(first.waiter())
+                .unwrap()
+                .request_reclaimed()
+        );
+        assert_eq!(POOL.live_requests(), 0);
+    }
+
+    #[test]
     fn checked_ranges_preserve_half_open_edges() {
         assert_eq!(FaultRange::try_new(0, 0), Err(FaultRangeError::Empty));
         assert_eq!(
@@ -1355,6 +1766,70 @@ mod tests {
         let load = broker.load();
         assert_eq!(load.live_requests(), 3);
         assert_eq!(load.live_waiters(), 4);
+    }
+
+    #[test]
+    fn request_iterator_provides_bounded_allocation_free_policy_inspection() {
+        let mut broker = Broker::try_new(3, 4).unwrap();
+        let first_key = Key::page(7, 11, 0x1000, Access::Read);
+        let first = broker.admit(3, first_key).unwrap();
+        let coalesced = broker.admit(3, first_key).unwrap();
+        let delivered = broker
+            .admit(4, Key::page(8, 1, 0x2000, Access::Write))
+            .unwrap();
+        let other = broker
+            .admit(3, Key::page(9, 1, 0x3000, Access::Write))
+            .unwrap();
+        assert_eq!(broker.claim_next(4).unwrap().token(), delivered.request());
+        broker
+            .complete(first.request(), 17, CompletionVisibility::Deferred)
+            .unwrap();
+
+        assert_eq!(broker.requests().count(), broker.load().live_requests());
+        assert_eq!(
+            broker
+                .requests()
+                .filter(|snapshot| *snapshot.handler() == 3)
+                .count(),
+            2
+        );
+        assert_eq!(
+            broker
+                .requests()
+                .filter(|snapshot| snapshot.phase() == RequestPhase::DeferredPending)
+                .count(),
+            1
+        );
+        assert_eq!(
+            broker
+                .requests()
+                .find(|snapshot| snapshot.token() == first.request())
+                .unwrap()
+                .waiter_count(),
+            2
+        );
+        assert_eq!(
+            broker.matching_request(3, first_key).unwrap(),
+            broker.request(first.request()).unwrap()
+        );
+        assert_eq!(
+            broker
+                .requests()
+                .find(|snapshot| snapshot.token() == other.request())
+                .unwrap()
+                .key()
+                .mapping,
+            9
+        );
+
+        let request_capacity = broker.requests.capacity();
+        let waiter_capacity = broker.waiters.capacity();
+        for _ in 0..64 {
+            assert_eq!(broker.requests().count(), 3);
+        }
+        assert_eq!(broker.requests.capacity(), request_capacity);
+        assert_eq!(broker.waiters.capacity(), waiter_capacity);
+        assert!(coalesced.coalesced());
     }
 
     #[test]
@@ -1702,6 +2177,81 @@ mod tests {
             assert_eq!(broker.load().live_waiters(), 0);
             assert_eq!(broker.pending_count(1), 0);
             assert!(broker.claim_next(1).is_none());
+        }
+    }
+
+    #[test]
+    fn shared_credit_is_retained_until_the_final_waiter_in_every_phase() {
+        #[derive(Clone, Copy)]
+        enum Phase {
+            Pending,
+            Delivered,
+            DeferredPending,
+            DeferredDelivered,
+            Visible,
+        }
+
+        static POOL: RequestCreditPool = RequestCreditPool::new(1);
+        for phase in [
+            Phase::Pending,
+            Phase::Delivered,
+            Phase::DeferredPending,
+            Phase::DeferredDelivered,
+            Phase::Visible,
+        ] {
+            let mut broker = Broker::try_new_with_credit_pool(1, 2, &POOL).unwrap();
+            let key = Key::page(1, 1, 0, Access::Read);
+            let first = broker.admit(1, key).unwrap();
+            let second = broker.admit(1, key).unwrap();
+            match phase {
+                Phase::Pending => {}
+                Phase::Delivered => {
+                    broker.claim_next(1).unwrap();
+                }
+                Phase::DeferredPending => {
+                    broker
+                        .complete(first.request(), 5, CompletionVisibility::Deferred)
+                        .unwrap();
+                }
+                Phase::DeferredDelivered => {
+                    broker.claim_next(1).unwrap();
+                    broker
+                        .complete(first.request(), 5, CompletionVisibility::Deferred)
+                        .unwrap();
+                }
+                Phase::Visible => {
+                    broker
+                        .complete(first.request(), 5, CompletionVisibility::Visible)
+                        .unwrap();
+                }
+            }
+
+            assert_eq!(POOL.live_requests(), 1);
+            let first_cancel = broker.cancel_waiter(first.waiter()).unwrap();
+            assert!(!first_cancel.request_reclaimed());
+            assert_eq!(
+                first_cancel.completion().copied(),
+                if matches!(phase, Phase::Visible) {
+                    Some(5)
+                } else {
+                    None
+                }
+            );
+            assert_eq!(POOL.live_requests(), 1);
+
+            let reclaimed = if matches!(phase, Phase::Visible) {
+                broker
+                    .take_waiter_completion(second.waiter())
+                    .unwrap()
+                    .request_reclaimed()
+            } else {
+                broker
+                    .cancel_waiter(second.waiter())
+                    .unwrap()
+                    .request_reclaimed()
+            };
+            assert!(reclaimed);
+            assert_eq!(POOL.live_requests(), 0);
         }
     }
 
@@ -2116,6 +2666,112 @@ mod tests {
     }
 
     #[test]
+    fn broker_drop_returns_exact_credits_for_every_live_phase() {
+        static POOL: RequestCreditPool = RequestCreditPool::new(6);
+
+        {
+            let mut broker = Broker::try_new_with_credit_pool(6, 6, &POOL).unwrap();
+            let reclaimed = broker.admit(0, Key::page(0, 1, 0, Access::Read)).unwrap();
+            assert_eq!(POOL.live_requests(), 1);
+            assert!(
+                broker
+                    .cancel_waiter(reclaimed.waiter())
+                    .unwrap()
+                    .request_reclaimed()
+            );
+            assert_eq!(POOL.live_requests(), 0);
+
+            let _open_pending = broker
+                .admit(1, Key::page(1, 1, 0x1000, Access::Read))
+                .unwrap();
+            let open_delivered = broker
+                .admit(2, Key::page(2, 1, 0x2000, Access::Read))
+                .unwrap();
+            assert_eq!(
+                broker.claim_next(2).unwrap().token(),
+                open_delivered.request()
+            );
+            let deferred_pending = broker
+                .admit(3, Key::page(3, 1, 0x3000, Access::Read))
+                .unwrap();
+            broker
+                .complete(
+                    deferred_pending.request(),
+                    3,
+                    CompletionVisibility::Deferred,
+                )
+                .unwrap();
+            let deferred_delivered = broker
+                .admit(4, Key::page(4, 1, 0x4000, Access::Read))
+                .unwrap();
+            assert_eq!(
+                broker.claim_next(4).unwrap().token(),
+                deferred_delivered.request()
+            );
+            broker
+                .complete(
+                    deferred_delivered.request(),
+                    4,
+                    CompletionVisibility::Deferred,
+                )
+                .unwrap();
+            let visible = broker
+                .admit(5, Key::page(5, 1, 0x5000, Access::Read))
+                .unwrap();
+            broker
+                .complete(visible.request(), 5, CompletionVisibility::Visible)
+                .unwrap();
+
+            let load = broker.load();
+            assert_eq!(load.live_requests(), 5);
+            assert_eq!(load.open_pending_requests(), 1);
+            assert_eq!(load.open_delivered_requests(), 1);
+            assert_eq!(load.deferred_pending_requests(), 1);
+            assert_eq!(load.deferred_delivered_requests(), 1);
+            assert_eq!(load.visible_requests(), 1);
+            assert_eq!(POOL.live_requests(), 5);
+        }
+
+        assert_eq!(POOL.live_requests(), 0);
+        assert_eq!(POOL.available_requests(), POOL.capacity());
+    }
+
+    #[test]
+    fn dropping_one_shared_broker_releases_only_its_owned_credits() {
+        static POOL: RequestCreditPool = RequestCreditPool::new(3);
+
+        let mut first = Broker::try_new_with_credit_pool(2, 2, &POOL).unwrap();
+        first
+            .admit(1, Key::page(1, 1, 0x1000, Access::Read))
+            .unwrap();
+        first
+            .admit(1, Key::page(2, 1, 0x2000, Access::Read))
+            .unwrap();
+        let mut second = Broker::try_new_with_credit_pool(1, 2, &POOL).unwrap();
+        let second_admission = second
+            .admit(2, Key::page(3, 1, 0x3000, Access::Read))
+            .unwrap();
+        second
+            .admit(2, Key::page(3, 1, 0x3000, Access::Read))
+            .unwrap();
+        assert_eq!(POOL.live_requests(), 3);
+
+        drop(first);
+        assert_eq!(POOL.live_requests(), 1);
+        assert_eq!(second.requests().count(), 1);
+        assert_eq!(
+            second
+                .request(second_admission.request())
+                .unwrap()
+                .waiter_count(),
+            2
+        );
+
+        drop(second);
+        assert_eq!(POOL.live_requests(), 0);
+    }
+
+    #[test]
     fn load_counts_every_phase_and_ready_waiter_exactly() {
         let mut broker = Broker::try_new(5, 6).unwrap();
         let open_pending = broker
@@ -2284,6 +2940,52 @@ mod tests {
             assert_eq!(load.live_requests(), 0);
             assert_eq!(load.live_waiters(), 0);
         }
+    }
+
+    #[test]
+    fn concurrent_brokers_never_exceed_shared_credit_capacity() {
+        const THREADS: usize = 16;
+        static POOL: RequestCreditPool = RequestCreditPool::new(4);
+
+        let start = Arc::new(Barrier::new(THREADS + 1));
+        let admitted = Arc::new(Barrier::new(THREADS + 1));
+        let release = Arc::new(Barrier::new(THREADS + 1));
+        let mut workers = Vec::new();
+        for mapping in 0..THREADS {
+            let start = Arc::clone(&start);
+            let admitted = Arc::clone(&admitted);
+            let release = Arc::clone(&release);
+            workers.push(thread::spawn(move || {
+                let mut broker = Broker::try_new_with_credit_pool(1, 1, &POOL).unwrap();
+                start.wait();
+                let owns_credit = match broker.admit(
+                    mapping as u64,
+                    Key::page(mapping as u64, 1, (mapping as u64) << 12, Access::Read),
+                ) {
+                    Ok(_) => true,
+                    Err(AdmissionError::RequestCreditCapacity) => false,
+                    Err(error) => panic!("unexpected concurrent admission failure: {error:?}"),
+                };
+                admitted.wait();
+                release.wait();
+                owns_credit
+            }));
+        }
+
+        start.wait();
+        admitted.wait();
+        assert_eq!(POOL.live_requests(), POOL.capacity());
+        assert_eq!(POOL.available_requests(), 0);
+        release.wait();
+
+        let successful = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(|successful| *successful)
+            .count();
+        assert_eq!(successful, POOL.capacity());
+        assert_eq!(POOL.live_requests(), 0);
+        assert_eq!(POOL.available_requests(), POOL.capacity());
     }
 
     #[test]
