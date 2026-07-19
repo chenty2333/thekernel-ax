@@ -66,6 +66,8 @@ for target in riscv64gc-unknown-none-elf loongarch64-unknown-none; do
 done
 
 CARGO_TOOLCHAIN=1.85.0 scripts/package-unpack-original.sh
-CARGO_TOOLCHAIN=nightly-2025-05-20 scripts/publish-dry-run.sh
+AXCBPF_CARGO_TOOLCHAIN=1.85.0 \
+    CARGO_TOOLCHAIN=nightly-2025-05-20 \
+    scripts/publish-dry-run.sh
 CARGO_TOOLCHAIN=nightly-2025-05-20 scripts/package-unpack.sh
 printf 'workspace-ci: PASS\n'

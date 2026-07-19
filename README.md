@@ -66,6 +66,12 @@ last command packages the coordinated three-crate maintained-fork release set,
 unpacks the registry artifacts in a temporary directory, and tests them
 without access to TheKernel's workspace patches.
 
+The publish dry-run uses Rust 1.85.0 for the independent `thekernel-axcbpf`
+artifact and the pinned nightly for the coordinated maintained-fork set. An
+`axcbpf` release must be visible in crates.io before a downstream TheKernel
+Linux-ABI seccomp adapter is published; see
+[`docs/RELEASE.md`](docs/RELEASE.md) for the exact ordering.
+
 ## Project policy
 
 - [`GOVERNANCE.md`](GOVERNANCE.md) defines scope and decision making.

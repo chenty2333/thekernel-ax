@@ -130,6 +130,9 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
+          toolchain: 1.85.0
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
           toolchain: nightly-2025-05-20
           components: clippy,rustfmt
           targets: riscv64gc-unknown-none-elf,loongarch64-unknown-none
@@ -148,8 +151,9 @@ jobs:
           for target in riscv64gc-unknown-none-elf loongarch64-unknown-none; do
             cargo +nightly-2025-05-20 check -p thekernel-axtask --locked --target "$target" --features "$features"
           done
-      - name: Test unpacked release artifacts
+      - name: Test publish and unpacked release artifacts
         env:
+          AXCBPF_CARGO_TOOLCHAIN: 1.85.0
           CARGO_TOOLCHAIN: nightly-2025-05-20
           AXTASK_REGISTRY_READY: ${{ github.event_name == 'workflow_dispatch' && inputs.axtask_registry_ready && '1' || '0' }}
         run: |
