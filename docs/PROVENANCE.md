@@ -20,6 +20,14 @@ The copied crate paths were clean at that commit. The unrelated TheKernel root
 
 ## Original TheKernel-owned sources
 
+`thekernel-axcbpf` 0.1.0 was designed and implemented in this repository as an
+unsafe-free, `no_std` verifier and interpreter for ordinary classic BPF. The
+implementation was written from the public instruction contract and behavioral
+study of Linux v6.12 validation semantics; it does not copy Linux source. Linux
+seccomp actions, syscall data layout, socket ownership, and ancillary packet
+extensions remain in adapters outside this generic mechanism. Its source is
+licensed under Apache-2.0.
+
 `thekernel-axfault` 0.1.0 was designed and implemented in this repository as a
 generic, bounded state core. It has no upstream registry archive, vendored
 baseline, or copied Linux MM/userfaultfd implementation. Its source is licensed
@@ -74,9 +82,9 @@ license expression:
 The same three files are included under each crate so a registry artifact is
 self-contained.
 
-The original `thekernel-axfault` and `thekernel-axtlb` packages declare
-Apache-2.0 and include only `LICENSES/Apache-2.0.txt`, whose SHA-256 is the
-Apache-2.0 value above.
+The original `thekernel-axcbpf`, `thekernel-axfault`, and `thekernel-axtlb`
+packages declare Apache-2.0 and include only `LICENSES/Apache-2.0.txt`, whose
+SHA-256 is the Apache-2.0 value above.
 
 ## Verification rule
 

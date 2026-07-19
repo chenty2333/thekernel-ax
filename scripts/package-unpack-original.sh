@@ -8,7 +8,7 @@ trap 'rm -rf "$tmp"' EXIT
 
 packages=("$@")
 if [[ ${#packages[@]} -eq 0 ]]; then
-    packages=(thekernel-axfault thekernel-axtlb)
+    packages=(thekernel-axcbpf thekernel-axfault thekernel-axtlb)
 fi
 
 allow_dirty=()
@@ -26,7 +26,7 @@ export CARGO_TARGET_DIR="$tmp/package-target"
 
 for package in "${packages[@]}"; do
     case "$package" in
-        thekernel-axfault | thekernel-axtlb) ;;
+        thekernel-axcbpf | thekernel-axfault | thekernel-axtlb) ;;
         *)
             printf 'unsupported original package: %s\n' "$package" >&2
             exit 2

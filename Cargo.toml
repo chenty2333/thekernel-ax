@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/thekernel-axcbpf",
     "crates/thekernel-axfault",
     "crates/thekernel-axtlb",
     "crates/thekernel-axtask",

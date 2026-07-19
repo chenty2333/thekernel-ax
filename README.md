@@ -5,6 +5,7 @@ crates maintained by TheKernel. The workspace contains these crates:
 
 | Package | Rust crate name | Purpose |
 | --- | --- | --- |
+| `thekernel-axcbpf` | `axcbpf` | verified classic-BPF mechanism with bounded execution |
 | `thekernel-axfault` | `axfault` | bounded generation-safe fault-request broker state |
 | `thekernel-axtlb` | `axtlb` | bounded allocation-free SMP TLB and instruction-sync shootdown state |
 | `thekernel-axsched` | `axsched` | FIFO, round-robin, fair, and real-time scheduling mechanisms |
@@ -15,8 +16,8 @@ The maintained-fork package names are new so releases cannot be confused with
 the upstream `axsched`, `axpoll`, and `axtask` packages. Their Rust library
 names stay unchanged, which lets downstream code continue to use the
 established crate paths after changing only its dependency declaration.
-`thekernel-axfault` and `thekernel-axtlb` are new TheKernel-owned mechanisms
-rather than renamed upstream packages.
+`thekernel-axcbpf`, `thekernel-axfault`, and `thekernel-axtlb` are new
+TheKernel-owned mechanisms rather than renamed upstream packages.
 
 ## Scope
 
@@ -39,6 +40,8 @@ The workspace is intentionally self-contained and has no root
 
 ```sh
 scripts/test-axsched-msrv.sh
+cargo +1.85.0 test -p thekernel-axcbpf --all-targets --locked
+cargo +1.85.0 test -p thekernel-axcbpf --doc --locked
 cargo +1.85.0 test -p thekernel-axfault --all-targets --locked
 cargo +1.85.0 test -p thekernel-axfault --doc --locked
 cargo +1.85.0 test -p thekernel-axtlb --all-targets --locked
@@ -58,7 +61,7 @@ provider and prove the final link; TheKernel does so unconditionally through
 its coordinated `axruntime`/`axhal` release set. It is not a profile-selected
 optimization.
 
-The first unpack command validates the two original mechanism artifacts. The
+The first unpack command validates the three original mechanism artifacts. The
 last command packages the coordinated three-crate maintained-fork release set,
 unpacks the registry artifacts in a temporary directory, and tests them
 without access to TheKernel's workspace patches.

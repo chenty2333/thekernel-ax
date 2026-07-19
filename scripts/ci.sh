@@ -10,6 +10,12 @@ scripts/check-provenance.sh
 
 scripts/test-axsched-msrv.sh
 
+cargo +1.85.0 test -p thekernel-axcbpf --all-targets --locked
+cargo +1.85.0 test -p thekernel-axcbpf --doc --locked
+cargo +1.85.0 clippy -p thekernel-axcbpf --all-targets --locked -- -D warnings
+RUSTDOCFLAGS='-D warnings' \
+    cargo +1.85.0 doc -p thekernel-axcbpf --no-deps --locked
+
 cargo +1.85.0 test -p thekernel-axfault --all-targets --locked
 cargo +1.85.0 test -p thekernel-axfault --doc --locked
 cargo +1.85.0 clippy -p thekernel-axfault --all-targets --locked -- -D warnings
@@ -48,6 +54,7 @@ for scheduler in sched-fifo sched-rr sched-cfs; do
 done
 
 for target in riscv64gc-unknown-none-elf loongarch64-unknown-none; do
+    cargo +1.85.0 check -p thekernel-axcbpf --locked --target "$target"
     cargo +1.85.0 check -p thekernel-axfault --locked --target "$target"
     cargo +1.85.0 check -p thekernel-axtlb --locked --target "$target"
     cargo +1.85.0 check -p thekernel-axpoll --locked --target "$target"

@@ -1,0 +1,15 @@
+[package]
+name = "thekernel-axcbpf"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["TheKernel contributors"]
+description = "Verified classic-BPF mechanism for no_std operating systems"
+license = "Apache-2.0"
+repository = "https://github.com/chenty2333/thekernel-ax"
+documentation = "https://docs.rs/thekernel-axcbpf"
+readme = "README.md"
+
+[lib]
+name = "axcbpf"
+path = "src/lib.rs"
