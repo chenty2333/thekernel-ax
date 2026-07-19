@@ -720,6 +720,38 @@ where
         None
     }
 
+    /// Counts requests currently pending for delivery to `handler`.
+    ///
+    /// This observation is derived from the authoritative request phase. It
+    /// does not depend on an adapter-maintained counter, so completion before
+    /// a handler claims the request cannot leave behind phantom readiness.
+    /// The scan is allocation-free and bounded by the request capacity fixed
+    /// at construction.
+    pub fn pending_count(&self, handler: H) -> usize {
+        self.requests
+            .iter()
+            .filter(|slot| {
+                slot.record.is_some_and(|record| {
+                    record.handler == handler && matches!(record.state, RequestState::Pending)
+                })
+            })
+            .count()
+    }
+
+    /// Returns whether a request is currently pending for `handler`.
+    ///
+    /// Like [`Self::pending_count`], this scans the preallocated request slots
+    /// and allocates no storage. Unknown or detached handler identities have
+    /// no pending requests; handler-registry validation remains an adapter
+    /// responsibility.
+    pub fn has_pending(&self, handler: H) -> bool {
+        self.requests.iter().any(|slot| {
+            slot.record.is_some_and(|record| {
+                record.handler == handler && matches!(record.state, RequestState::Pending)
+            })
+        })
+    }
+
     /// Returns a stable copy of one live request's current facts.
     pub fn request(&self, token: RequestToken) -> Result<RequestSnapshot<K, H>, RequestError> {
         let slot = self.request_index(token)?;
@@ -1287,6 +1319,44 @@ mod tests {
     }
 
     #[test]
+    fn pending_observation_has_no_resolver_before_read_ghost() {
+        let mut broker = Broker::try_new(3, 4).unwrap();
+        let key = Key::page(1, 1, 0x1000, Access::Read);
+        let first = broker.admit(7, key).unwrap();
+        let second = broker.admit(7, key).unwrap();
+        let other = broker
+            .admit(8, Key::page(2, 1, 0x2000, Access::Read))
+            .unwrap();
+
+        assert!(second.coalesced());
+        assert_eq!(first.request(), second.request());
+        assert_eq!(broker.pending_count(7), 1);
+        assert!(broker.has_pending(7));
+        assert_eq!(broker.pending_count(8), 1);
+
+        let effect = broker
+            .complete(first.request(), 17, CompletionVisibility::Visible)
+            .unwrap();
+        assert_eq!(effect.waiters_released(), 2);
+        assert_eq!(broker.pending_count(7), 0);
+        assert!(!broker.has_pending(7));
+        assert!(broker.claim_next(7).is_none());
+        assert_eq!(
+            broker.waiter(first.waiter()).unwrap(),
+            WaiterObservation::Ready(17)
+        );
+        assert_eq!(
+            broker.waiter(second.waiter()).unwrap(),
+            WaiterObservation::Ready(17)
+        );
+
+        assert_eq!(broker.pending_count(8), 1);
+        assert!(broker.has_pending(8));
+        assert_eq!(broker.claim_next(8).unwrap().token(), other.request());
+        assert!(!broker.has_pending(8));
+    }
+
+    #[test]
     fn dropping_a_claim_snapshot_keeps_request_out_of_pending_fifo() {
         let mut broker = Broker::try_new(3, 3).unwrap();
         let first = broker
@@ -1314,12 +1384,14 @@ mod tests {
         let key = Key::page(1, 1, 0, Access::Read);
         let first = broker.admit(1, key).unwrap();
         let second = broker.admit(1, key).unwrap();
+        assert_eq!(broker.pending_count(1), 1);
         assert!(
             !broker
                 .cancel_waiter(first.waiter())
                 .unwrap()
                 .request_reclaimed()
         );
+        assert!(broker.has_pending(1));
         assert_eq!(broker.load().live_requests(), 1);
         assert_eq!(broker.load().live_waiters(), 1);
 
@@ -1329,6 +1401,8 @@ mod tests {
                 .unwrap()
                 .request_reclaimed()
         );
+        assert_eq!(broker.pending_count(1), 0);
+        assert!(!broker.has_pending(1));
         assert_eq!(broker.load().live_requests(), 0);
         assert_eq!(broker.load().pending_requests(), 0);
         assert_eq!(
@@ -1453,7 +1527,9 @@ mod tests {
         let third = broker
             .admit(1, Key::page(3, 1, 0x9000, Access::Read))
             .unwrap();
+        assert_eq!(broker.pending_count(1), 3);
         assert_eq!(broker.claim_next(1).unwrap().token(), first.request());
+        assert_eq!(broker.pending_count(1), 2);
 
         let summary = broker.complete_range(
             FaultRange::try_new(0x1800, 0x1000).unwrap(),
@@ -1474,6 +1550,8 @@ mod tests {
             broker.waiter(third.waiter()).unwrap(),
             WaiterObservation::Pending
         );
+        assert_eq!(broker.pending_count(1), 1);
+        assert!(broker.has_pending(1));
         assert_eq!(broker.load().pending_requests(), 1);
     }
 
@@ -1518,6 +1596,10 @@ mod tests {
             broker.waiter(other.waiter()).unwrap(),
             WaiterObservation::Pending
         );
+        assert_eq!(broker.pending_count(4), 0);
+        assert!(!broker.has_pending(4));
+        assert_eq!(broker.pending_count(5), 1);
+        assert!(broker.has_pending(5));
     }
 
     #[test]
@@ -1540,7 +1622,9 @@ mod tests {
     fn stale_request_and_waiter_tokens_cannot_target_reused_slots() {
         let mut broker = Broker::try_new(1, 1).unwrap();
         let first = broker.admit(1, Key::page(1, 1, 0, Access::Read)).unwrap();
+        assert!(broker.has_pending(1));
         broker.cancel_waiter(first.waiter()).unwrap();
+        assert!(!broker.has_pending(1));
         let second = broker.admit(1, Key::page(2, 1, 0, Access::Read)).unwrap();
         assert_eq!(first.request().slot(), second.request().slot());
         assert_ne!(first.request().generation(), second.request().generation());
@@ -1554,6 +1638,8 @@ mod tests {
             broker.cancel_waiter(first.waiter()),
             Err(WaiterError::StaleOrForeign)
         );
+        assert_eq!(broker.pending_count(1), 1);
+        assert!(broker.has_pending(1));
     }
 
     #[test]

@@ -46,6 +46,14 @@ Whether a failed upper-layer delivery is retried is deliberately outside this
 crate; the generic broker only preserves the claimed phase until completion or
 final-waiter cancellation.
 
+`pending_count(handler)` and `has_pending(handler)` scan the fixed request-slot
+array and derive readiness from the authoritative `Pending` phase. They do not
+cache an adapter-side count. Consequently, completion before claim, range
+completion, final-waiter cancellation, handler detach, and generation-safe slot
+reuse cannot leave phantom pending work. The scan allocates no storage and is
+bounded by the request capacity selected at construction (64 in TheKernel's
+initial userfaultfd profile).
+
 Completion may be immediately `Visible` or `Deferred`. Deferred completion is
 the generic mechanism used by a Linux adapter for `DONTWAKE`: the terminal
 result is fixed, but waiters remain pending until `release`, `release_where`, or
