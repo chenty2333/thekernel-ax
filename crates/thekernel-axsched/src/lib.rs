@@ -73,6 +73,27 @@ pub enum EnqueueReason {
     Yield,
     /// The task was preempted and should keep as much state as possible.
     Preempt,
+    /// The task is being transferred from another run queue.
+    ///
+    /// Unlike a wakeup, migration must not apply sleeper placement policy.
+    /// Fair schedulers may use a preceding migration lifecycle hook to rebase
+    /// queue-local virtual-time state at this enqueue boundary.
+    Migrate,
+}
+
+/// Why a running task is leaving its scheduler's current-entity state.
+///
+/// The current entity is not necessarily linked into a ready queue, so this
+/// hook is separate from [`BaseScheduler::remove_task`]. It gives virtual-time
+/// schedulers an allocation-free place to snapshot sleep or migration state.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum DeactivateReason {
+    /// The task is becoming blocked.
+    Sleep,
+    /// The task is leaving the scheduler permanently.
+    Exit,
+    /// The task will be enqueued on another run queue.
+    Migrate,
 }
 
 /// The base scheduler trait that all schedulers should implement.
@@ -97,6 +118,25 @@ pub trait BaseScheduler {
         &mut self,
         task: &Self::SchedItem,
     ) -> Result<Option<Self::SchedItem>, SchedulerError>;
+
+    /// Removes a ready task specifically for transfer to another run queue.
+    ///
+    /// The default implementation is suitable for schedulers without
+    /// queue-local virtual time. Fair schedulers can override it to snapshot a
+    /// relative position before releasing queue ownership.
+    fn remove_task_for_migration(
+        &mut self,
+        task: &Self::SchedItem,
+    ) -> Result<Option<Self::SchedItem>, SchedulerError> {
+        self.remove_task(task)
+    }
+
+    /// Records that the current, unqueued task is leaving the CPU.
+    ///
+    /// This is deliberately infallible: blocking, exit, and CPU-affinity
+    /// enforcement cannot safely strand a task because optional scheduler
+    /// bookkeeping failed. Mechanisms with no lifecycle state use this no-op.
+    fn deactivate_task(&mut self, _task: &Self::SchedItem, _reason: DeactivateReason) {}
 
     /// Picks the next task to run, it will be removed from the scheduler.
     /// Returns [`None`] if there is not runnable task.
@@ -123,7 +163,9 @@ pub trait BaseScheduler {
         reason: EnqueueReason,
     ) -> Result<(), SchedulerError> {
         match reason {
-            EnqueueReason::New | EnqueueReason::Wakeup => self.add_task(task),
+            EnqueueReason::New | EnqueueReason::Wakeup | EnqueueReason::Migrate => {
+                self.add_task(task)
+            }
             EnqueueReason::Yield => self.put_prev_task(task, false),
             EnqueueReason::Preempt => self.put_prev_task(task, true),
         }

@@ -17,7 +17,8 @@ use spin::Once;
 #[cfg(feature = "sched-cfs")]
 pub use crate::run_queue::PreparedTaskPublication;
 pub use crate::run_queue::{
-    TaskEnqueueError, TaskEnqueueErrorKind, TaskRuntimeInitError, TaskSchedError,
+    SchedulerLoadSnapshot, TaskEnqueueError, TaskEnqueueErrorKind, TaskRuntimeInitError,
+    TaskSchedError, scheduler_load_snapshot,
 };
 pub(crate) use crate::run_queue::{current_run_queue, select_run_queue};
 #[doc(cfg(all(feature = "multitask", feature = "task-ext")))]
@@ -555,8 +556,7 @@ pub fn sched_state(task: &AxTaskRef) -> SchedState {
 /// Applies the runtime scheduling state of a task.
 #[cfg(feature = "sched-cfs")]
 pub fn set_sched_state(task: &AxTaskRef, sched_state: SchedState) -> Result<(), TaskSchedError> {
-    crate::run_queue::task_run_queue::<NoPreemptIrqSave>(task)
-        .set_task_sched_state(task, sched_state)
+    crate::run_queue::set_task_sched_state_stable(task, sched_state)
 }
 
 /// Requests reclamation of exited tasks queued on the current CPU.
@@ -635,11 +635,8 @@ fn try_prepare_migration_task(migrated: &AxTaskRef) -> AxResult<AxTaskRef> {
     let migrated = Arc::downgrade(migrated);
     let task = TaskInner::try_new(
         move || {
-            if let Some(migrated) = migrated.upgrade()
-                && crate::run_queue::migrate_entry(migrated).is_err()
-            {
-                #[cfg(feature = "preempt")]
-                current().set_preempt_pending(true);
+            if let Some(migrated) = migrated.upgrade() {
+                crate::run_queue::migrate_entry(migrated);
             }
         },
         name,

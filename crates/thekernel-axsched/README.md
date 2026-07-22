@@ -108,3 +108,23 @@ strictly monotonic and never wrapped, rebased, or reused. Cancellation may leave
 a harmless gap. Once a direction reaches its finite `isize` domain, new
 admission returns `SequenceExhausted` without mutation, while reservations that
 already own earlier sequences remain committable.
+
+## Migration lifecycle and EEVDF boundary
+
+`BaseScheduler` distinguishes migration from wakeup and exposes lifecycle
+hooks for a running task that sleeps, exits, or transfers CPUs. CFS snapshots a
+fair task's vruntime relative to the source queue floor and reconstructs it
+relative to the destination floor. Failed destination admission retains that
+snapshot for rollback or retry; migration also preserves an RR task's remaining
+time slice. This is allocation-free and prevents CPU transfer from accidentally
+applying sleeper-wakeup placement.
+
+This release does **not** expose a `sched-eevdf` feature. A correct EEVDF needs
+eligible-entity selection by lag and virtual deadline, plus an allocation-free
+way to find the earliest eligible deadline. The current intrusive RB tree has
+no augmented subtree minimum, and an O(n) scan or an allocating side index
+would violate the ready-path contract. The lifecycle hooks above are a
+prerequisite, not an EEVDF claim; an opt-in implementation should arrive only
+with augmented-tree invariants, sleeper-lag tests, migration/reweight tests,
+and differential stress coverage. The repository's versioned design record
+contains the complete provenance and acceptance gates.

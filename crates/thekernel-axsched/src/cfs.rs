@@ -8,7 +8,8 @@ use core::{
 use intrusive_collections::{intrusive_adapter, Bound, KeyAdapter, RBTree, RBTreeAtomicLink};
 
 use crate::{
-    allocate_scheduler_id, BaseScheduler, EnqueueReason, SchedulerError, CONFIGURING, UNOWNED,
+    allocate_scheduler_id, BaseScheduler, DeactivateReason, EnqueueReason, SchedulerError,
+    CONFIGURING, UNOWNED,
 };
 
 /// Default tick budget assigned to a round-robin task.
@@ -132,6 +133,11 @@ pub struct CFSTask<T> {
     /// class-specific priority during a concurrent safe configuration.
     params: AtomicU32,
     rr_time_slice: AtomicIsize,
+    /// Fair vruntime relative to the source run queue's floor while a task is
+    /// between run queues. This avoids treating migration as a sleeper wakeup
+    /// and keeps the transfer allocation-free.
+    migration_vruntime_offset: AtomicIsize,
+    migration_vruntime_offset_valid: AtomicBool,
     id: AtomicIsize,
     queue_owner: AtomicUsize,
 }
@@ -192,6 +198,8 @@ impl<T> CFSTask<T> {
                 .packed(),
             ),
             rr_time_slice: AtomicIsize::new(RR_TIMESLICE_TICKS as isize),
+            migration_vruntime_offset: AtomicIsize::new(0),
+            migration_vruntime_offset_valid: AtomicBool::new(false),
             id: AtomicIsize::new(0_isize),
             queue_owner: AtomicUsize::new(UNOWNED),
         }
@@ -280,6 +288,37 @@ impl<T> CFSTask<T> {
     fn rebase_vruntime(&self, v: isize) {
         self.init_vruntime.store(v, Ordering::Release);
         self.delta.store(0, Ordering::Release);
+    }
+
+    fn stage_migration_vruntime_offset(&self, source_floor: isize) {
+        let params = self.load_sched_params();
+        if is_realtime(params) {
+            self.migration_vruntime_offset_valid
+                .store(false, Ordering::Release);
+            return;
+        }
+        let offset = self.get_vruntime_with(params).saturating_sub(source_floor);
+        self.migration_vruntime_offset
+            .store(offset, Ordering::Relaxed);
+        self.migration_vruntime_offset_valid
+            .store(true, Ordering::Release);
+    }
+
+    fn take_migration_vruntime(&self, destination_floor: isize) -> isize {
+        if self
+            .migration_vruntime_offset_valid
+            .swap(false, Ordering::AcqRel)
+        {
+            destination_floor.saturating_add(self.migration_vruntime_offset.load(Ordering::Acquire))
+        } else {
+            self.get_vruntime_with(self.load_sched_params())
+                .max(destination_floor)
+        }
+    }
+
+    fn clear_migration_vruntime_offset(&self) {
+        self.migration_vruntime_offset_valid
+            .store(false, Ordering::Release);
     }
 
     fn rr_time_slice(&self) -> isize {
@@ -501,6 +540,7 @@ enum CfsEnqueueAction {
     Wakeup,
     ExplicitYield,
     Requeue { preempt: bool },
+    Migrate,
 }
 
 /// A queue-owner claim acquired before any enqueue-side task state changes.
@@ -752,12 +792,18 @@ impl<T> CFScheduler<T> {
                     | CfsEnqueueAction::Wakeup
                     | CfsEnqueueAction::ExplicitYield
                     | CfsEnqueueAction::Requeue { .. } => (false, true),
+                    // Preserve a positive remaining RR budget across a CPU
+                    // transfer. An already exhausted budget starts a fresh
+                    // quantum after being placed at the destination tail.
+                    CfsEnqueueAction::Migrate if claim.task().rr_time_slice() > 0 => (false, false),
+                    CfsEnqueueAction::Migrate => (false, true),
                 },
                 CfsTaskClass::Normal | CfsTaskClass::Batch | CfsTaskClass::Idle => {
                     unreachable!("realtime snapshot has a fair class")
                 }
             };
             let sequence = self.next_rt_seq(front)?;
+            claim.task().clear_migration_vruntime_offset();
             if reset_rr {
                 claim.task().reset_rr_time_slice();
             }
@@ -792,9 +838,13 @@ impl<T> CFScheduler<T> {
                 claim.task().get_vruntime_with(params).max(floor)
             }
             CfsEnqueueAction::Requeue { .. } => claim.task().get_vruntime_with(params),
+            CfsEnqueueAction::Migrate => claim.task().take_migration_vruntime(self.queue_floor()),
         };
         if matches!(action, CfsEnqueueAction::New) {
             claim.task().seeded_vruntime.store(false, Ordering::Release);
+        }
+        if !matches!(action, CfsEnqueueAction::Migrate) {
+            claim.task().clear_migration_vruntime_offset();
         }
         claim.task().rebase_vruntime(vruntime);
         claim.task().stage_ready_key(1, vruntime, sequence);
@@ -982,7 +1032,7 @@ impl<T> CFScheduler<T> {
                 let previous = task.snapshot_reconfiguration_state();
                 let previous_min_vruntime = self.min_vruntime;
                 let queued = self
-                    .remove_owned_task(task, CONFIGURING)?
+                    .remove_owned_task(task, CONFIGURING, false)?
                     .ok_or(SchedulerError::InconsistentState)?;
                 queued.apply_validated(params);
                 match self.reinsert_reconfigured(queued.clone(), params) {
@@ -1000,6 +1050,7 @@ impl<T> CFScheduler<T> {
         &mut self,
         task: &Arc<CFSTask<T>>,
         next_owner: usize,
+        preserve_migration_vruntime_offset: bool,
     ) -> Result<Option<Arc<CFSTask<T>>>, SchedulerError> {
         match task.owner() {
             UNOWNED => return Ok(None),
@@ -1010,6 +1061,7 @@ impl<T> CFScheduler<T> {
             _ => {}
         }
         let key = task.ready_key();
+        let migration_floor = preserve_migration_vruntime_offset.then(|| self.queue_floor());
         let mut cursor = self.ready_queue.lower_bound_mut(Bound::Included(&key));
         loop {
             let Some(found) = cursor.get() else {
@@ -1023,7 +1075,18 @@ impl<T> CFScheduler<T> {
             }
             cursor.move_next();
         }
-        let removed = cursor.remove().ok_or(SchedulerError::InconsistentState)?;
+        if let Some(source_floor) = migration_floor {
+            task.stage_migration_vruntime_offset(source_floor);
+        }
+        let removed = match cursor.remove() {
+            Some(removed) => removed,
+            None => {
+                if preserve_migration_vruntime_offset {
+                    task.clear_migration_vruntime_offset();
+                }
+                return Err(SchedulerError::InconsistentState);
+            }
+        };
         removed.transfer_owner(self.id, next_owner)?;
         if key.0 != 0 {
             self.refresh_min_vruntime(None);
@@ -1045,7 +1108,23 @@ impl<T> BaseScheduler for CFScheduler<T> {
         &mut self,
         task: &Self::SchedItem,
     ) -> Result<Option<Self::SchedItem>, SchedulerError> {
-        self.remove_owned_task(task, UNOWNED)
+        self.remove_owned_task(task, UNOWNED, false)
+    }
+
+    fn remove_task_for_migration(
+        &mut self,
+        task: &Self::SchedItem,
+    ) -> Result<Option<Self::SchedItem>, SchedulerError> {
+        self.remove_owned_task(task, UNOWNED, true)
+    }
+
+    fn deactivate_task(&mut self, task: &Self::SchedItem, reason: DeactivateReason) {
+        match reason {
+            DeactivateReason::Migrate => task.stage_migration_vruntime_offset(self.queue_floor()),
+            DeactivateReason::Sleep | DeactivateReason::Exit => {
+                task.clear_migration_vruntime_offset()
+            }
+        }
     }
 
     fn pick_next_task(&mut self) -> Option<Self::SchedItem> {
@@ -1082,6 +1161,7 @@ impl<T> BaseScheduler for CFScheduler<T> {
             EnqueueReason::Wakeup => CfsEnqueueAction::Wakeup,
             EnqueueReason::Yield => CfsEnqueueAction::ExplicitYield,
             EnqueueReason::Preempt => CfsEnqueueAction::Requeue { preempt: true },
+            EnqueueReason::Migrate => CfsEnqueueAction::Migrate,
         };
         self.enqueue_with_action(task, action)
     }
@@ -1493,5 +1573,170 @@ mod sequence_tests {
 
         assert!(Arc::ptr_eq(&scheduler.pick_next_task().unwrap(), &first));
         assert!(Arc::ptr_eq(&scheduler.pick_next_task().unwrap(), &reserved));
+    }
+
+    #[test]
+    fn ready_migration_preserves_vruntime_offset_at_destination_floor() {
+        let mut source = CFScheduler::new();
+        let migrating = Arc::new(CFSTask::new("migrating"));
+        let source_peer = Arc::new(CFSTask::new("source-peer"));
+
+        source.add_task(migrating.clone()).unwrap();
+        let running = source.pick_next_task().unwrap();
+        for _ in 0..10 {
+            assert!(!source.task_tick(&running));
+        }
+        source.put_prev_task(running, false).unwrap();
+        source.add_task(source_peer).unwrap();
+
+        let running = source.pick_next_task().unwrap();
+        assert!(Arc::ptr_eq(&running, &migrating));
+        for _ in 0..5 {
+            let _ = source.task_tick(&running);
+        }
+        source.put_prev_task(running, false).unwrap();
+        assert_eq!(source.queue_floor(), 10);
+
+        let migrated = source
+            .remove_task_for_migration(&migrating)
+            .unwrap()
+            .unwrap();
+        assert!(migrating
+            .migration_vruntime_offset_valid
+            .load(Ordering::Acquire));
+
+        let mut destination = CFScheduler::new();
+        let destination_peer = Arc::new(CFSTask::new("destination-peer"));
+        destination.add_task(destination_peer.clone()).unwrap();
+        let running = destination.pick_next_task().unwrap();
+        for _ in 0..100 {
+            assert!(!destination.task_tick(&running));
+        }
+        destination.put_prev_task(running, false).unwrap();
+        assert_eq!(destination.queue_floor(), 100);
+
+        destination
+            .enqueue_task(migrated, EnqueueReason::Migrate)
+            .unwrap();
+        assert_eq!(migrating.ready_key().1, 105);
+        assert!(!migrating
+            .migration_vruntime_offset_valid
+            .load(Ordering::Acquire));
+        assert!(Arc::ptr_eq(
+            &destination.pick_next_task().unwrap(),
+            &destination_peer
+        ));
+        assert!(Arc::ptr_eq(
+            &destination.pick_next_task().unwrap(),
+            &migrating
+        ));
+    }
+
+    #[test]
+    fn failed_migration_enqueue_retains_rebase_state_for_retry() {
+        let mut source = CFScheduler::new();
+        let migrating = Arc::new(CFSTask::new(()));
+        source.add_task(migrating.clone()).unwrap();
+        let migrated = source
+            .remove_task_for_migration(&migrating)
+            .unwrap()
+            .unwrap();
+
+        let mut exhausted = CFScheduler::new();
+        exhausted.fair_sequence = isize::MAX;
+        assert_eq!(
+            exhausted.enqueue_task(migrated.clone(), EnqueueReason::Migrate),
+            Err(SchedulerError::SequenceExhausted)
+        );
+        assert!(migrating
+            .migration_vruntime_offset_valid
+            .load(Ordering::Acquire));
+
+        let mut retry = CFScheduler::new();
+        retry
+            .enqueue_task(migrated, EnqueueReason::Migrate)
+            .unwrap();
+        assert!(!migrating
+            .migration_vruntime_offset_valid
+            .load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn rr_migration_retry_preserves_positive_remaining_slice() {
+        let mut source = CFScheduler::new();
+        let migrating = Arc::new(CFSTask::new("migrating"));
+        let peer = Arc::new(CFSTask::new("peer"));
+        for task in [&migrating, &peer] {
+            task.configure(rr_params(42)).unwrap();
+            source.add_task(task.clone()).unwrap();
+        }
+
+        let running = source.pick_next_task().unwrap();
+        assert!(Arc::ptr_eq(&running, &migrating));
+        for _ in 0..RR_TIMESLICE_TICKS - 2 {
+            assert!(!source.task_tick(&running));
+        }
+        source.put_prev_task(running, true).unwrap();
+        assert_eq!(migrating.rr_time_slice(), 2);
+
+        let migrated = source
+            .remove_task_for_migration(&migrating)
+            .unwrap()
+            .unwrap();
+        assert_eq!(migrating.owner(), UNOWNED);
+        assert_eq!(migrating.rr_time_slice(), 2);
+
+        let mut exhausted = CFScheduler::new();
+        exhausted.rt_back_seq = isize::MAX;
+        let before = migrating.snapshot_reconfiguration_state();
+        assert_eq!(
+            exhausted.enqueue_task(migrated.clone(), EnqueueReason::Migrate),
+            Err(SchedulerError::SequenceExhausted)
+        );
+        assert_eq!(migrating.snapshot_reconfiguration_state(), before);
+        assert_eq!(migrating.owner(), UNOWNED);
+
+        source
+            .enqueue_task(migrated, EnqueueReason::Migrate)
+            .unwrap();
+        assert_eq!(migrating.rr_time_slice(), 2);
+        assert_eq!(migrating.owner(), source.id);
+    }
+
+    #[test]
+    fn rr_migration_resets_an_exhausted_slice_at_destination_tail() {
+        let mut source = CFScheduler::new();
+        let migrating = Arc::new(CFSTask::new(()));
+        migrating.configure(rr_params(42)).unwrap();
+        source.add_task(migrating.clone()).unwrap();
+        let migrated = source
+            .remove_task_for_migration(&migrating)
+            .unwrap()
+            .unwrap();
+        migrating.rr_time_slice.store(0, Ordering::Release);
+
+        let mut destination = CFScheduler::new();
+        destination
+            .enqueue_task(migrated, EnqueueReason::Migrate)
+            .unwrap();
+
+        assert_eq!(migrating.rr_time_slice(), RR_TIMESLICE_TICKS as isize);
+        assert_eq!(migrating.owner(), destination.id);
+    }
+
+    #[test]
+    fn running_migration_and_sleep_have_distinct_lifecycle_state() {
+        let mut source = CFScheduler::new();
+        let task = Arc::new(CFSTask::new(()));
+        source.add_task(task.clone()).unwrap();
+        let running = source.pick_next_task().unwrap();
+        for _ in 0..7 {
+            assert!(!source.task_tick(&running));
+        }
+
+        source.deactivate_task(&running, DeactivateReason::Migrate);
+        assert!(task.migration_vruntime_offset_valid.load(Ordering::Acquire));
+        source.deactivate_task(&running, DeactivateReason::Sleep);
+        assert!(!task.migration_vruntime_offset_valid.load(Ordering::Acquire));
     }
 }

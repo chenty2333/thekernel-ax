@@ -76,6 +76,24 @@ selected affinity transaction; a concurrent affinity update receives
 `ResourceBusy` and leaves the old mask unchanged until the token is committed
 or cancelled.
 
+SMP initial placement now scans the finite configured CPU set once, filters by
+affinity and initialized run queues, and chooses the smallest advisory
+`ready + running` load. Equal loads use a rotated deterministic tie-break.
+Blocking remains source-local whenever the current initialized CPU is still
+affinity-allowed. Only a task whose source CPU has become disallowed uses the
+bounded load-aware selector to choose an initialized allowed wake owner. A
+racing wake that aborts the block restores the actual current CPU. Raw wake
+publication remains pinned to that previously committed owner, preserving its
+scheduler-lock serialization with parameter updates instead of selecting a new
+CPU inside a raw-waker path.
+
+`scheduler_load_snapshot` exposes the lock-free per-CPU ready/running
+observation used by placement. It is advisory and may straddle a concurrent
+context switch; queue ownership, task state, and affinity remain authoritative.
+Idle stealing is intentionally absent: safe stealing still needs a bounded
+remote-ready transfer policy, cache-hotness/imbalance thresholds, and stress
+coverage for affinity and context-switch handoff races.
+
 `WaitQueue::wait_timeout_until_interruptible` uses one complete deadline rather
 than hidden short-slice polling. It returns condition versus timeout explicitly
 and preserves separate block-session, interruption, and bounded timer-admission

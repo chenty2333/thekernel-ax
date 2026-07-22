@@ -6,7 +6,7 @@ use core::{
 
 use linked_list_r4l::{GetLinks, Links, List};
 
-use crate::{allocate_scheduler_id, BaseScheduler, SchedulerError, UNOWNED};
+use crate::{allocate_scheduler_id, BaseScheduler, EnqueueReason, SchedulerError, UNOWNED};
 
 /// A task wrapper for the [`RRScheduler`].
 pub struct RRTask<T, const MAX_TIME_SLICE: usize> {
@@ -195,6 +195,26 @@ impl<T, const S: usize> BaseScheduler for RRScheduler<T, S> {
         Ok(())
     }
 
+    fn enqueue_task(
+        &mut self,
+        task: Self::SchedItem,
+        reason: EnqueueReason,
+    ) -> Result<(), SchedulerError> {
+        match reason {
+            EnqueueReason::New | EnqueueReason::Wakeup => self.add_task(task),
+            EnqueueReason::Yield => self.put_prev_task(task, false),
+            EnqueueReason::Preempt => self.put_prev_task(task, true),
+            EnqueueReason::Migrate => {
+                self.claim(&task)?;
+                if task.time_slice() == 0 {
+                    task.reset_time_slice();
+                }
+                self.ready_queue.push_back(task);
+                Ok(())
+            }
+        }
+    }
+
     fn task_tick(&mut self, current: &Self::SchedItem) -> bool {
         let old_slice = current
             .time_slice
@@ -225,5 +245,47 @@ impl<T, const S: usize> Drop for RRScheduler<T, S> {
         while let Some(task) = self.ready_queue.pop_front() {
             task.release(self.id);
         }
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    #[test]
+    fn migration_preserves_positive_remaining_slice() {
+        let mut source = RRScheduler::<_, 5>::new();
+        let task = Arc::new(RRTask::new(()));
+        source.add_task(task.clone()).unwrap();
+        let running = source.pick_next_task().unwrap();
+        assert!(!source.task_tick(&running));
+        assert!(!source.task_tick(&running));
+        source.put_prev_task(running, true).unwrap();
+        let migrated = source.remove_task_for_migration(&task).unwrap().unwrap();
+
+        let mut destination = RRScheduler::new();
+        destination
+            .enqueue_task(migrated, EnqueueReason::Migrate)
+            .unwrap();
+
+        assert_eq!(task.time_slice(), 3);
+        assert_eq!(task.owner(), destination.id);
+    }
+
+    #[test]
+    fn migration_resets_an_exhausted_slice_at_destination_tail() {
+        let mut source = RRScheduler::<_, 5>::new();
+        let task = Arc::new(RRTask::new(()));
+        source.add_task(task.clone()).unwrap();
+        let migrated = source.remove_task_for_migration(&task).unwrap().unwrap();
+        task.time_slice.store(0, Ordering::Release);
+
+        let mut destination = RRScheduler::new();
+        destination
+            .enqueue_task(migrated, EnqueueReason::Migrate)
+            .unwrap();
+
+        assert_eq!(task.time_slice(), 5);
+        assert_eq!(task.owner(), destination.id);
     }
 }

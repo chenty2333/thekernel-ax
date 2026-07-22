@@ -22,6 +22,15 @@
   compatible with typed task-creation OOM.
 - Reject affinity masks that contain no initialized run queue and exclude
   possible-but-offline CPUs from runnable-task publication.
+- Replace initial round-robin CPU placement with a bounded load-aware scan that
+  respects affinity and initialized queues, and publish advisory per-CPU
+  ready/running snapshots for diagnostics.
+- Keep an ordinary blocking task's next wake on its affinity-allowed source
+  CPU. Only an affinity-excluded source performs one bounded load-aware scan
+  of initialized allowed CPUs; raw wake publication stays pinned to that
+  committed owner.
+- Preserve scheduler migration lifecycle and queue-relative fair vruntime for
+  both ready-task and running-task affinity transfers.
 - Add a single-deadline interruptible conditional wait, with typed block,
   interrupt, timer-admission, condition, and timeout outcomes and no slice
   polling.

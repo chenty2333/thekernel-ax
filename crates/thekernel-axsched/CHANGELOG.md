@@ -22,5 +22,9 @@
   slices.
 - Keep fair and real-time ordering sequences monotonic and non-reusable; report
   exhaustion explicitly while preserving already-issued reservation tickets.
+- Distinguish migration from wakeup, expose current-task deactivate lifecycle
+  hooks, and preserve fair relative vruntime plus RR budget across run queues.
+- Retain migration rebase state across failed destination admission so a retry
+  or source rollback does not silently become a sleeper wakeup.
 - Add cross-scheduler, teardown, overflow, lifecycle, class, priority, and
   ordering tests for `no_std` consumers.
