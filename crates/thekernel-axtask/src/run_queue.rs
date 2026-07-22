@@ -625,22 +625,35 @@ impl PreparedTaskPublication {
         // can re-enter `scheduler_timer_tick()` and spin forever on this raw
         // scheduler lock while publication is refreshing CFS state.
         let _guard = kernel_guard::NoPreemptIrqSave::new();
-        let publication = {
+        let (publication, publication_claim_corrupt) = {
             let mut scheduler = self.run_queue.scheduler.lock();
             let result = scheduler.commit_reserved_task(reservation);
-            if result.is_ok() {
+            let mut publication_claim_corrupt = false;
+            if let Ok(task) = &result {
+                if !task.release_publication_mutation() {
+                    publication_claim_corrupt = true;
+                }
                 // Publish the advisory count before releasing the same lock
-                // that makes the task selectable. Otherwise the owner CPU can
-                // dequeue first and underflow the counter.
+                // that makes the task selectable. The publication mutation is
+                // also cleared under this lock: after unlock the task may run
+                // and begin blocking immediately, so a later clear would be
+                // the same ABA window as delayed wake completion.
                 self.run_queue.load.ready_enqueued();
             }
-            result
+            (result, publication_claim_corrupt)
         };
+        if publication_claim_corrupt {
+            let task = publication
+                .as_ref()
+                .expect("only successful publication clears its mutation claim");
+            error!(
+                "published task {} retained its new-task mutation claim",
+                task.id().as_u64()
+            );
+            axhal::power::system_off();
+        }
         match publication {
-            Ok(task) => {
-                task.release_publication_mutation();
-                task
-            }
+            Ok(task) => task,
             Err(error) => {
                 let kind = error.kind();
                 let reservation = error.into_reservation();
@@ -1476,10 +1489,52 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
             BlockWaitClaim::Claimed => {}
         }
 
+        // Affinity publication and a previous wake completion must not cross
+        // the mask -> wake-owner -> Blocked transaction. Do not spin from this
+        // IRQ/preemption-disabled boundary: publish one spurious wake while we
+        // still own BLOCK_WAIT_OWNER, consume it ourselves, and let block_on
+        // repoll after the competing bounded transaction releases.
+        match curr.try_begin_block_mutation() {
+            crate::task::BlockMutationClaim::Claimed => {}
+            crate::task::BlockMutationClaim::Busy => {
+                if !matches!(
+                    curr.mark_block_woken(),
+                    crate::task::BlockWakeAction::BlockOwnerWillConsume
+                ) {
+                    curr.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+                    error!(
+                        "task {} could not abort a contended block publication",
+                        curr.id().as_u64()
+                    );
+                    axhal::power::system_off();
+                }
+                return match curr.commit_block_wait(token) {
+                    BlockWaitCommit::Woken => BlockReschedOutcome::Woken,
+                    BlockWaitCommit::Stale => BlockReschedOutcome::StateLost,
+                    BlockWaitCommit::Blocked => {
+                        curr.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+                        error!(
+                            "task {} committed Blocked after aborting block publication",
+                            curr.id().as_u64()
+                        );
+                        axhal::power::system_off();
+                    }
+                };
+            }
+            crate::task::BlockMutationClaim::Corrupt => {
+                curr.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+                error!(
+                    "task {} began blocking with corrupt mutation ownership",
+                    curr.id().as_u64()
+                );
+                axhal::power::system_off();
+            }
+        }
+
         // Serialize cpu_id publication with parameter updaters that may have
         // sampled this source CPU. BLOCK_WAIT_OWNER keeps a racing raw waker
         // from taking either scheduler lock until this transaction commits.
-        let commit = {
+        let (commit, mutation_completion) = {
             let mut scheduler = self.inner.scheduler.lock();
             #[cfg(feature = "smp")]
             let wake_cpu = {
@@ -1503,8 +1558,27 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
                     curr.set_cpu_id(self.inner.cpu_id as _);
                 }
             }
-            commit
+            (commit, curr.finish_block_mutation())
         };
+
+        match mutation_completion {
+            crate::task::BlockMutationCompletion::Released => {}
+            crate::task::BlockMutationCompletion::WakeClaimed => {
+                // A waker arrived after BLOCK_WAIT_OWNER was released but
+                // before this block publisher relinquished its transaction.
+                // The source scheduler lock is gone; complete the inherited
+                // wake through the same frozen-owner path as an ordinary raw
+                // waker.
+                crate::future::wake_task_claimed(curr);
+            }
+            crate::task::BlockMutationCompletion::Corrupt => {
+                error!(
+                    "task {} block/wake mutation ownership is corrupt",
+                    curr.id().as_u64()
+                );
+                axhal::power::system_off();
+            }
+        }
 
         match commit {
             BlockWaitCommit::Blocked => {
@@ -1539,16 +1613,32 @@ impl AxRunQueue {
         // before taking the scheduler lock and lets the caller retry or report
         // the exact task after the lock is released.
         let scheduler_task = task.clone();
-        let result = {
+        let (result, wake_claim_corrupt) = {
             let mut scheduler = self.scheduler.lock();
             let result = scheduler.enqueue_task(scheduler_task, reason);
+            let mut wake_claim_corrupt = false;
             if result.is_ok() {
+                if matches!(reason, EnqueueReason::Wakeup) && !task.finish_wake_mutation() {
+                    // Clear the exact wake owner while the target scheduler is
+                    // still locked. Once this lock is released the task may run
+                    // and begin another block session, so a later clear would
+                    // be an ABA bug that could consume the new session's owner.
+                    wake_claim_corrupt = true;
+                }
                 // Keep queue publication and its observable count atomic with
                 // respect to the owner CPU's dequeue path.
                 self.load.ready_enqueued();
             }
-            result
+            (result, wake_claim_corrupt)
         };
+        if wake_claim_corrupt {
+            error!(
+                "task {} entered run queue {} without an exact wake claim",
+                task.id().as_u64(),
+                self.cpu_id
+            );
+            axhal::power::system_off();
+        }
         match result {
             Ok(()) => Ok(()),
             Err(error) => Err(TaskEnqueueError {
@@ -2099,8 +2189,16 @@ pub(crate) unsafe fn clear_prev_task_on_cpu() {
             };
             if let Err(error) = result {
                 contain_enqueue_failure(&error, TaskState::Blocked);
-                #[cfg(feature = "preempt")]
-                crate::current().set_preempt_pending(true);
+                error!(
+                    "old-CPU delegated wake publication failed for task {}: {:?}",
+                    error.task.id().as_u64(),
+                    error.kind
+                );
+                // A valid deferred wake is allocation/capacity-free. Returning
+                // here would leave BLOCK_WAIT_WOKEN with no enqueue owner and
+                // a permanently claimed mutation, so internal failure is
+                // fail-stop until a preallocated retry owner exists.
+                axhal::power::system_off();
             }
         }
         CpuHandoffCompletion::MissingWake => {
@@ -2109,6 +2207,7 @@ pub(crate) unsafe fn clear_prev_task_on_cpu() {
                 "CPU handoff for task {} lost its owned wake token",
                 previous.id().as_u64()
             );
+            axhal::power::system_off();
         }
     }
 }
@@ -2227,6 +2326,71 @@ mod exited_queue_tests {
         );
         load.ready_dequeued();
         assert_eq!(load.snapshot().runnable_tasks(), 2);
+    }
+
+    #[test]
+    fn wake_enqueue_clears_the_exact_claim_before_target_unlock() {
+        let task = task("claimed-wake-enqueue");
+        task.set_state(TaskState::Ready);
+        assert_eq!(
+            task.claim_wake_mutation(),
+            crate::task::WakeMutationClaim::Claimed
+        );
+        let run_queue = AxRunQueue {
+            cpu_id: 0,
+            scheduler: SpinRaw::new(Scheduler::new()),
+            load: RunQueueLoad::new(0, false),
+        };
+
+        run_queue
+            .enqueue_task(task.clone(), EnqueueReason::Wakeup)
+            .unwrap();
+        assert!(
+            task.try_begin_affinity_mutation(),
+            "returning from enqueue proves the scheduler-lock completion released WAKE"
+        );
+        assert_eq!(
+            task.finish_affinity_mutation(),
+            crate::task::AffinityMutationCompletion::Released
+        );
+    }
+
+    #[cfg(feature = "smp")]
+    #[test]
+    fn deferred_handoff_uses_the_same_target_locked_wake_completion() {
+        let task = task("claimed-deferred-enqueue");
+        task.set_state(TaskState::Ready);
+        assert_eq!(
+            task.claim_wake_mutation(),
+            crate::task::WakeMutationClaim::Claimed
+        );
+        assert!(matches!(
+            task.publish_wake_handoff(task.clone()),
+            crate::task::WakeHandoffPublication::Deferred
+        ));
+        let owned = match task.finish_cpu_handoff() {
+            CpuHandoffCompletion::Wake(owned) => owned,
+            CpuHandoffCompletion::Cleared
+            | CpuHandoffCompletion::AlreadyCleared
+            | CpuHandoffCompletion::MissingWake => {
+                panic!("old CPU lost the claimed deferred wake")
+            }
+        };
+        assert!(!task.try_begin_affinity_mutation());
+
+        let run_queue = AxRunQueue {
+            cpu_id: 0,
+            scheduler: SpinRaw::new(Scheduler::new()),
+            load: RunQueueLoad::new(0, false),
+        };
+        run_queue
+            .enqueue_task(owned, EnqueueReason::Wakeup)
+            .unwrap();
+        assert!(task.try_begin_affinity_mutation());
+        assert_eq!(
+            task.finish_affinity_mutation(),
+            crate::task::AffinityMutationCompletion::Released
+        );
     }
 
     #[test]

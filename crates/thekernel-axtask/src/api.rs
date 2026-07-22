@@ -658,14 +658,33 @@ struct AffinityMutation<'a>(&'a AxTaskRef);
 impl<'a> AffinityMutation<'a> {
     fn try_begin(task: &'a AxTaskRef) -> AxResult<Self> {
         task.try_begin_affinity_mutation()
-            .then_some(Self(task))
+            // `then_some(Self(task))` would eagerly construct and immediately
+            // drop a guard on the busy path, falsely releasing another
+            // publication owner's mutation state.
+            .then(|| Self(task))
             .ok_or(AxError::ResourceBusy)
     }
 }
 
 impl Drop for AffinityMutation<'_> {
     fn drop(&mut self) {
-        self.0.finish_affinity_mutation();
+        match self.0.finish_affinity_mutation() {
+            crate::task::AffinityMutationCompletion::Released => {}
+            crate::task::AffinityMutationCompletion::WakeClaimed => {
+                // The affinity owner inherited a raw-waker obligation. All
+                // affinity/runqueue temporaries created by the syscall-facing
+                // operation have been released before this guard is dropped,
+                // so the claimed wake can publish without nested queue locks.
+                crate::future::wake_task_claimed(self.0);
+            }
+            crate::task::AffinityMutationCompletion::Corrupt => {
+                error!(
+                    "task {} affinity/wake mutation ownership is corrupt",
+                    self.0.id().as_u64()
+                );
+                axhal::power::system_off();
+            }
+        }
     }
 }
 

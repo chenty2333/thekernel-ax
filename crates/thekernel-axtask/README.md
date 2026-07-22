@@ -83,9 +83,22 @@ Blocking remains source-local whenever the current initialized CPU is still
 affinity-allowed. Only a task whose source CPU has become disallowed uses the
 bounded load-aware selector to choose an initialized allowed wake owner. A
 racing wake that aborts the block restores the actual current CPU. Raw wake
-publication remains pinned to that previously committed owner, preserving its
-scheduler-lock serialization with parameter updates instead of selecting a new
-CPU inside a raw-waker path.
+publication remains pinned to that previously committed owner instead of
+selecting a new CPU inside a raw-waker path.
+
+Affinity, Running-to-Blocked owner publication, and Blocked-to-runnable wake
+publication share one bounded per-task transaction. A raw waker either claims
+the exact publication, delegates it to an active affinity/block owner, or sees
+an existing owner; it never spins on helper allocation or takes two runqueue
+locks. A block attempt which meets another publication owner converts that
+iteration into a spurious wake and repolls in task context. While a wake is
+claimed, affinity updates return `ResourceBusy`, freezing the allowed target
+through the Ready-before-enqueue and old-CPU handoff windows. Immediate and
+deferred wakes both clear the exact claim under the target scheduler lock after
+linking and before the task becomes selectable. Since valid wake publication is
+capacity-free after scheduler initialization, an impossible enqueue rejection
+or missing handoff owner is fail-stop rather than leaving
+`Blocked + WOKEN` without an enqueue obligation.
 
 `scheduler_load_snapshot` exposes the lock-free per-CPU ready/running
 observation used by placement. It is advisory and may straddle a concurrent
@@ -114,3 +127,7 @@ Failure returns `TaskEnqueueError`, which owns the exact unpublished task throug
 cancels it; `cancel()` also returns a task owner. `publish_prepared_task` consumes
 an exact reservation and performs only allocation-free final linking, so the
 safe axtask adapter has no recoverable failure after external state is committed.
+The successful commit clears its task-level publication claim under the same
+target scheduler lock after linking and before the task becomes selectable;
+this prevents a newly running task from observing its own stale reservation
+when it immediately blocks.

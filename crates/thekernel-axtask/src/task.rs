@@ -33,9 +33,15 @@ pub struct TaskId(u64);
 pub const MIN_KERNEL_STACK_SIZE: usize = 16 * 1024;
 
 const TASK_MUTATION_IDLE: u8 = 0;
+const TASK_MUTATION_AFFINITY: u8 = 1;
+const TASK_MUTATION_BLOCK: u8 = 2;
+const TASK_MUTATION_WAKE: u8 = 4;
+const TASK_MUTATION_AFFINITY_WAKE_PENDING: u8 = 5;
+const TASK_MUTATION_BLOCK_WAKE_PENDING: u8 = 6;
+// Include TASK_MUTATION_WAKE so a wait-free wake `fetch_or` leaves an
+// impossible new-task-publication race byte-for-byte unchanged.
 #[cfg(feature = "sched-cfs")]
-const TASK_MUTATION_PUBLICATION: u8 = 1;
-const TASK_MUTATION_AFFINITY: u8 = 2;
+const TASK_MUTATION_PUBLICATION: u8 = 12;
 
 /// Failure while constructing an unpublished task.
 ///
@@ -474,6 +480,56 @@ pub(crate) enum MigrationClaim {
     Missing,
 }
 
+/// Result of claiming the one runnable-publication obligation created by a
+/// raw blocked-task wake.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum WakeMutationClaim {
+    /// This waker owns the complete Blocked -> runnable publication.
+    Claimed,
+    /// An affinity transaction will inherit the publication when it releases.
+    DeferredToAffinity,
+    /// The block publisher will inherit the publication after committing the
+    /// Blocked state and releasing its source runqueue lock.
+    DeferredToBlock,
+    /// Another waker or the affinity owner already owns the publication.
+    AlreadyOwned,
+    /// Wake publication raced an incompatible or corrupt mutation owner.
+    Corrupt,
+}
+
+/// Result of releasing one affinity transaction.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum AffinityMutationCompletion {
+    /// No wake arrived while affinity ownership was held.
+    Released,
+    /// A waker delegated its runnable-publication obligation to this owner.
+    WakeClaimed,
+    /// The task mutation word did not contain a valid affinity-owned state.
+    Corrupt,
+}
+
+/// Result of releasing one Running -> Blocked publication transaction.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum BlockMutationCompletion {
+    /// No post-commit wake arrived while block publication was owned.
+    Released,
+    /// A post-commit waker delegated its runnable-publication obligation.
+    WakeClaimed,
+    /// The task mutation word did not contain a valid block-owned state.
+    Corrupt,
+}
+
+/// Result of trying to own one current-task Blocked publication.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum BlockMutationClaim {
+    /// This caller owns the complete mask/CPU/state block transaction.
+    Claimed,
+    /// A valid affinity or wake publication is active; abort and repoll.
+    Busy,
+    /// A current task was already owned by an impossible mutation domain.
+    Corrupt,
+}
+
 /// User-defined task extended data.
 #[cfg(feature = "task-ext")]
 #[extern_trait::extern_trait(
@@ -506,9 +562,12 @@ pub struct TaskInner {
     entry: Cell<Option<Box<dyn FnOnce()>>>,
     state: AtomicU8,
 
-    /// Serializes an unpublished runnable-publication reservation against an
-    /// affinity update. The reservation fixes a destination run queue, so a
-    /// concurrently published mask must not be allowed to exclude that CPU.
+    /// Serializes new-task, affinity, block-owner, and wake publication. A raw
+    /// waker performs only a bounded sequence of exact state transitions: it
+    /// either owns `WAKE`, delegates to an active affinity/block transaction,
+    /// or observes an existing wake owner. Thus affinity and the committed
+    /// blocked CPU cannot change across Ready-before-enqueue or deferred CPU
+    /// handoff windows.
     /// Other task state remains protected by its existing scheduler/field
     /// ownership domains rather than by this narrow transaction word.
     mutation: AtomicU8,
@@ -856,7 +915,7 @@ impl TaskInner {
     }
 
     #[cfg(feature = "sched-cfs")]
-    pub(crate) fn release_publication_mutation(&self) {
+    pub(crate) fn release_publication_mutation(&self) -> bool {
         if self
             .mutation
             .compare_exchange(
@@ -865,9 +924,12 @@ impl TaskInner {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .is_err()
+            .is_ok()
         {
+            true
+        } else {
             self.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+            false
         }
     }
 
@@ -882,18 +944,129 @@ impl TaskInner {
             .is_ok()
     }
 
-    pub(crate) fn finish_affinity_mutation(&self) {
+    pub(crate) fn finish_affinity_mutation(&self) -> AffinityMutationCompletion {
+        match self.mutation.compare_exchange(
+            TASK_MUTATION_AFFINITY,
+            TASK_MUTATION_IDLE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => AffinityMutationCompletion::Released,
+            Err(TASK_MUTATION_AFFINITY_WAKE_PENDING) => {
+                if self
+                    .mutation
+                    .compare_exchange(
+                        TASK_MUTATION_AFFINITY_WAKE_PENDING,
+                        TASK_MUTATION_WAKE,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    AffinityMutationCompletion::WakeClaimed
+                } else {
+                    self.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+                    AffinityMutationCompletion::Corrupt
+                }
+            }
+            Err(_) => {
+                self.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+                AffinityMutationCompletion::Corrupt
+            }
+        }
+    }
+
+    /// Claims the mask/owner/state transaction which publishes this current
+    /// task as Blocked. Failure is non-blocking: the block owner must turn this
+    /// iteration into a spurious wake and retry from ordinary task context.
+    pub(crate) fn try_begin_block_mutation(&self) -> BlockMutationClaim {
+        match self.mutation.compare_exchange(
+            TASK_MUTATION_IDLE,
+            TASK_MUTATION_BLOCK,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => BlockMutationClaim::Claimed,
+            Err(
+                TASK_MUTATION_AFFINITY | TASK_MUTATION_WAKE | TASK_MUTATION_AFFINITY_WAKE_PENDING,
+            ) => BlockMutationClaim::Busy,
+            Err(_) => {
+                self.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+                BlockMutationClaim::Corrupt
+            }
+        }
+    }
+
+    pub(crate) fn finish_block_mutation(&self) -> BlockMutationCompletion {
+        match self.mutation.compare_exchange(
+            TASK_MUTATION_BLOCK,
+            TASK_MUTATION_IDLE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => BlockMutationCompletion::Released,
+            Err(TASK_MUTATION_BLOCK_WAKE_PENDING) => {
+                if self
+                    .mutation
+                    .compare_exchange(
+                        TASK_MUTATION_BLOCK_WAKE_PENDING,
+                        TASK_MUTATION_WAKE,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    BlockMutationCompletion::WakeClaimed
+                } else {
+                    self.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+                    BlockMutationCompletion::Corrupt
+                }
+            }
+            Err(_) => {
+                self.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+                BlockMutationCompletion::Corrupt
+            }
+        }
+    }
+
+    /// Claims or delegates one raw-waker runnable-publication obligation.
+    ///
+    /// One wait-free `fetch_or` is the complete arbitration step. If affinity
+    /// or block publication owns the task, the corresponding pending state
+    /// transfers the obligation without spinning on that owner. The reserved
+    /// new-task publication value already contains the wake bit, so even the
+    /// impossible case remains unmodified before fail-stop containment.
+    pub(crate) fn claim_wake_mutation(&self) -> WakeMutationClaim {
+        match self.mutation.fetch_or(TASK_MUTATION_WAKE, Ordering::AcqRel) {
+            TASK_MUTATION_IDLE => WakeMutationClaim::Claimed,
+            TASK_MUTATION_AFFINITY => WakeMutationClaim::DeferredToAffinity,
+            TASK_MUTATION_BLOCK => WakeMutationClaim::DeferredToBlock,
+            TASK_MUTATION_WAKE
+            | TASK_MUTATION_AFFINITY_WAKE_PENDING
+            | TASK_MUTATION_BLOCK_WAKE_PENDING => WakeMutationClaim::AlreadyOwned,
+            _ => {
+                self.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+                WakeMutationClaim::Corrupt
+            }
+        }
+    }
+
+    /// Releases a completed immediate or old-CPU-deferred wake publication.
+    pub(crate) fn finish_wake_mutation(&self) -> bool {
         if self
             .mutation
             .compare_exchange(
-                TASK_MUTATION_AFFINITY,
+                TASK_MUTATION_WAKE,
                 TASK_MUTATION_IDLE,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .is_err()
+            .is_ok()
         {
+            true
+        } else {
             self.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+            false
         }
     }
 
@@ -1898,6 +2071,89 @@ mod mechanism_tests {
     }
 
     #[test]
+    fn affinity_owner_inherits_a_racing_wake_without_an_old_owner_window() {
+        let task = TaskInner::new_init("affinity-wake-handoff".into()).unwrap();
+        task.set_state(TaskState::Blocked);
+        #[cfg(feature = "smp")]
+        task.set_cpu_id(0);
+
+        assert!(task.try_begin_affinity_mutation());
+        assert_eq!(
+            task.claim_wake_mutation(),
+            WakeMutationClaim::DeferredToAffinity
+        );
+
+        // Model the affinity owner's final Blocked-task redirect after a waker
+        // sampled the old owner. The waker cannot act on that stale sample: its
+        // exact obligation is transferred only after the new owner is visible.
+        #[cfg(feature = "smp")]
+        task.set_cpu_id(1);
+        assert_eq!(
+            task.finish_affinity_mutation(),
+            AffinityMutationCompletion::WakeClaimed
+        );
+        #[cfg(feature = "smp")]
+        assert_eq!(task.cpu_id(), 1);
+        assert_eq!(task.claim_wake_mutation(), WakeMutationClaim::AlreadyOwned);
+        assert!(task.finish_wake_mutation());
+    }
+
+    #[test]
+    fn wake_owner_excludes_affinity_until_exact_completion() {
+        let task = TaskInner::new_init("wake-before-affinity".into()).unwrap();
+        assert_eq!(task.claim_wake_mutation(), WakeMutationClaim::Claimed);
+        assert!(!task.try_begin_affinity_mutation());
+        assert_eq!(task.claim_wake_mutation(), WakeMutationClaim::AlreadyOwned);
+
+        assert!(task.finish_wake_mutation());
+        assert!(task.try_begin_affinity_mutation());
+        assert_eq!(
+            task.finish_affinity_mutation(),
+            AffinityMutationCompletion::Released
+        );
+    }
+
+    #[test]
+    fn block_owner_inherits_only_a_post_commit_wake() {
+        let task = TaskInner::new_init("block-wake-handoff".into()).unwrap();
+        assert_eq!(task.try_begin_block_mutation(), BlockMutationClaim::Claimed);
+        assert_eq!(
+            task.claim_wake_mutation(),
+            WakeMutationClaim::DeferredToBlock
+        );
+        assert_eq!(
+            task.finish_block_mutation(),
+            BlockMutationCompletion::WakeClaimed
+        );
+        assert_eq!(task.try_begin_block_mutation(), BlockMutationClaim::Busy);
+        assert!(task.finish_wake_mutation());
+        assert_eq!(task.try_begin_block_mutation(), BlockMutationClaim::Claimed);
+        assert_eq!(
+            task.finish_block_mutation(),
+            BlockMutationCompletion::Released
+        );
+    }
+
+    #[cfg(feature = "sched-cfs")]
+    #[test]
+    fn wake_claim_does_not_modify_an_unpublished_task_reservation() {
+        let task = TaskInner::new_init("publication-wake-isolation".into()).unwrap();
+        assert!(task.try_reserve_publication_mutation());
+        assert_eq!(
+            task.claim_wake_mutation(),
+            WakeMutationClaim::Corrupt,
+            "an unpublished task cannot own a valid block wake"
+        );
+        assert_eq!(
+            task.mutation.load(Ordering::Acquire),
+            TASK_MUTATION_PUBLICATION,
+            "the rejected wake must not poison the publication owner"
+        );
+        task.release_publication_mutation();
+        assert_eq!(task.mutation.load(Ordering::Acquire), TASK_MUTATION_IDLE);
+    }
+
+    #[test]
     fn first_wake_fault_is_durable() {
         let task = TaskInner::new_init("wake-fault".into()).unwrap();
         assert!(task.record_wake_fault(TaskWakeFault::SchedulerCapacity));
@@ -2048,6 +2304,32 @@ mod mechanism_tests {
             task.finish_cpu_handoff(),
             CpuHandoffCompletion::AlreadyCleared
         ));
+    }
+
+    #[cfg(feature = "smp")]
+    #[test]
+    fn deferred_cpu_handoff_retains_the_wake_claim_until_target_publication() {
+        let task = TaskInner::new_init("claimed-handoff".into())
+            .unwrap()
+            .into_arc()
+            .unwrap();
+        assert_eq!(task.claim_wake_mutation(), WakeMutationClaim::Claimed);
+        assert!(matches!(
+            task.publish_wake_handoff(task.clone()),
+            WakeHandoffPublication::Deferred
+        ));
+        let owned = match task.finish_cpu_handoff() {
+            CpuHandoffCompletion::Wake(owned) => owned,
+            CpuHandoffCompletion::Cleared
+            | CpuHandoffCompletion::AlreadyCleared
+            | CpuHandoffCompletion::MissingWake => {
+                panic!("deferred handoff lost its exact task owner")
+            }
+        };
+        assert!(Arc::ptr_eq(&owned, &task));
+        assert!(!task.try_begin_affinity_mutation());
+        assert!(task.finish_wake_mutation());
+        drop(owned);
     }
 
     #[cfg(feature = "smp")]

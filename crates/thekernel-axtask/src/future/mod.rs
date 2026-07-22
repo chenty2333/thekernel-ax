@@ -16,7 +16,7 @@ use crate::{
     AxTask, AxTaskRef, current, current_run_queue,
     run_queue::{BlockReschedOutcome, WakeTaskOutcome},
     select_run_queue,
-    task::{BeginBlockWaitError, BlockWakeAction, EndBlockWaitError},
+    task::{BeginBlockWaitError, BlockWakeAction, EndBlockWaitError, WakeMutationClaim},
 };
 
 #[cfg(feature = "irq")]
@@ -29,23 +29,65 @@ pub use time::*;
 
 fn wake_task(task: &AxTaskRef) {
     match task.mark_block_woken() {
-        BlockWakeAction::Unblock => {
-            let mut rq = select_run_queue::<NoPreemptIrqSave>(task);
-            let outcome = rq.unblock_task(task.clone(), true);
-            drop(rq);
-            if let WakeTaskOutcome::Rejected(error) = outcome {
-                // The runqueue already restored a safe state and recorded a
-                // durable TaskWakeFault. Consume the typed detail outside its
-                // IRQ guard so this failure is neither silent nor dropped in
-                // a critical section.
+        BlockWakeAction::Unblock => match task.claim_wake_mutation() {
+            WakeMutationClaim::Claimed => wake_task_claimed(task),
+            // The active affinity owner observes the wake bit when it releases
+            // and calls `wake_task_claimed` itself. A later waker finding an
+            // existing owner has no second enqueue obligation.
+            WakeMutationClaim::DeferredToAffinity
+            | WakeMutationClaim::DeferredToBlock
+            | WakeMutationClaim::AlreadyOwned => {}
+            WakeMutationClaim::Corrupt => {
                 error!(
-                    "raw task waker contained enqueue failure for task {}: {:?}",
-                    error.task.id().as_u64(),
-                    error.kind
+                    "raw task waker found corrupt mutation ownership for task {}",
+                    task.id().as_u64()
                 );
+                axhal::power::system_off();
+            }
+        },
+        BlockWakeAction::BlockOwnerWillConsume | BlockWakeAction::Inactive => {}
+    }
+}
+
+/// Completes a raw blocked-task wake after this caller has acquired the unique
+/// mutation claim. Affinity cannot change the committed wake owner until an
+/// immediate enqueue completes or the old CPU consumes a deferred handoff.
+pub(crate) fn wake_task_claimed(task: &AxTaskRef) {
+    let mut rq = select_run_queue::<NoPreemptIrqSave>(task);
+    let outcome = rq.unblock_task(task.clone(), true);
+    drop(rq);
+
+    match outcome {
+        WakeTaskOutcome::Enqueued => {
+            // The target scheduler cleared TASK_MUTATION_WAKE under its lock
+            // after linking the task and before making it selectable.
+        }
+        WakeTaskOutcome::AlreadyRunnable => {
+            if !task.finish_wake_mutation() {
+                error!(
+                    "task {} completed a wake without owning its mutation claim",
+                    task.id().as_u64()
+                );
+                axhal::power::system_off();
             }
         }
-        BlockWakeAction::BlockOwnerWillConsume | BlockWakeAction::Inactive => {}
+        #[cfg(feature = "smp")]
+        WakeTaskOutcome::Deferred => {
+            // `wake_handoff` now owns the exact strong reference and the old
+            // CPU retains TASK_MUTATION_WAKE until it publishes the frozen
+            // target from its context-switch epilogue.
+        }
+        WakeTaskOutcome::Rejected(error) => {
+            // Valid blocked wakes are capacity-free after runqueue/scheduler
+            // initialization. Restoring Blocked here would leave WOKEN with no
+            // enqueue owner, so an internal publication failure is fail-stop.
+            error!(
+                "claimed raw wake publication failed for task {}: {:?}",
+                error.task.id().as_u64(),
+                error.kind
+            );
+            axhal::power::system_off();
+        }
     }
 }
 

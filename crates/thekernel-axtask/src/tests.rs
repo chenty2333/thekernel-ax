@@ -1072,6 +1072,14 @@ fn publication_reservation_commits_and_auto_exit_is_reclaimable() {
     let reservation = axtask::reserve_prepared_task(prepared).unwrap();
     let published = axtask::publish_prepared_task(reservation);
     assert_eq!(published.id(), id);
+    assert!(
+        published.try_begin_affinity_mutation(),
+        "successful publication must clear its reservation before target unlock"
+    );
+    assert_eq!(
+        published.finish_affinity_mutation(),
+        crate::task::AffinityMutationCompletion::Released
+    );
     assert_eq!(published.join().unwrap(), 0);
     assert!(RAN.load(Ordering::Acquire));
     drop(published);
