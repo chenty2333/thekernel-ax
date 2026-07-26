@@ -8,4 +8,7 @@
   SBI encodings and explicit backend negotiation failures.
 - Add an opt-in RISC-V SBI backend with injected hardware-CSR reads and an
   explicit unsupported LoongArch backend pending a verified platform adapter.
+- Add a fixed-capacity LoongArch backend whose injected platform contract owns
+  CPUCFG probing, event encodings, and PMCFG/PMCNT access while the generic
+  layer owns generation-safe counter lifecycle.
 - Add default-off, saturating software diagnostics for ASID fast-switch paths.

@@ -8,6 +8,12 @@ extern crate std;
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+mod loongarch;
+
+pub use loongarch::{
+    LOONGARCH_MAX_COUNTERS, LoongArchCounter, LoongArchPlatform, LoongArchPlatformPmu,
+};
+
 #[cfg(all(
     feature = "riscv-sbi",
     any(target_arch = "riscv32", target_arch = "riscv64")

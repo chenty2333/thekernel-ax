@@ -120,14 +120,22 @@ impl<R> RiscvSbiPmu<R> {
         valid & !self.claimed
     }
 
-    fn validate(&self, counter: RiscvCounter) -> Result<(), Error> {
+    fn validate_known(&self, counter: RiscvCounter) -> Result<(), Error> {
         if counter.index >= self.counter_count
-            || self.claimed & (1usize << counter.index) == 0
             || self.generations[counter.index] != counter.generation
         {
             return Err(Error::InvalidRequest);
         }
         Ok(())
+    }
+
+    fn validate_claimed(&self, counter: RiscvCounter) -> Result<(), Error> {
+        self.validate_known(counter)?;
+        if self.claimed & (1usize << counter.index) == 0 {
+            Err(Error::InvalidRequest)
+        } else {
+            Ok(())
+        }
     }
 
     fn counter_set(counter: RiscvCounter) -> (usize, usize) {
@@ -240,7 +248,7 @@ impl<R: RiscvHardwareCounterReader> Backend for RiscvSbiPmu<R> {
     }
 
     fn start(&mut self, counter: Self::Counter) -> Result<(), Error> {
-        self.validate(counter)?;
+        self.validate_claimed(counter)?;
         let (base, mask) = Self::counter_set(counter);
         Self::map_sbi(sbi_rt::pmu_counter_start(
             base,
@@ -252,7 +260,7 @@ impl<R: RiscvHardwareCounterReader> Backend for RiscvSbiPmu<R> {
     }
 
     fn read(&mut self, counter: Self::Counter) -> Result<u64, Error> {
-        self.validate(counter)?;
+        self.validate_claimed(counter)?;
         if counter.firmware {
             Self::read_firmware(counter.index)
         } else {
@@ -265,12 +273,18 @@ impl<R: RiscvHardwareCounterReader> Backend for RiscvSbiPmu<R> {
     }
 
     fn stop(&mut self, counter: Self::Counter) -> Result<(), Error> {
-        self.validate(counter)?;
+        self.validate_known(counter)?;
+        if self.claimed & (1usize << counter.index) == 0 {
+            return Ok(());
+        }
         Self::stop_raw(counter, 0)
     }
 
     fn release(&mut self, counter: Self::Counter) -> Result<(), Error> {
-        self.validate(counter)?;
+        self.validate_known(counter)?;
+        if self.claimed & (1usize << counter.index) == 0 {
+            return Ok(());
+        }
         Self::stop_raw(counter, STOP_RESET_MAPPING)?;
         self.claimed &= !(1usize << counter.index);
         Ok(())
