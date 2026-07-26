@@ -53,28 +53,61 @@ axtask check before those two leaf versions exist.
 1. Run `scripts/publish-dry-run.sh`. It first performs real crates.io publish
    dry-runs for `thekernel-axcbpf` and `thekernel-axpmu` with Rust 1.85.0, then
    performs the two coordinated leaf-package dry-runs with the pinned nightly.
+   A successful dry-run does not publish either original package.
 2. Publish `thekernel-axcbpf` only from the exact commit whose package, offline
-   unpack, provenance, CI, and publish dry-run gates passed. Wait until that
-   version is visible in the registry index before publishing the downstream
-   TheKernel Linux-ABI seccomp adapter; a workspace path or patch is not a
-   substitute for this dependency boundary.
-3. For the first maintained-fork release, crates.io cannot resolve
+   unpack, provenance, CI, and publish dry-run gates passed:
+
+   ```sh
+   cargo +1.85.0 publish --locked --registry crates-io -p thekernel-axcbpf
+   ```
+
+   Wait for both exact-version checks to succeed:
+
+   ```sh
+   cargo +1.85.0 info thekernel-axcbpf@0.1.0 --registry crates-io
+   curl --location --fail --silent --show-error \
+     https://docs.rs/thekernel-axcbpf/0.1.0/axcbpf/
+   ```
+
+   Only then publish the downstream TheKernel Linux-ABI seccomp adapter; a
+   workspace path or patch is not a substitute for this dependency boundary.
+3. Publish `thekernel-axpmu` independently from the same exact verified release
+   commit:
+
+   ```sh
+   cargo +1.85.0 publish --locked --registry crates-io -p thekernel-axpmu
+   ```
+
+   Wait for its exact registry version and docs.rs build before claiming that
+   the package was released or switching a downstream package to the released
+   dependency:
+
+   ```sh
+   cargo +1.85.0 info thekernel-axpmu@0.1.0 --registry crates-io
+   curl --location --fail --silent --show-error \
+     https://docs.rs/thekernel-axpmu/0.1.0/axpmu/
+   ```
+
+4. For the first maintained-fork release, crates.io cannot resolve
    `thekernel-axtask` until the two sibling `0.1.0` packages exist. Before that
    point,
    `scripts/package-unpack.sh` is the checksum-bound substitute: it verifies the
    exact sibling archives and tests the unpacked axtask artifact without a
    workspace patch leak. This limitation is reported explicitly rather than
    calling the dependent dry-run successful.
-4. Publish `thekernel-axsched` and `thekernel-axpoll` from the same verified
+5. Publish `thekernel-axsched` and `thekernel-axpoll` from the same verified
    commit, wait until both are visible in the registry index, then run
    `AXTASK_REGISTRY_READY=1 scripts/publish-dry-run.sh` and publish
    `thekernel-axtask` only if that final real dry-run passes.
-5. Publish only after the dry run and CI pass for the exact release commit.
-6. Create an exact-commit repository tag `v0.1.0`; its release record lists the
+6. Publish only after the dry run and CI pass for the exact release commit.
+7. Create an exact-commit repository tag `v0.1.0`; its release record lists the
    checksum of every package published from that tag.
-7. Attach release notes that summarize the maintained delta and any public API
+8. Attach release notes that summarize the maintained delta and any public API
    migration.
-8. Verify the registry checksum and docs.rs build after publication.
+9. Verify the registry checksum and docs.rs build after publication. Registry
+   visibility, docs.rs availability, and publication claims are recorded per
+   exact package version; success for one original package does not imply
+   success for the other.
 
 Publishing and pushing tags are deliberate maintainer actions; local release
 preparation does not imply authorization to perform either action.

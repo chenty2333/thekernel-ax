@@ -72,9 +72,11 @@ without access to TheKernel's workspace patches.
 
 The publish dry-run uses Rust 1.85.0 for the independent `thekernel-axcbpf` and
 `thekernel-axpmu` artifacts and the pinned nightly for the coordinated
-maintained-fork set. An `axcbpf` release must be visible in crates.io before a
-downstream TheKernel Linux-ABI seccomp adapter is published; see
-[`docs/RELEASE.md`](docs/RELEASE.md) for the exact ordering.
+maintained-fork set. A dry-run does not publish either original artifact: each
+must be published separately from the verified commit and pass its own exact
+registry-version and docs.rs checks. An `axcbpf` release must be visible in
+crates.io before a downstream TheKernel Linux-ABI seccomp adapter is published;
+see [`docs/RELEASE.md`](docs/RELEASE.md) for the exact ordering.
 
 ## Project policy
 
