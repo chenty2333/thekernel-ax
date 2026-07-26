@@ -1901,6 +1901,13 @@ name = "thekernel-axfault"
 version = "0.1.0"
 
 [[package]]
+name = "thekernel-axpmu"
+version = "0.1.0"
+dependencies = [
+ "sbi-rt 0.0.3",
+]
+
+[[package]]
 name = "thekernel-axpoll"
 version = "0.1.0"
 dependencies = [

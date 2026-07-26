@@ -3,9 +3,10 @@
 The packages have independent names and version histories even when they are
 released from one workspace. The coordinated maintained-fork checkpoint is
 `0.1.0` for `thekernel-axsched`, `thekernel-axpoll`, and `thekernel-axtask`.
-`thekernel-axcbpf` is an independent original mechanism with its own `0.1.0`
-release gate at Rust 1.85.0. User-visible changes for these checkpoints are
-recorded in [`releases/0.1.0.md`](releases/0.1.0.md).
+`thekernel-axcbpf` and `thekernel-axpmu` are independent original mechanisms
+with their own `0.1.0` release gates at Rust 1.85.0. User-visible changes for
+these checkpoints are recorded in
+[`releases/0.1.0.md`](releases/0.1.0.md).
 
 ## Prepare
 
@@ -32,25 +33,26 @@ Inspect the contents explicitly:
 
 ```sh
 cargo +1.85.0 package --locked --list -p thekernel-axcbpf
+cargo +1.85.0 package --locked --list -p thekernel-axpmu
 cargo package --locked --list -p thekernel-axsched
 cargo package --locked --list -p thekernel-axpoll
 cargo +nightly-2025-05-20 package --locked --list -p thekernel-axtask
 ```
 
-The original-package unpack test builds `thekernel-axcbpf` from its normalized
-archive with Rust 1.85.0, `--locked`, and `--offline`. The maintained-fork
-unpack test builds leaf packages directly from their normalized archives,
-while the first axtask release uses only the two sibling archives whose SHA-256
-values match its generated release lock. These gates prove packaged source
-builds outside both this workspace and TheKernel's patch table, but the latter
-is not described as a registry-only axtask check before those two leaf versions
-exist.
+The original-package unpack test builds `thekernel-axcbpf` and
+`thekernel-axpmu` from their normalized archives with Rust 1.85.0, `--locked`,
+and `--offline`. The maintained-fork unpack test builds leaf packages directly
+from their normalized archives, while the first axtask release uses only the
+two sibling archives whose SHA-256 values match its generated release lock.
+These gates prove packaged source builds outside both this workspace and
+TheKernel's patch table, but the latter is not described as a registry-only
+axtask check before those two leaf versions exist.
 
 ## Publish
 
-1. Run `scripts/publish-dry-run.sh`. It first performs a real crates.io publish
-   dry-run for `thekernel-axcbpf` with Rust 1.85.0, then performs the two
-   coordinated leaf-package dry-runs with the pinned nightly.
+1. Run `scripts/publish-dry-run.sh`. It first performs real crates.io publish
+   dry-runs for `thekernel-axcbpf` and `thekernel-axpmu` with Rust 1.85.0, then
+   performs the two coordinated leaf-package dry-runs with the pinned nightly.
 2. Publish `thekernel-axcbpf` only from the exact commit whose package, offline
    unpack, provenance, CI, and publish dry-run gates passed. Wait until that
    version is visible in the registry index before publishing the downstream
