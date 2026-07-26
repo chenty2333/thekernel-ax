@@ -118,6 +118,22 @@ PY
             --all-targets \
             --locked \
             --offline
+
+    if [[ "$package" == thekernel-axpmu ]]; then
+        CARGO_TARGET_DIR="$tmp/test-target/$package-riscv64" \
+            cargo "+$toolchain" check \
+                --manifest-path "$crate_dir/Cargo.toml" \
+                --locked \
+                --offline \
+                --target riscv64gc-unknown-none-elf \
+                --features riscv-sbi
+        CARGO_TARGET_DIR="$tmp/test-target/$package-loongarch64" \
+            cargo "+$toolchain" check \
+                --manifest-path "$crate_dir/Cargo.toml" \
+                --locked \
+                --offline \
+                --target loongarch64-unknown-none
+    fi
 done
 
 printf 'original-package-unpack: PASS (%s packages)\n' "${#packages[@]}"

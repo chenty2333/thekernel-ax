@@ -116,7 +116,7 @@ jobs:
           components: clippy
           targets: riscv64gc-unknown-none-elf,loongarch64-unknown-none
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Test, lint, document, package, and cross-check axpmu
+      - name: Test, lint, document, and cross-check source and packaged axpmu
         run: |
           cargo +1.85.0 test -p thekernel-axpmu --all-targets --locked
           cargo +1.85.0 test -p thekernel-axpmu --doc --locked
