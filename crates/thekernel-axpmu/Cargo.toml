@@ -1,0 +1,26 @@
+[package]
+name = "thekernel-axpmu"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["TheKernel contributors"]
+description = "Bounded opt-in PMU sessions for no_std operating systems"
+license = "Apache-2.0"
+repository = "https://github.com/chenty2333/thekernel-ax"
+documentation = "https://docs.rs/thekernel-axpmu"
+readme = "README.md"
+
+[lib]
+name = "axpmu"
+path = "src/lib.rs"
+
+[features]
+default = []
+riscv-sbi = ["dep:sbi-rt"]
+
+[target.'cfg(any(target_arch = "riscv32", target_arch = "riscv64"))'.dependencies]
+sbi-rt = { version = "0.0.3", features = ["integer-impls"], optional = true }
+
+[package.metadata.docs.rs]
+all-features = true
+default-target = "riscv64gc-unknown-none-elf"

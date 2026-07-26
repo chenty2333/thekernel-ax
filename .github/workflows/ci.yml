@@ -106,6 +106,26 @@ jobs:
           cargo +1.85.0 check -p thekernel-axtlb --locked --target loongarch64-unknown-none
           scripts/package-unpack-original.sh thekernel-axtlb
 
+  axpmu-msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: 1.85.0
+          components: clippy
+          targets: riscv64gc-unknown-none-elf,loongarch64-unknown-none
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Test, lint, document, and cross-check source and packaged axpmu
+        run: |
+          cargo +1.85.0 test -p thekernel-axpmu --all-targets --locked
+          cargo +1.85.0 test -p thekernel-axpmu --doc --locked
+          cargo +1.85.0 clippy -p thekernel-axpmu --all-targets --locked -- -D warnings
+          RUSTDOCFLAGS='-D warnings' cargo +1.85.0 doc -p thekernel-axpmu --no-deps --locked
+          cargo +1.85.0 check -p thekernel-axpmu --locked --target riscv64gc-unknown-none-elf --features riscv-sbi
+          cargo +1.85.0 check -p thekernel-axpmu --locked --target loongarch64-unknown-none
+          scripts/package-unpack-original.sh thekernel-axpmu
+
   axpoll-msrv:
     runs-on: ubuntu-latest
     steps:

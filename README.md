@@ -7,6 +7,7 @@ crates maintained by TheKernel. The workspace contains these crates:
 | --- | --- | --- |
 | `thekernel-axcbpf` | `axcbpf` | verified classic-BPF mechanism with bounded execution |
 | `thekernel-axfault` | `axfault` | bounded generation-safe fault-request broker state |
+| `thekernel-axpmu` | `axpmu` | bounded, opt-in PMU sessions and low-overhead software diagnostics |
 | `thekernel-axtlb` | `axtlb` | bounded allocation-free SMP TLB and instruction-sync shootdown state |
 | `thekernel-axsched` | `axsched` | FIFO, round-robin, fair, and real-time scheduling mechanisms |
 | `thekernel-axpoll` | `axpoll` | bounded I/O readiness registration and wakeup primitives |
@@ -16,7 +17,8 @@ The maintained-fork package names are new so releases cannot be confused with
 the upstream `axsched`, `axpoll`, and `axtask` packages. Their Rust library
 names stay unchanged, which lets downstream code continue to use the
 established crate paths after changing only its dependency declaration.
-`thekernel-axcbpf`, `thekernel-axfault`, and `thekernel-axtlb` are new
+`thekernel-axcbpf`, `thekernel-axfault`, `thekernel-axpmu`, and
+`thekernel-axtlb` are new
 TheKernel-owned mechanisms rather than renamed upstream packages.
 
 ## Scope
@@ -44,6 +46,8 @@ cargo +1.85.0 test -p thekernel-axcbpf --all-targets --locked
 cargo +1.85.0 test -p thekernel-axcbpf --doc --locked
 cargo +1.85.0 test -p thekernel-axfault --all-targets --locked
 cargo +1.85.0 test -p thekernel-axfault --doc --locked
+cargo +1.85.0 test -p thekernel-axpmu --all-targets --locked
+cargo +1.85.0 test -p thekernel-axpmu --doc --locked
 cargo +1.85.0 test -p thekernel-axtlb --all-targets --locked
 cargo +1.85.0 test -p thekernel-axtlb --doc --locked
 cargo +1.85.0 test -p thekernel-axpoll --all-targets --locked
@@ -61,16 +65,18 @@ provider and prove the final link; TheKernel does so unconditionally through
 its coordinated `axruntime`/`axhal` release set. It is not a profile-selected
 optimization.
 
-The first unpack command validates the three original mechanism artifacts. The
+The first unpack command validates the four original mechanism artifacts. The
 last command packages the coordinated three-crate maintained-fork release set,
 unpacks the registry artifacts in a temporary directory, and tests them
 without access to TheKernel's workspace patches.
 
-The publish dry-run uses Rust 1.85.0 for the independent `thekernel-axcbpf`
-artifact and the pinned nightly for the coordinated maintained-fork set. An
-`axcbpf` release must be visible in crates.io before a downstream TheKernel
-Linux-ABI seccomp adapter is published; see
-[`docs/RELEASE.md`](docs/RELEASE.md) for the exact ordering.
+The publish dry-run uses Rust 1.85.0 for the independent `thekernel-axcbpf` and
+`thekernel-axpmu` artifacts and the pinned nightly for the coordinated
+maintained-fork set. A dry-run does not publish either original artifact: each
+must be published separately from the verified commit and pass its own exact
+registry-version and docs.rs checks. An `axcbpf` release must be visible in
+crates.io before a downstream TheKernel Linux-ABI seccomp adapter is published;
+see [`docs/RELEASE.md`](docs/RELEASE.md) for the exact ordering.
 
 ## Project policy
 
