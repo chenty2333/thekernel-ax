@@ -19,6 +19,9 @@ use memory_addr::VirtAddr;
 
 use crate::{AxCpuMask, AxTask, AxTaskRef, future::block_on};
 
+#[cfg(all(feature = "legacy-fxsave", target_arch = "x86_64"))]
+use crate::legacy_fxsave::{LegacyFxsaveSession, LegacyFxsaveTaskError};
+
 /// A unique identifier for a thread.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct TaskId(u64);
@@ -1870,6 +1873,24 @@ impl CurrentTask {
     /// Returns `true` if the current task is the same as `other`.
     pub fn ptr_eq(&self, other: &AxTaskRef) -> bool {
         Arc::ptr_eq(&self.0, other)
+    }
+
+    /// Begins a legacy FXSAVE operation for this task while it is current.
+    ///
+    /// The returned session disables local IRQs and task preemption for its
+    /// entire lifetime. A handle retained across a context switch is rejected
+    /// instead of touching another task's live FPU/SIMD state.
+    #[cfg(all(feature = "legacy-fxsave", target_arch = "x86_64"))]
+    pub fn legacy_fxsave_session(&self) -> Result<LegacyFxsaveSession, LegacyFxsaveTaskError> {
+        let guard = kernel_guard::NoPreemptIrqSave::new();
+        let current = axhal::percpu::current_task_ptr();
+        if !core::ptr::eq(current, Arc::as_ptr(&self.0)) {
+            return Err(LegacyFxsaveTaskError::NotCurrent);
+        }
+        // SAFETY: the identity check above and `guard` keep this task's context
+        // current and exclusively owned until the returned session is dropped.
+        let ctx = unsafe { self.ctx_mut_ptr() };
+        Ok(LegacyFxsaveSession::new(guard, ctx))
     }
 
     pub(crate) unsafe fn init_current(init_task: AxTaskRef) {

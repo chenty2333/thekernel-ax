@@ -42,6 +42,10 @@ smp = ["kspin/smp"]
 # Explicit IRQ-entry/exit integration. TheKernel enables this only with its
 # maintained axhal boundary contract; registry-only consumers keep it off.
 irq-exit = ["multitask", "preempt", "axhal/irq"]
+# x86_64 legacy FXSAVE signal-state support. This feature intentionally keeps
+# the architecture-specific context field behind axhal's fp-simd contract;
+# consumers must opt in when they own the corresponding signal path.
+legacy-fxsave = ["multitask", "preempt", "axhal/fp-simd"]
 # Allocation-free, lock-free trace snapshots for diagnosing IRQ-return
 # scheduling. This is intentionally opt-in because it adds atomics to context
 # switch and suspicious IRQ-off preemption paths.

@@ -36,6 +36,9 @@ compile_error!(
     "thekernel-axtask 0.1.0 does not support TLS tasks: axhal must first expose fallible TLS allocation"
 );
 
+#[cfg(all(feature = "legacy-fxsave", not(target_arch = "x86_64")))]
+compile_error!("the legacy FXSAVE task API is x86_64-only");
+
 #[cfg(all(test, feature = "multitask"))]
 mod tests;
 
@@ -58,6 +61,9 @@ cfg_if::cfg_if! {
         mod api;
         mod wait_queue;
 
+        #[cfg(all(feature = "legacy-fxsave", target_arch = "x86_64"))]
+        mod legacy_fxsave;
+
         #[cfg(feature = "irq-exit")]
         mod irq_exit;
         #[cfg(feature = "irq-exit")]
@@ -77,6 +83,11 @@ cfg_if::cfg_if! {
         #[doc(cfg(feature = "multitask"))]
         pub use self::api::*;
         pub use self::api::{sleep, sleep_until, yield_now};
+        #[cfg(all(feature = "legacy-fxsave", target_arch = "x86_64"))]
+        pub use self::legacy_fxsave::{
+            LEGACY_FXSAVE_IMAGE_SIZE, LegacyFxsaveImage, LegacyFxsaveImageError,
+            LegacyFxsaveSession, LegacyFxsaveTaskError, ValidatedLegacyFxsaveImage,
+        };
         #[cfg(feature = "irq-continuation-diagnostics")]
         pub use self::irq_continuation_diagnostics::{
             IrqContinuationDiagnosticEvent, IrqContinuationDiagnosticSnapshot,
