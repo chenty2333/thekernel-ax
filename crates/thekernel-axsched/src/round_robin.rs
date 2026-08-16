@@ -6,7 +6,9 @@ use core::{
 
 use linked_list_r4l::{GetLinks, Links, List};
 
-use crate::{allocate_scheduler_id, BaseScheduler, EnqueueReason, SchedulerError, UNOWNED};
+use crate::{
+    allocate_scheduler_id, try_update_usize, BaseScheduler, EnqueueReason, SchedulerError, UNOWNED,
+};
 
 /// A task wrapper for the [`RRScheduler`].
 pub struct RRTask<T, const MAX_TIME_SLICE: usize> {
@@ -216,12 +218,13 @@ impl<T, const S: usize> BaseScheduler for RRScheduler<T, S> {
     }
 
     fn task_tick(&mut self, current: &Self::SchedItem) -> bool {
-        let old_slice = current
-            .time_slice
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |slice| {
-                Some(slice.saturating_sub(1))
-            })
-            .unwrap_or(0);
+        let old_slice = try_update_usize(
+            &current.time_slice,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |slice| Some(slice.saturating_sub(1)),
+        )
+        .unwrap_or(0);
         old_slice <= 1
     }
 

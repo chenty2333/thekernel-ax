@@ -17,23 +17,6 @@ instruction-TLB misses. A capability's event mask describes events that can be
 requested, not a promise that a particular platform has a matching counter.
 `Backend::configure` remains the authoritative negotiation point.
 
-The optional `riscv-sbi` backend uses the SBI PMU extension to probe,
-configure, start, and stop counters. SBI reports a hardware counter's CSR
-number at run time, while Rust inline assembly requires a compile-time CSR
-operand. The platform therefore injects `RiscvHardwareCounterReader`; no CSR
-number is guessed by this crate. Firmware counters are read through SBI.
-
-LoongArch event numbers and CSR instruction selection remain platform-owned.
-`LoongArchPlatformPmu<P, N>` accepts a `LoongArchPlatform` implementation that
-provides its CPUCFG-derived counter count, verified event encodings, and
-PMCFG/PMCNT access. The generic backend bounds the count to `min(N, 32)`, tags
-handles with non-wrapping generations, and owns configure/start/stop/release
-lifecycle. The zero-adapter `LoongArchPmu` remains available and reports
-`Error::Unsupported`; no raw event number or arbitrary CSR is guessed.
-This boundary follows LoongArch Reference Manual Volume 1 v1.10 section 7.8:
-CPUCFG.6 reports PMU capability/count/width, the architecture permits up to 32
-monitors, and each monitor owns one PMCFG/PMCNT pair.
-
 `SoftwareDiagnostics` is a separate default-off mechanism for already
 classified hot-path facts such as an ASID switch avoiding a full TLB flush. It
 does not decide whether a switch was safe and does not classify policy reasons.

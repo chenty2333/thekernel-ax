@@ -19,6 +19,27 @@ use core::{
 use bitflags::bitflags;
 use kspin::SpinNoIrq as Mutex;
 
+fn try_update_usize<F>(
+    atomic: &AtomicUsize,
+    set: Ordering,
+    fail: Ordering,
+    mut update: F,
+) -> Result<usize, usize>
+where
+    F: FnMut(usize) -> Option<usize>,
+{
+    let mut current = atomic.load(fail);
+    loop {
+        let Some(next) = update(current) else {
+            return Err(current);
+        };
+        match atomic.compare_exchange_weak(current, next, set, fail) {
+            Ok(previous) => return Ok(previous),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 bitflags! {
     /// Generic I/O readiness events.
     ///
@@ -183,11 +204,13 @@ impl fmt::Display for UpdateError {
 static NEXT_REGISTRY_ID: AtomicUsize = AtomicUsize::new(1);
 
 fn allocate_registry_id() -> Option<usize> {
-    NEXT_REGISTRY_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            current.checked_add(1)
-        })
-        .ok()
+    try_update_usize(
+        &NEXT_REGISTRY_ID,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+        |current| current.checked_add(1),
+    )
+    .ok()
 }
 
 struct Slot {

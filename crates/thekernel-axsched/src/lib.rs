@@ -23,12 +23,56 @@ const UNOWNED: usize = 0;
 const CONFIGURING: usize = usize::MAX;
 static NEXT_SCHEDULER_ID: AtomicUsize = AtomicUsize::new(1);
 
+pub(crate) fn try_update_usize<F>(
+    atomic: &AtomicUsize,
+    set: Ordering,
+    fail: Ordering,
+    mut update: F,
+) -> Result<usize, usize>
+where
+    F: FnMut(usize) -> Option<usize>,
+{
+    let mut current = atomic.load(fail);
+    loop {
+        let Some(next) = update(current) else {
+            return Err(current);
+        };
+        match atomic.compare_exchange_weak(current, next, set, fail) {
+            Ok(previous) => return Ok(previous),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+pub(crate) fn try_update_isize<F>(
+    atomic: &core::sync::atomic::AtomicIsize,
+    set: Ordering,
+    fail: Ordering,
+    mut update: F,
+) -> Result<isize, isize>
+where
+    F: FnMut(isize) -> Option<isize>,
+{
+    let mut current = atomic.load(fail);
+    loop {
+        let Some(next) = update(current) else {
+            return Err(current);
+        };
+        match atomic.compare_exchange_weak(current, next, set, fail) {
+            Ok(previous) => return Ok(previous),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 fn allocate_scheduler_id() -> Result<usize, SchedulerError> {
-    NEXT_SCHEDULER_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            current.checked_add(1)
-        })
-        .map_err(|_| SchedulerError::IdentifierExhausted)
+    try_update_usize(
+        &NEXT_SCHEDULER_ID,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+        |current| current.checked_add(1),
+    )
+    .map_err(|_| SchedulerError::IdentifierExhausted)
 }
 
 /// Failure returned by a scheduler mechanism operation.

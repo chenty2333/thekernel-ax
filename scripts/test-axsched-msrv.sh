@@ -20,7 +20,7 @@ fi
 # workspace members. Package with the repository toolchain, then run the exact
 # registry artifact in isolation with the claimed MSRV.
 CARGO_TARGET_DIR="$tmp/package-target" \
-    cargo +nightly-2025-05-20 package \
+    cargo +nightly package \
         --manifest-path "$root/Cargo.toml" \
         --locked \
         --no-verify \
@@ -38,8 +38,5 @@ cargo +1.76.0 clippy \
     --manifest-path "$crate_dir/Cargo.toml" --all-targets --locked -- -D warnings
 RUSTDOCFLAGS='-D warnings' \
     cargo +1.76.0 doc --manifest-path "$crate_dir/Cargo.toml" --no-deps --locked
-for target in riscv64gc-unknown-none-elf loongarch64-unknown-none; do
-    cargo +1.76.0 check --manifest-path "$crate_dir/Cargo.toml" --target "$target" --locked
-done
 
 printf 'axsched-msrv: PASS (1.76.0, unpacked artifact)\n'

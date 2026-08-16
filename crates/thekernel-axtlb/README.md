@@ -7,17 +7,25 @@ explicit maintenance classes. It deliberately does not send hardware IPIs or
 execute architecture-specific maintenance instructions; a kernel adapter
 supplies those operations.
 
-The first correctness profile targets every online CPU other than the issuer.
-Each target owns fixed requested/completed epoch pairs for TLB and I-cache
-maintenance plus one pending-reason bitset. Concurrent requests coalesce into
-one reason bit and the greatest requested epoch for each class. A caller
-receives `ShootdownGrace` only after every target has acknowledged every class
-carried by that request. Each request borrows the domain that issued it, so safe
-code cannot complete it against another domain's epochs.
+The all-online correctness profile targets every online CPU other than the
+issuer. A bounded `CpuSet` also supports exact target selection through
+`issue_after_local_maintenance_for_targets` (and its TLB-only convenience
+variant). Each target owns fixed requested/completed epoch pairs for TLB and
+I-cache maintenance plus one pending-reason bitset. Concurrent requests
+coalesce into one reason bit and the greatest requested epoch for each class. A
+caller receives `ShootdownGrace` only after every target has acknowledged every
+class carried by that request. Each request borrows the domain that issued it,
+so safe code cannot complete it against another domain's epochs.
 
 ## Contract
 
 - Construction allocates nothing and all storage is fixed by `MAX_CPUS`.
+- `CpuSet` is bounded by `MAX_CPUS` and allocates nothing. The targeted issue
+  API rejects an empty set, an issuer included in the set, or any target that
+  is offline/already draining. It acquires every target admission before
+  publishing an epoch, so those validation failures do not partially publish a
+  targeted request. The all-online APIs retain their original admission-race
+  behavior and remain the fallback for callers without a fixed target set.
 - IPI reasons are a machine-word bitset; there is no callback queue.
 - Epochs are monotonic and never wrap. Every issue error is reported after the
   caller has published page-table or executable-data stores and may follow

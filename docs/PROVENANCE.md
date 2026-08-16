@@ -35,11 +35,10 @@ under Apache-2.0; the distributed license text is the canonical Apache-2.0 text
 already used by this repository.
 
 `thekernel-axpmu` 0.1.0 was designed and implemented in this repository as an
-allocation-free PMU session mechanism with typed event negotiation, an opt-in
-RISC-V SBI adapter, an injected LoongArch PMCFG/PMCNT lifecycle adapter, and
-default-off software diagnostics. It does not copy a Linux perf implementation,
-provide `perf_event_open` policy, guess LoongArch event numbers, or perform
-arbitrary CSR access. Its source is licensed under Apache-2.0.
+allocation-free PMU session mechanism with typed event negotiation and
+default-off software diagnostics. It does not copy a Linux perf
+implementation, provide `perf_event_open` policy, or perform arbitrary CSR
+access. Its source is licensed under Apache-2.0.
 
 `thekernel-axtlb` 0.1.0 was designed and implemented in this repository as a
 generic, bounded, allocation-free SMP TLB and instruction-sync shootdown state

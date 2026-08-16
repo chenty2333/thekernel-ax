@@ -8,29 +8,31 @@ extern crate std;
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-mod loongarch;
-
-pub use loongarch::{
-    LOONGARCH_MAX_COUNTERS, LoongArchCounter, LoongArchPlatform, LoongArchPlatformPmu,
-};
-
-#[cfg(all(
-    feature = "riscv-sbi",
-    any(target_arch = "riscv32", target_arch = "riscv64")
-))]
-mod riscv_sbi;
-
-#[cfg(all(
-    feature = "riscv-sbi",
-    any(target_arch = "riscv32", target_arch = "riscv64")
-))]
-pub use riscv_sbi::{RiscvCounter, RiscvHardwareCounter, RiscvHardwareCounterReader, RiscvSbiPmu};
+fn try_update_usize<F>(
+    atomic: &AtomicUsize,
+    set: Ordering,
+    fail: Ordering,
+    mut update: F,
+) -> Result<usize, usize>
+where
+    F: FnMut(usize) -> Option<usize>,
+{
+    let mut current = atomic.load(fail);
+    loop {
+        let Some(next) = update(current) else {
+            return Err(current);
+        };
+        match atomic.compare_exchange_weak(current, next, set, fail) {
+            Ok(previous) => return Ok(previous),
+            Err(actual) => current = actual,
+        }
+    }
+}
 
 /// A typed performance event understood by the generic session layer.
 ///
-/// The TLB variants are deliberately operation-specific. SBI has no single
-/// aggregate D-TLB event, so calling a read-only mapping "all D-TLB misses"
-/// would overstate what the hardware reports.
+/// The TLB variants are deliberately operation-specific. Calling a read-only
+/// mapping "all D-TLB misses" would overstate what the hardware reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Event {
@@ -55,49 +57,6 @@ impl Event {
             Self::DataTlbWriteMisses => 1 << 3,
             Self::InstructionTlbReadMisses => 1 << 4,
         }
-    }
-
-    /// Returns the standard SBI PMU event encoding for this event.
-    ///
-    /// This only describes the request. A RISC-V implementation may still
-    /// reject it because no matching physical counter exists.
-    pub const fn riscv_sbi_encoding(self) -> RiscvSbiEvent {
-        const HARDWARE_CACHE: usize = 1 << 16;
-        const CACHE_RESULT_MISS: usize = 1;
-        const CACHE_OP_WRITE: usize = 1 << 1;
-        const DTLB: usize = 3 << 3;
-        const ITLB: usize = 4 << 3;
-
-        let event_idx = match self {
-            Self::CpuCycles => 1,
-            Self::Instructions => 2,
-            Self::DataTlbReadMisses => HARDWARE_CACHE | DTLB | CACHE_RESULT_MISS,
-            Self::DataTlbWriteMisses => HARDWARE_CACHE | DTLB | CACHE_OP_WRITE | CACHE_RESULT_MISS,
-            Self::InstructionTlbReadMisses => HARDWARE_CACHE | ITLB | CACHE_RESULT_MISS,
-        };
-        RiscvSbiEvent {
-            event_idx,
-            event_data: 0,
-        }
-    }
-}
-
-/// A standard RISC-V SBI PMU event request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RiscvSbiEvent {
-    event_idx: usize,
-    event_data: u64,
-}
-
-impl RiscvSbiEvent {
-    /// Returns the 20-bit SBI event index.
-    pub const fn event_idx(self) -> usize {
-        self.event_idx
-    }
-
-    /// Returns the SBI event's additional configuration.
-    pub const fn event_data(self) -> u64 {
-        self.event_data
     }
 }
 
@@ -135,10 +94,6 @@ impl EventMask {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CounterSource {
-    /// RISC-V counters configured through the SBI PMU extension.
-    RiscvSbi,
-    /// LoongArch PMCFG/PMCNT registers.
-    LoongArchCsr,
     /// A platform-specific backend supplied by a consumer.
     Platform,
 }
@@ -224,11 +179,11 @@ pub enum Error {
     InvalidRequest,
     /// A counter exists but this adapter cannot read its value safely.
     ValueUnavailable,
-    /// An architecture backend returned an otherwise unmapped error code.
+    /// A backend returned an otherwise unmapped error code.
     BackendFailure(isize),
 }
 
-/// Architecture or platform mechanism used by a bounded PMU session.
+/// Platform mechanism used by a bounded PMU session.
 ///
 /// Implementations must make `stop` and `release` idempotent. `release` must
 /// make a counter inactive before relinquishing it, including when cleanup is
@@ -487,48 +442,6 @@ impl<B: Backend, const N: usize> Drop for Session<'_, B, N> {
     }
 }
 
-/// Explicitly unsupported LoongArch PMU backend.
-///
-/// This type preserves honest capability discovery until a platform adapter
-/// can cite and implement its PMCFG/PMCNT register contract.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct LoongArchPmu;
-
-impl LoongArchPmu {
-    /// Constructs the unsupported backend without touching hardware.
-    pub const fn new() -> Self {
-        Self
-    }
-}
-
-impl Backend for LoongArchPmu {
-    type Counter = ();
-
-    fn capabilities(&self) -> Capabilities {
-        Capabilities::unsupported(CounterSource::LoongArchCsr)
-    }
-
-    fn configure(&mut self, _event: Event) -> Result<Self::Counter, Error> {
-        Err(Error::Unsupported)
-    }
-
-    fn start(&mut self, _counter: Self::Counter) -> Result<(), Error> {
-        Err(Error::Unsupported)
-    }
-
-    fn read(&mut self, _counter: Self::Counter) -> Result<u64, Error> {
-        Err(Error::Unsupported)
-    }
-
-    fn stop(&mut self, _counter: Self::Counter) -> Result<(), Error> {
-        Err(Error::Unsupported)
-    }
-
-    fn release(&mut self, _counter: Self::Counter) -> Result<(), Error> {
-        Err(Error::Unsupported)
-    }
-}
-
 /// Approximate snapshot of default-off software diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SoftwareSnapshot {
@@ -587,12 +500,13 @@ impl SoftwareDiagnostics {
         if !self.enabled.load(Ordering::Relaxed) {
             return;
         }
-        if self
-            .asid_tlb_flushes_avoided
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                value.checked_add(1)
-            })
-            .is_err()
+        if try_update_usize(
+            &self.asid_tlb_flushes_avoided,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |value| value.checked_add(1),
+        )
+        .is_err()
         {
             self.saturated.store(true, Ordering::Relaxed);
         }
@@ -690,26 +604,6 @@ mod tests {
     }
 
     #[test]
-    fn sbi_encodings_are_typed_and_operation_specific() {
-        assert_eq!(Event::CpuCycles.riscv_sbi_encoding().event_idx(), 1);
-        assert_eq!(Event::Instructions.riscv_sbi_encoding().event_idx(), 2);
-        assert_eq!(
-            Event::DataTlbReadMisses.riscv_sbi_encoding().event_idx(),
-            0x1_0019
-        );
-        assert_eq!(
-            Event::DataTlbWriteMisses.riscv_sbi_encoding().event_idx(),
-            0x1_001b
-        );
-        assert_eq!(
-            Event::InstructionTlbReadMisses
-                .riscv_sbi_encoding()
-                .event_idx(),
-            0x1_0021
-        );
-    }
-
-    #[test]
     fn session_is_stopped_until_explicit_start_and_snapshots_in_order() {
         let mut backend = MockBackend::new();
         let events = [Event::CpuCycles, Event::Instructions];
@@ -767,12 +661,5 @@ mod tests {
             2
         );
         assert_eq!(diagnostics.snapshot().asid_tlb_flushes_avoided(), 0);
-    }
-
-    #[test]
-    fn loongarch_backend_is_honestly_unavailable() {
-        let mut backend = LoongArchPmu::new();
-        assert!(!backend.capabilities().is_available());
-        assert_eq!(backend.configure(Event::CpuCycles), Err(Error::Unsupported));
     }
 }

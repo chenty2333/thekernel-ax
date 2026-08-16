@@ -3,10 +3,10 @@ set -euo pipefail
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
-coordinated_toolchain=${CARGO_TOOLCHAIN:-nightly-2025-05-20}
+coordinated_toolchain=${CARGO_TOOLCHAIN:-nightly}
 # Keep this exact compiler aligned with `rust-version = "1.85"` in the
 # independent original mechanisms. The maintained-fork release set still
-# requires its pinned nightly.
+# requires the rolling nightly toolchain.
 axcbpf_toolchain=${AXCBPF_CARGO_TOOLCHAIN:-1.85.0}
 
 allow_dirty=()

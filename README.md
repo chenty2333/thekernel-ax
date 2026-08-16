@@ -51,7 +51,7 @@ cargo +1.85.0 test -p thekernel-axpmu --doc --locked
 cargo +1.85.0 test -p thekernel-axtlb --all-targets --locked
 cargo +1.85.0 test -p thekernel-axtlb --doc --locked
 cargo +1.85.0 test -p thekernel-axpoll --all-targets --locked
-cargo +nightly-2025-05-20 test -p thekernel-axtask --all-targets --locked \
+cargo +nightly test -p thekernel-axtask --all-targets --locked \
   --features "test multitask irq preempt smp sched-cfs task-ext irq-continuation-diagnostics irq-exit"
 python3 scripts/check_registry_dependencies.py
 scripts/package-unpack-original.sh
@@ -71,7 +71,7 @@ unpacks the registry artifacts in a temporary directory, and tests them
 without access to TheKernel's workspace patches.
 
 The publish dry-run uses Rust 1.85.0 for the independent `thekernel-axcbpf` and
-`thekernel-axpmu` artifacts and the pinned nightly for the coordinated
+`thekernel-axpmu` artifacts and the rolling `nightly` for the coordinated
 maintained-fork set. A dry-run does not publish either original artifact: each
 must be published separately from the verified commit and pass its own exact
 registry-version and docs.rs checks. An `axcbpf` release must be visible in

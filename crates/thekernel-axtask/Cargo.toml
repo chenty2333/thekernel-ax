@@ -77,16 +77,15 @@ spin = { version = "0.10", optional = true }
 [dev-dependencies]
 axhal = { version = "=0.3.0-preview.2", features = ["fp-simd"] }
 
-# axhal accepts the 0.15 line, but 0.15.5 implements a newer nightly `Step`
-# contract than the release toolchain. Pin the compatible source explicitly so
-# fresh and unpacked resolution cannot drift.
+# Rust 1.99's nightly `Step` contract requires the implementation added in
+# x86_64 0.15.5.
 [target.'cfg(target_arch = "x86_64")'.dependencies]
-x86_64 = { version = "=0.15.4", default-features = false }
+x86_64 = { version = "=0.15.5", default-features = false }
 
 [package.metadata.docs.rs]
 features = ["multitask", "sched-fifo", "task-ext"]
 default-target = "x86_64-unknown-none"
 
 [package.metadata.thekernel]
-toolchain = "nightly-2025-05-20"
+toolchain = "nightly"
 nightly-features = ["allocator_api", "doc_cfg", "linkage"]

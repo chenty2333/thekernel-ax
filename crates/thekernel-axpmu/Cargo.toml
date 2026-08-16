@@ -16,11 +16,7 @@ path = "src/lib.rs"
 
 [features]
 default = []
-riscv-sbi = ["dep:sbi-rt"]
-
-[target.'cfg(any(target_arch = "riscv32", target_arch = "riscv64"))'.dependencies]
-sbi-rt = { version = "0.0.3", features = ["integer-impls"], optional = true }
 
 [package.metadata.docs.rs]
 all-features = true
-default-target = "riscv64gc-unknown-none-elf"
+default-target = "x86_64-unknown-none"

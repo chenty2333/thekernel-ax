@@ -11,6 +11,27 @@ use core::{
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
+fn try_update_u64<F>(
+    atomic: &AtomicU64,
+    set: Ordering,
+    fail: Ordering,
+    mut update: F,
+) -> Result<u64, u64>
+where
+    F: FnMut(u64) -> Option<u64>,
+{
+    let mut current = atomic.load(fail);
+    loop {
+        let Some(next) = update(current) else {
+            return Err(current);
+        };
+        match atomic.compare_exchange_weak(current, next, set, fail) {
+            Ok(previous) => return Ok(previous),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 const CPU_OFFLINE: usize = 0;
 const CPU_ONLINE: usize = 1;
 const CPU_DRAINING: usize = 2;
@@ -57,6 +78,101 @@ impl CpuMaintenance {
 
     const fn is_empty(self) -> bool {
         self.bits == 0
+    }
+}
+
+/// Error returned while constructing a fixed CPU set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CpuSetError {
+    /// The CPU index is outside this set's fixed capacity.
+    InvalidCpu,
+}
+
+/// A bounded, allocation-free set of CPU indices.
+///
+/// A set owns one fixed membership bit per CPU slot. In particular, creating
+/// or passing a set does not allocate, and an index outside `MAX_CPUS` cannot
+/// become a member. This type is intended for targeted shootdown admission;
+/// use [`Self::try_insert`] when constructing a set from a runtime CPU index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CpuSet<const MAX_CPUS: usize> {
+    members: [bool; MAX_CPUS],
+}
+
+impl<const MAX_CPUS: usize> CpuSet<MAX_CPUS> {
+    /// Creates an empty CPU set.
+    pub const fn new() -> Self {
+        Self {
+            members: [false; MAX_CPUS],
+        }
+    }
+
+    /// Creates an empty CPU set.
+    pub const fn empty() -> Self {
+        Self::new()
+    }
+
+    /// Creates a singleton set, or `None` when `cpu` is outside the capacity.
+    pub const fn from_cpu(cpu: usize) -> Option<Self> {
+        if cpu >= MAX_CPUS {
+            return None;
+        }
+        let mut set = Self::new();
+        set.members[cpu] = true;
+        Some(set)
+    }
+
+    /// Adds `cpu` to this set.
+    ///
+    /// Returns [`CpuSetError::InvalidCpu`] without changing the set when the
+    /// index is outside the fixed capacity. Inserting an existing CPU is
+    /// successful and leaves the set unchanged.
+    pub fn try_insert(&mut self, cpu: usize) -> Result<(), CpuSetError> {
+        let member = self.members.get_mut(cpu).ok_or(CpuSetError::InvalidCpu)?;
+        *member = true;
+        Ok(())
+    }
+
+    /// Adds `cpu` to this set, returning whether the index was valid.
+    pub fn insert(&mut self, cpu: usize) -> bool {
+        self.try_insert(cpu).is_ok()
+    }
+
+    /// Returns whether `cpu` belongs to this set.
+    pub fn contains(&self, cpu: usize) -> bool {
+        self.members.get(cpu).copied().unwrap_or(false)
+    }
+
+    /// Returns whether the set has no members.
+    pub const fn is_empty(&self) -> bool {
+        let mut cpu = 0;
+        while cpu < MAX_CPUS {
+            if self.members[cpu] {
+                return false;
+            }
+            cpu += 1;
+        }
+        true
+    }
+
+    /// Returns the number of members in the set.
+    pub const fn len(&self) -> usize {
+        let mut count = 0;
+        let mut cpu = 0;
+        while cpu < MAX_CPUS {
+            if self.members[cpu] {
+                count += 1;
+            }
+            cpu += 1;
+        }
+        count
+    }
+}
+
+impl<const MAX_CPUS: usize> Default for CpuSet<MAX_CPUS> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -113,6 +229,12 @@ pub enum ShootdownIssueError {
     InvalidCpu,
     /// The issuer has not been published online.
     IssuerOffline,
+    /// A targeted request supplied no target CPUs.
+    EmptyTargetSet,
+    /// A targeted request included its issuer as a remote target.
+    IssuerIsTarget,
+    /// A targeted request named a CPU that was offline or already draining.
+    TargetOffline,
     /// The fixed lifecycle word cannot represent another concurrent admission.
     AdmissionExhausted,
     /// The global non-wrapping epoch space is exhausted.
@@ -521,6 +643,47 @@ impl<const MAX_CPUS: usize> TlbShootdown<MAX_CPUS> {
         self.issue_after_local_maintenance_with(issuer_cpu, maintenance, || {})
     }
 
+    /// Issues one request after local maintenance for an exact fixed target
+    /// set.
+    ///
+    /// Every member of `targets` must be online when this method acquires its
+    /// target admission, and `issuer_cpu` must not be a member. The method
+    /// acquires all target admissions before allocating an epoch or publishing
+    /// any target mailbox, so an offline or draining target returns
+    /// [`ShootdownIssueError::TargetOffline`] without partial targeted
+    /// publication. Once admission succeeds, a concurrent offline transition
+    /// may mark a target draining, but it cannot miss or discard this
+    /// request: the target admission keeps that request in the offline-drain
+    /// protocol until its mailbox is serviced.
+    ///
+    /// An empty set is rejected with
+    /// [`ShootdownIssueError::EmptyTargetSet`]. This makes accidentally
+    /// skipping remote acknowledgement fail closed; callers that have no
+    /// remote CPUs should use a separate local-only path.
+    ///
+    /// As with the all-online APIs, this call is made only after the issuer's
+    /// stores and matching local operation are complete. An epoch exhaustion
+    /// error is still fail-stop after the caller's local mutation, although
+    /// this targeted implementation does not publish a target mailbox before
+    /// reporting it.
+    pub fn issue_after_local_maintenance_for_targets(
+        &self,
+        issuer_cpu: usize,
+        targets: CpuSet<MAX_CPUS>,
+        maintenance: CpuMaintenance,
+    ) -> Result<ShootdownRequest<'_, MAX_CPUS>, ShootdownIssueError> {
+        self.issue_after_local_maintenance_for_targets_with(issuer_cpu, targets, maintenance, || {})
+    }
+
+    /// Issues a TLB-only request for an exact fixed target set.
+    pub fn issue_after_local_flush_for_targets(
+        &self,
+        issuer_cpu: usize,
+        targets: CpuSet<MAX_CPUS>,
+    ) -> Result<ShootdownRequest<'_, MAX_CPUS>, ShootdownIssueError> {
+        self.issue_after_local_maintenance_for_targets(issuer_cpu, targets, CpuMaintenance::TLB)
+    }
+
     #[cfg(test)]
     fn issue_after_local_flush_with(
         &self,
@@ -552,14 +715,15 @@ impl<const MAX_CPUS: usize> TlbShootdown<MAX_CPUS> {
         // This RMW is sequenced after the caller's PTE stores. AcqRel makes
         // the total global epoch order carry earlier writers' stores forward:
         // acknowledging a later epoch therefore also covers every earlier one.
-        let previous = self
-            .next_epoch
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
-                epoch.checked_add(1)
-            })
-            .map_err(|_| ShootdownIssueError::EpochExhausted)?;
+        let previous = try_update_u64(
+            &self.next_epoch,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |epoch| epoch.checked_add(1),
+        )
+        .map_err(|_| ShootdownIssueError::EpochExhausted)?;
         let epoch = previous + 1;
-        let mut targets = [false; MAX_CPUS];
+        let mut targets = CpuSet::new();
         let mut kicks = [false; MAX_CPUS];
 
         for (cpu, mailbox) in self.cpus.iter().enumerate() {
@@ -584,10 +748,100 @@ impl<const MAX_CPUS: usize> TlbShootdown<MAX_CPUS> {
                     .fetch_max(epoch, Ordering::Release);
             }
             let post = mailbox.post_reason(CPU_MAINTENANCE_REASON);
-            targets[cpu] = true;
+            targets
+                .try_insert(cpu)
+                .expect("online CPU index exceeds TLB shootdown capacity");
             kicks[cpu] = post.needs_kick();
         }
 
+        Ok(ShootdownRequest {
+            domain: self,
+            _issuer_admission: issuer_admission,
+            epoch,
+            maintenance,
+            targets,
+            kicks,
+        })
+    }
+
+    fn issue_after_local_maintenance_for_targets_with(
+        &self,
+        issuer_cpu: usize,
+        targets: CpuSet<MAX_CPUS>,
+        maintenance: CpuMaintenance,
+        after_issuer_admission: impl FnOnce(),
+    ) -> Result<ShootdownRequest<'_, MAX_CPUS>, ShootdownIssueError> {
+        debug_assert!(!maintenance.is_empty());
+        let Some(issuer) = self.cpus.get(issuer_cpu) else {
+            return Err(ShootdownIssueError::InvalidCpu);
+        };
+        if targets.is_empty() {
+            return Err(ShootdownIssueError::EmptyTargetSet);
+        }
+        if targets.contains(issuer_cpu) {
+            return Err(ShootdownIssueError::IssuerIsTarget);
+        }
+
+        let issuer_admission = issuer.try_admit().map_err(|error| match error {
+            AdmissionError::Unavailable => ShootdownIssueError::IssuerOffline,
+            AdmissionError::Exhausted => ShootdownIssueError::AdmissionExhausted,
+        })?;
+        after_issuer_admission();
+
+        // Hold every target admission until all validation has succeeded. This
+        // closes the online-to-publication race without an allocation or an
+        // unsafe guard array: an error drops this fixed array and releases all
+        // acquired readers before any epoch or mailbox store exists.
+        let mut target_admissions: [Option<CpuAdmission<'_>>; MAX_CPUS] =
+            core::array::from_fn(|_| None);
+        for (cpu, admission_slot) in target_admissions.iter_mut().enumerate() {
+            if !targets.contains(cpu) {
+                continue;
+            }
+            let mailbox = &self.cpus[cpu];
+            let admission = mailbox.try_admit().map_err(|error| match error {
+                AdmissionError::Unavailable => ShootdownIssueError::TargetOffline,
+                AdmissionError::Exhausted => ShootdownIssueError::AdmissionExhausted,
+            })?;
+            *admission_slot = Some(admission);
+        }
+
+        // This RMW is sequenced after the caller's PTE stores. AcqRel makes
+        // the total global epoch order carry earlier writers' stores forward:
+        // acknowledging a later epoch therefore also covers every earlier one.
+        let previous = try_update_u64(
+            &self.next_epoch,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |epoch| epoch.checked_add(1),
+        )
+        .map_err(|_| ShootdownIssueError::EpochExhausted)?;
+        let epoch = previous + 1;
+        let mut kicks = [false; MAX_CPUS];
+
+        for (cpu, kick) in kicks.iter_mut().enumerate() {
+            if !targets.contains(cpu) {
+                continue;
+            }
+            let mailbox = &self.cpus[cpu];
+            if maintenance.needs_tlb() {
+                mailbox
+                    .requested_tlb_epoch
+                    .fetch_max(epoch, Ordering::Release);
+            }
+            if maintenance.needs_icache() {
+                mailbox
+                    .requested_icache_epoch
+                    .fetch_max(epoch, Ordering::Release);
+            }
+            let post = mailbox.post_reason(CPU_MAINTENANCE_REASON);
+            *kick = post.needs_kick();
+        }
+
+        // Target admissions protect the publication stores above. They are
+        // not part of the live request; only the issuer admission must remain
+        // held through grace.
+        drop(target_admissions);
         Ok(ShootdownRequest {
             domain: self,
             _issuer_admission: issuer_admission,
@@ -688,7 +942,7 @@ pub struct ShootdownRequest<'domain, const MAX_CPUS: usize> {
     _issuer_admission: CpuAdmission<'domain>,
     epoch: u64,
     maintenance: CpuMaintenance,
-    targets: [bool; MAX_CPUS],
+    targets: CpuSet<MAX_CPUS>,
     kicks: [bool; MAX_CPUS],
 }
 
@@ -705,7 +959,12 @@ impl<'domain, const MAX_CPUS: usize> ShootdownRequest<'domain, MAX_CPUS> {
 
     /// Returns whether `cpu` must acknowledge this request.
     pub fn targets(&self, cpu: usize) -> bool {
-        self.targets.get(cpu).copied().unwrap_or(false)
+        self.targets.contains(cpu)
+    }
+
+    /// Returns the exact fixed target set owned by this request.
+    pub const fn target_set(&self) -> CpuSet<MAX_CPUS> {
+        self.targets
     }
 
     /// Returns whether this issue must send a hardware IPI to `cpu`.
@@ -715,7 +974,7 @@ impl<'domain, const MAX_CPUS: usize> ShootdownRequest<'domain, MAX_CPUS> {
 
     /// Returns the number of CPUs whose acknowledgement is required.
     pub fn target_count(&self) -> usize {
-        self.targets.iter().filter(|targeted| **targeted).count()
+        self.targets.len()
     }
 
     /// Returns whether `cpu` is a target still pending this exact request.
@@ -724,9 +983,9 @@ impl<'domain, const MAX_CPUS: usize> ShootdownRequest<'domain, MAX_CPUS> {
     /// returns `false` for an invalid CPU index or a CPU not targeted by this
     /// request.
     pub fn target_pending(&self, cpu: usize) -> bool {
-        let Some(true) = self.targets.get(cpu).copied() else {
+        if !self.targets.contains(cpu) {
             return false;
-        };
+        }
         let mailbox = &self.domain.cpus[cpu];
         (self.maintenance.needs_tlb()
             && mailbox.completed_tlb_epoch.load(Ordering::Acquire) < self.epoch)
@@ -745,8 +1004,8 @@ impl<'domain, const MAX_CPUS: usize> ShootdownRequest<'domain, MAX_CPUS> {
 
     /// Returns grace only when every target in this request acknowledged it.
     pub fn try_complete(&self) -> Option<ShootdownGrace<'domain, MAX_CPUS>> {
-        for (cpu, targeted) in self.targets.iter().copied().enumerate() {
-            if targeted && self.target_pending(cpu) {
+        for cpu in 0..MAX_CPUS {
+            if self.targets.contains(cpu) && self.target_pending(cpu) {
                 return None;
             }
         }
@@ -782,6 +1041,24 @@ mod tests {
     }
 
     #[test]
+    fn cpu_sets_are_fixed_and_bounded() {
+        let mut set = CpuSet::<3>::new();
+        assert!(set.is_empty());
+        assert!(set.insert(1));
+        assert!(set.insert(1));
+        assert!(set.try_insert(2).is_ok());
+        assert!(!set.insert(3));
+        assert_eq!(set.try_insert(3), Err(CpuSetError::InvalidCpu));
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(1));
+        assert!(set.contains(2));
+        assert!(!set.contains(0));
+        assert!(!set.contains(3));
+        assert_eq!(CpuSet::<3>::from_cpu(2).unwrap().len(), 1);
+        assert_eq!(CpuSet::<3>::from_cpu(3), None);
+    }
+
+    #[test]
     fn issue_targets_every_other_online_cpu() {
         let domain = TlbShootdown::<4>::new();
         online(&domain);
@@ -800,6 +1077,133 @@ mod tests {
         assert!(!request.target_pending(4));
         assert!(!request.target_complete(4));
         assert!(request.try_complete().is_none());
+    }
+
+    #[test]
+    fn targeted_issue_publishes_and_acks_only_the_fixed_targets() {
+        let domain = TlbShootdown::<4>::new();
+        online(&domain);
+        let mut targets = CpuSet::new();
+        assert!(targets.insert(1));
+        assert!(targets.insert(3));
+
+        let request = domain
+            .issue_after_local_maintenance_for_targets(0, targets, CpuMaintenance::TLB)
+            .unwrap();
+        assert_eq!(request.epoch(), 1);
+        assert_eq!(request.target_set(), targets);
+        assert_eq!(request.target_count(), 2);
+        assert!(!request.targets(0));
+        assert!(request.targets(1));
+        assert!(!request.targets(2));
+        assert!(request.targets(3));
+        assert!(!request.needs_kick(0));
+        assert!(request.needs_kick(1));
+        assert!(!request.needs_kick(2));
+        assert!(request.needs_kick(3));
+
+        let issuer = domain.cpu_snapshot(0).unwrap();
+        assert_eq!(issuer.requested_tlb_epoch(), 0);
+        assert_eq!(issuer.pending_reasons(), 0);
+        assert_eq!(issuer.admissions(), 1);
+        let non_target = domain.cpu_snapshot(2).unwrap();
+        assert_eq!(non_target.requested_tlb_epoch(), 0);
+        assert_eq!(non_target.completed_tlb_epoch(), 0);
+        assert_eq!(non_target.pending_reasons(), 0);
+        assert_eq!(non_target.admissions(), 0);
+        for cpu in [1, 3] {
+            let snapshot = domain.cpu_snapshot(cpu).unwrap();
+            assert_eq!(snapshot.requested_tlb_epoch(), request.epoch());
+            assert_eq!(snapshot.completed_tlb_epoch(), 0);
+            assert_eq!(snapshot.pending_reasons(), CPU_MAINTENANCE_REASON.bit());
+            assert!(request.target_pending(cpu));
+        }
+        assert!(request.try_complete().is_none());
+
+        assert_eq!(
+            domain.take_pending_reasons(1).unwrap(),
+            CPU_MAINTENANCE_REASON.bit()
+        );
+        domain.service_maintenance(1, |_| {}).unwrap();
+        assert!(request.target_complete(1));
+        assert!(request.target_pending(3));
+        assert!(request.try_complete().is_none());
+
+        assert_eq!(
+            domain.take_pending_reasons(3).unwrap(),
+            CPU_MAINTENANCE_REASON.bit()
+        );
+        domain.service_maintenance(3, |_| {}).unwrap();
+        assert!(request.try_complete().is_some());
+    }
+
+    #[test]
+    fn targeted_issue_rejects_empty_issuer_and_offline_targets_without_publication() {
+        let domain = TlbShootdown::<3>::new();
+        domain.publish_online(0).unwrap();
+        domain.publish_online(1).unwrap();
+
+        assert_eq!(
+            domain
+                .issue_after_local_maintenance_for_targets(0, CpuSet::empty(), CpuMaintenance::TLB,)
+                .err(),
+            Some(ShootdownIssueError::EmptyTargetSet)
+        );
+
+        let issuer_target = CpuSet::from_cpu(0).unwrap();
+        assert_eq!(
+            domain
+                .issue_after_local_maintenance_for_targets(0, issuer_target, CpuMaintenance::TLB,)
+                .err(),
+            Some(ShootdownIssueError::IssuerIsTarget)
+        );
+
+        let mut offline_target = CpuSet::new();
+        assert!(offline_target.insert(1));
+        assert!(offline_target.insert(2));
+        assert_eq!(
+            domain
+                .issue_after_local_maintenance_for_targets(0, offline_target, CpuMaintenance::TLB,)
+                .err(),
+            Some(ShootdownIssueError::TargetOffline)
+        );
+        assert_eq!(domain.next_epoch.load(Ordering::Acquire), 0);
+        assert_eq!(domain.cpu_snapshot(0).unwrap().admissions(), 0);
+        for cpu in [1, 2] {
+            let snapshot = domain.cpu_snapshot(cpu).unwrap();
+            assert_eq!(snapshot.requested_tlb_epoch(), 0);
+            assert_eq!(snapshot.pending_reasons(), 0);
+            assert_eq!(snapshot.admissions(), 0);
+        }
+    }
+
+    #[test]
+    fn targeted_issue_closes_offline_race_before_target_admission() {
+        let domain = TlbShootdown::<3>::new();
+        online(&domain);
+        let mut targets = CpuSet::new();
+        assert!(targets.insert(1));
+        assert!(targets.insert(2));
+
+        let result = domain.issue_after_local_maintenance_for_targets_with(
+            0,
+            targets,
+            CpuMaintenance::TLB,
+            || {
+                // This runs after the issuer is admitted but before any
+                // target admission. The strict path must report the target
+                // transition and leave target 1 unpublished.
+                domain.begin_offline(2).unwrap();
+            },
+        );
+        assert_eq!(result.err(), Some(ShootdownIssueError::TargetOffline));
+        assert_eq!(domain.next_epoch.load(Ordering::Acquire), 0);
+        let target_one = domain.cpu_snapshot(1).unwrap();
+        assert_eq!(target_one.admissions(), 0);
+        assert_eq!(target_one.requested_tlb_epoch(), 0);
+        assert_eq!(target_one.pending_reasons(), 0);
+        assert!(domain.cpu_snapshot(2).unwrap().is_draining());
+        domain.complete_offline(2).unwrap();
     }
 
     #[test]

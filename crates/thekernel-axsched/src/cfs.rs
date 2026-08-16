@@ -8,8 +8,8 @@ use core::{
 use intrusive_collections::{intrusive_adapter, Bound, KeyAdapter, RBTree, RBTreeAtomicLink};
 
 use crate::{
-    allocate_scheduler_id, BaseScheduler, DeactivateReason, EnqueueReason, SchedulerError,
-    CONFIGURING, UNOWNED,
+    allocate_scheduler_id, try_update_isize, BaseScheduler, DeactivateReason, EnqueueReason,
+    SchedulerError, CONFIGURING, UNOWNED,
 };
 
 /// Default tick budget assigned to a round-robin task.
@@ -331,11 +331,13 @@ impl<T> CFSTask<T> {
     }
 
     fn task_tick_rr(&self) -> isize {
-        self.rr_time_slice
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |slice| {
-                Some(slice.saturating_sub(1))
-            })
-            .unwrap_or(0)
+        try_update_isize(
+            &self.rr_time_slice,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |slice| Some(slice.saturating_sub(1)),
+        )
+        .unwrap_or(0)
     }
 
     fn set_sched_params(&self, params: CfsTaskParams) {
@@ -355,11 +357,9 @@ impl<T> CFSTask<T> {
     }
 
     fn task_tick(&self) {
-        let _ = self
-            .delta
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |delta| {
-                Some(delta.saturating_add(1))
-            });
+        let _ = try_update_isize(&self.delta, Ordering::AcqRel, Ordering::Acquire, |delta| {
+            Some(delta.saturating_add(1))
+        });
     }
 
     fn stage_ready_key(&self, class: u8, order: isize, sequence: isize) {

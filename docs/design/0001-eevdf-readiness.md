@@ -238,13 +238,13 @@ It remains mutually exclusive with FIFO, RR, and CFS through `axsched`,
   an observed latency win, and an explicit approval.
 - Wake-heavy and mixed-latency workloads demonstrate the intended p99 benefit
   without an unbounded context-switch increase.
-- QEMU TCG is a correctness gate, not the sole performance gate. RISC-V and
-  LoongArch hardware (or hardware acceleration where representative) must be
+- QEMU TCG is a correctness gate, not the sole performance gate. The supported
+  x86_64 hardware path (or representative hardware acceleration) must be
   measured separately, especially while address-space switches still perform
   broad TLB invalidation.
 - The feature is opt-in for at least one release cycle. `sched-cfs` stays the
-  default until both architectures pass the same SMP/lifecycle suite and the
-  kernel-level benchmark receipts are reviewed.
+  default until x86_64 passes the same SMP/lifecycle suite and the kernel-level
+  benchmark receipts are reviewed.
 
 ## Implementation sequence
 
@@ -253,7 +253,7 @@ It remains mutually exclusive with FIFO, RR, and CFS through `axsched`,
 2. Implement and verify the standalone intrusive augmented tree.
 3. Add the EEVDF entity and single-run-queue scheduler behind `sched-eevdf`.
 4. Wire lifecycle, class precedence, migration tokens, and feature forwarding.
-5. Run SMP stress and architecture builds with stealing disabled.
+5. Run SMP stress and x86_64 builds with stealing disabled.
 6. Collect hardware performance receipts; only then evaluate default status
    and a separately feature-gated idle-stealing experiment.
 

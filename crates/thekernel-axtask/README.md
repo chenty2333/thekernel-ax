@@ -17,7 +17,7 @@ queues, interrupt/timer wake mechanisms, and bounded deferred reclamation. It
 does not own Linux PID allocation, credential/process policy, scheduling ABI
 numbers, errno translation, or benchmark profiles.
 
-Version 0.1.0 is tested with `nightly-2025-05-20` and does not claim a stable
+Version 0.1.0 is tested with the rolling `nightly` toolchain and does not claim a stable
 `rust-version`, because fallible standard `Arc` allocation still uses
 `allocator_api`.
 
@@ -27,7 +27,7 @@ compile error in 0.1.0. The current registry `axhal` API only offers infallible
 `TlsArea::alloc()`, which can enter a null-pointer/allocator failure path before
 `TaskCreateError` can report OOM. TLS task support can return in a later 0.x
 release after the lower layer exposes a fallible allocation/initialization
-contract and both architectures pass it.
+contract and the supported x86_64 target passes it.
 
 The `irq-exit` feature is a coordinated lower-layer contract, not a dormant
 performance option. TheKernel enables it unconditionally when consuming its

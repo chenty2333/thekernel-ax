@@ -421,7 +421,7 @@ impl TaskIdAllocator {
     /// still consume identities above that personality's ceiling.
     fn allocate_up_to(&self, maximum: u64) -> Result<TaskId, TaskCreateError> {
         self.0
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 (next != 0 && next <= maximum).then(|| next.checked_add(1).unwrap_or(0))
             })
             .map(TaskId)
@@ -1358,7 +1358,7 @@ impl TaskInner {
     pub(crate) fn disable_preempt(&self) {
         if self
             .preempt_disable_count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 count.checked_add(1)
             })
             .is_err()
@@ -1370,11 +1370,11 @@ impl TaskInner {
     #[inline]
     #[cfg(feature = "preempt")]
     pub(crate) fn enable_preempt(&self, resched: bool) {
-        match self.preempt_disable_count.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |count| count.checked_sub(1),
-        ) {
+        match self
+            .preempt_disable_count
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            }) {
             Ok(1) if resched && self.need_resched.load(Ordering::Acquire) => {
                 // If current task is pending to be preempted, do rescheduling.
                 Self::current_check_preempt_pending();
@@ -1684,7 +1684,7 @@ impl TaskInner {
 
         if self
             .exit_queue_generation
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
                 generation.checked_add(1)
             })
             .is_err()

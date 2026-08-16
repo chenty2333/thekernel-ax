@@ -337,7 +337,9 @@ struct LenOnDrop<const CAPACITY: usize> {
 }
 
 impl<const CAPACITY: usize> std::task::Wake for LenOnDrop<CAPACITY> {
-    fn wake(self: Arc<Self>) {}
+    fn wake(self: Arc<Self>) {
+        self.dropped.store(true, Ordering::SeqCst);
+    }
 }
 
 impl<const CAPACITY: usize> Drop for LenOnDrop<CAPACITY> {

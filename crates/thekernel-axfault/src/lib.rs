@@ -11,6 +11,48 @@ extern crate std;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+fn try_update_usize<F>(
+    atomic: &AtomicUsize,
+    set: Ordering,
+    fail: Ordering,
+    mut update: F,
+) -> Result<usize, usize>
+where
+    F: FnMut(usize) -> Option<usize>,
+{
+    let mut current = atomic.load(fail);
+    loop {
+        let Some(next) = update(current) else {
+            return Err(current);
+        };
+        match atomic.compare_exchange_weak(current, next, set, fail) {
+            Ok(previous) => return Ok(previous),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+fn try_update_u64<F>(
+    atomic: &AtomicU64,
+    set: Ordering,
+    fail: Ordering,
+    mut update: F,
+) -> Result<u64, u64>
+where
+    F: FnMut(u64) -> Option<u64>,
+{
+    let mut current = atomic.load(fail);
+    loop {
+        let Some(next) = update(current) else {
+            return Err(current);
+        };
+        match atomic.compare_exchange_weak(current, next, set, fail) {
+            Ok(previous) => return Ok(previous),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 static NEXT_BROKER_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Failure while constructing a broker and reserving all of its storage.
@@ -92,26 +134,32 @@ impl RequestCreditPool {
     }
 
     fn try_acquire(&self) -> bool {
-        self.live_requests
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        try_update_usize(
+            &self.live_requests,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| {
                 if current >= self.capacity {
                     None
                 } else {
                     current.checked_add(1)
                 }
-            })
-            .is_ok()
+            },
+        )
+        .is_ok()
     }
 
     fn try_release(&self, count: usize) -> bool {
         if count == 0 {
             return true;
         }
-        self.live_requests
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_sub(count)
-            })
-            .is_ok()
+        try_update_usize(
+            &self.live_requests,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| current.checked_sub(count),
+        )
+        .is_ok()
     }
 
     fn release_exact(&self, count: usize) {
@@ -731,11 +779,13 @@ where
             });
         }
 
-        let id = NEXT_BROKER_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
-            .map_err(|_| BrokerConfigError::BrokerIdentityExhausted)?;
+        let id = try_update_u64(
+            &NEXT_BROKER_ID,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| current.checked_add(1),
+        )
+        .map_err(|_| BrokerConfigError::BrokerIdentityExhausted)?;
         Ok(Self {
             id,
             requests,

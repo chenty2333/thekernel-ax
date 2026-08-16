@@ -36,17 +36,15 @@ cargo +1.85.0 package --locked --list -p thekernel-axcbpf
 cargo +1.85.0 package --locked --list -p thekernel-axpmu
 cargo package --locked --list -p thekernel-axsched
 cargo package --locked --list -p thekernel-axpoll
-cargo +nightly-2025-05-20 package --locked --list -p thekernel-axtask
+cargo +nightly package --locked --list -p thekernel-axtask
 ```
 
 The original-package unpack test builds `thekernel-axcbpf` and
 `thekernel-axpmu` from their normalized archives with Rust 1.85.0, `--locked`,
-and `--offline`. For `thekernel-axpmu`, it also checks the unpacked archive for
-RV64 with the public `riscv-sbi` feature and for LA64 with default features;
-these checks cover the normalized manifest's target dependency, feature, and
-packaged-source boundaries rather than only the workspace source. The
-maintained-fork unpack test builds leaf packages directly from their normalized
-archives, while the first axtask release uses only the two sibling archives
+and `--offline`. These checks cover normalized manifests and packaged-source
+boundaries rather than only the workspace source. The maintained-fork unpack
+test builds leaf packages directly from their normalized archives, while the
+first axtask release uses only the two sibling archives
 whose SHA-256 values match its generated release lock. These gates prove
 packaged source builds outside both this workspace and TheKernel's patch table,
 but the latter is not described as a registry-only axtask check before those
@@ -56,7 +54,8 @@ two leaf versions exist.
 
 1. Run `scripts/publish-dry-run.sh`. It first performs real crates.io publish
    dry-runs for `thekernel-axcbpf` and `thekernel-axpmu` with Rust 1.85.0, then
-   performs the two coordinated leaf-package dry-runs with the pinned nightly.
+   performs the two coordinated leaf-package dry-runs with the rolling
+   `nightly` toolchain.
    A successful dry-run does not publish either original package.
 2. Publish `thekernel-axcbpf` only from the exact commit whose package, offline
    unpack, provenance, CI, and publish dry-run gates passed:

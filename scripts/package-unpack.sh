@@ -2,7 +2,7 @@
 set -euo pipefail
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-toolchain=${CARGO_TOOLCHAIN:-nightly-2025-05-20}
+toolchain=${CARGO_TOOLCHAIN:-nightly}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
@@ -146,13 +146,6 @@ CARGO_TARGET_DIR="$tmp/test-target/axsched" \
     run_cargo test --manifest-path "$axsched/Cargo.toml" --all-targets --locked
 CARGO_TARGET_DIR="$tmp/test-target/axpoll" \
     run_cargo test --manifest-path "$axpoll/Cargo.toml" --all-targets --locked
-for target in riscv64gc-unknown-none-elf loongarch64-unknown-none; do
-    CARGO_TARGET_DIR="$tmp/test-target/axpoll-$target" \
-        run_cargo check \
-            --manifest-path "$axpoll/Cargo.toml" \
-            --locked \
-            --target "$target"
-done
 
 patches=(
     --config "patch.crates-io.thekernel-axsched.path=\"$axsched\""
@@ -214,16 +207,6 @@ CARGO_TARGET_DIR="$tmp/test-target/axtask" \
         --offline \
         --features "test multitask irq preempt smp sched-cfs task-ext irq-exit" \
         "${patches[@]}"
-for target in riscv64gc-unknown-none-elf loongarch64-unknown-none; do
-    CARGO_TARGET_DIR="$tmp/test-target/axtask-$target" \
-        run_cargo check \
-            --manifest-path "$axtask/Cargo.toml" \
-            --locked \
-            --offline \
-            --target "$target" \
-            --features "multitask irq preempt smp sched-cfs task-ext irq-exit" \
-            "${patches[@]}"
-done
 CARGO_TARGET_DIR="$tmp/test-target/axtask-minimal" \
     run_cargo check \
         --manifest-path "$axtask/Cargo.toml" \
