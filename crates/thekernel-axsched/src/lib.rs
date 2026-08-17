@@ -2,6 +2,9 @@
 #![doc = include_str!("../README.md")]
 
 mod cfs;
+mod eevdf;
+mod eevdf_model;
+mod eevdf_tree;
 mod fifo;
 mod round_robin;
 
@@ -16,6 +19,7 @@ pub use cfs::{
     CFSTask, CFScheduler, CfsReservationCommitError, CfsTaskClass, CfsTaskParams,
     CfsTaskReservation, RR_TIMESLICE_TICKS, RT_PRIORITY_MAX, RT_PRIORITY_MIN,
 };
+pub use eevdf::{EEVDFScheduler, EEVDFTask, EevdfTaskClass, EevdfTaskParams};
 pub use fifo::{FifoScheduler, FifoTask};
 pub use round_robin::{RRScheduler, RRTask};
 
@@ -91,6 +95,8 @@ pub enum SchedulerError {
     /// Ordering identities never wrap or get reused; a reservation issued
     /// before exhaustion remains valid and committable.
     SequenceExhausted,
+    /// A checked virtual-time, weight, or deadline calculation overflowed.
+    ArithmeticExhausted,
     /// A task is undergoing an atomic configuration transaction.
     TaskBusy,
     /// Scheduling parameters were outside the mechanism's accepted domain.
