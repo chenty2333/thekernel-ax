@@ -6,15 +6,15 @@ use alloc::{
 };
 
 use axerrno::{AxError, AxResult};
-#[cfg(feature = "sched-cfs")]
+#[cfg(feature = "sched-eevdf")]
 pub use axsched::{
-    CfsTaskClass as SchedClass, CfsTaskParams as SchedState, RR_TIMESLICE_TICKS, RT_PRIORITY_MAX,
-    RT_PRIORITY_MIN,
+    EevdfTaskClass as SchedClass, EevdfTaskParams as SchedState, RR_TIMESLICE_TICKS,
+    RT_PRIORITY_MAX, RT_PRIORITY_MIN,
 };
 use kernel_guard::NoPreemptIrqSave;
 use spin::Once;
 
-#[cfg(feature = "sched-cfs")]
+#[cfg(feature = "sched-eevdf")]
 pub use crate::run_queue::PreparedTaskPublication;
 pub use crate::run_queue::{
     SchedulerLoadSnapshot, TaskEnqueueError, TaskEnqueueErrorKind, TaskRuntimeInitError,
@@ -63,9 +63,9 @@ cfg_if::cfg_if! {
         const MAX_TIME_SLICE: usize = 5;
         pub(crate) type AxTask = axsched::RRTask<TaskInner, MAX_TIME_SLICE>;
         pub(crate) type Scheduler = axsched::RRScheduler<TaskInner, MAX_TIME_SLICE>;
-    } else if #[cfg(feature = "sched-cfs")] {
-        pub(crate) type AxTask = axsched::CFSTask<TaskInner>;
-        pub(crate) type Scheduler = axsched::CFScheduler<TaskInner>;
+    } else if #[cfg(feature = "sched-eevdf")] {
+        pub(crate) type AxTask = axsched::EEVDFTask<TaskInner>;
+        pub(crate) type Scheduler = axsched::EEVDFScheduler<TaskInner>;
     } else {
         // If no scheduler features are set, use FIFO as the default.
         pub(crate) type AxTask = axsched::FifoTask<TaskInner>;
@@ -357,7 +357,8 @@ fn map_scheduler_error(error: axsched::SchedulerError) -> AxError {
     match error {
         axsched::SchedulerError::UnsupportedOperation => AxError::OperationNotSupported,
         axsched::SchedulerError::IdentifierExhausted
-        | axsched::SchedulerError::SequenceExhausted => AxError::OutOfRange,
+        | axsched::SchedulerError::SequenceExhausted
+        | axsched::SchedulerError::ArithmeticExhausted => AxError::OutOfRange,
         axsched::SchedulerError::TaskBusy => AxError::ResourceBusy,
         axsched::SchedulerError::InvalidParameters
         | axsched::SchedulerError::IncompatibleClass
@@ -421,7 +422,7 @@ where
 }
 
 /// Adds the given task to the run queue with the specified scheduling state.
-#[cfg(feature = "sched-cfs")]
+#[cfg(feature = "sched-eevdf")]
 pub fn spawn_task_with_sched(task: TaskInner, sched_state: SchedState) -> AxResult<AxTaskRef> {
     let task_ref = task.into_arc().map_err(map_task_create_error)?;
     task_ref
@@ -433,8 +434,8 @@ pub fn spawn_task_with_sched(task: TaskInner, sched_state: SchedState) -> AxResu
 }
 
 /// Adds the given task to the run queue with the specified scheduling state,
-/// inheriting the parent's fair vruntime when applicable.
-#[cfg(feature = "sched-cfs")]
+/// inheriting an opaque EEVDF fork seed when the parent's class supports it.
+#[cfg(feature = "sched-eevdf")]
 pub fn spawn_task_with_sched_from(
     task: TaskInner,
     sched_state: SchedState,
@@ -444,7 +445,7 @@ pub fn spawn_task_with_sched_from(
     task_ref
         .configure(sched_state)
         .map_err(map_scheduler_error)?;
-    inherit_fair_vruntime_if_applicable(&task_ref, parent)?;
+    install_fork_seed_if_applicable(&task_ref, parent)?;
     let publication = select_run_queue::<NoPreemptIrqSave>(&task_ref).add_task(task_ref.clone());
     publication.map_err(map_task_enqueue_error)?;
     Ok(task_ref)
@@ -452,7 +453,7 @@ pub fn spawn_task_with_sched_from(
 
 /// Fallibly constructs and configures a task without publishing it to a run
 /// queue. This is the allocation/admission half of task creation.
-#[cfg(feature = "sched-cfs")]
+#[cfg(feature = "sched-eevdf")]
 pub fn prepare_task_with_sched_from(
     task: TaskInner,
     sched_state: SchedState,
@@ -462,13 +463,13 @@ pub fn prepare_task_with_sched_from(
     task_ref
         .configure(sched_state)
         .map_err(map_scheduler_error)?;
-    inherit_fair_vruntime_if_applicable(&task_ref, parent)?;
+    install_fork_seed_if_applicable(&task_ref, parent)?;
     Ok(task_ref)
 }
 
-#[cfg(feature = "sched-cfs")]
-fn inherit_fair_vruntime_if_applicable(task: &AxTaskRef, parent: &AxTaskRef) -> AxResult {
-    match task.inherit_fair_vruntime_from(parent) {
+#[cfg(feature = "sched-eevdf")]
+fn install_fork_seed_if_applicable(task: &AxTaskRef, parent: &AxTaskRef) -> AxResult {
+    match crate::run_queue::install_fork_seed_from_parent(task, parent) {
         Ok(()) | Err(axsched::SchedulerError::IncompatibleClass) => Ok(()),
         Err(error) => Err(map_scheduler_error(error)),
     }
@@ -480,7 +481,7 @@ fn inherit_fair_vruntime_if_applicable(task: &AxTaskRef, parent: &AxTaskRef) -> 
 /// sequence admission all complete here. Dropping the returned token cancels
 /// the claim. A lifecycle adapter should obtain this token before committing
 /// any process, signal, or lookup-table state which cannot be rolled back.
-#[cfg(feature = "sched-cfs")]
+#[cfg(feature = "sched-eevdf")]
 pub fn reserve_prepared_task(task: AxTaskRef) -> Result<PreparedTaskPublication, TaskEnqueueError> {
     if !task.try_reserve_publication_mutation() {
         return Err(TaskEnqueueError {
@@ -493,7 +494,7 @@ pub fn reserve_prepared_task(task: AxTaskRef) -> Result<PreparedTaskPublication,
 
 /// Publishes an already reserved task without allocation or recoverable
 /// failure and returns the exact runnable task owner.
-#[cfg(feature = "sched-cfs")]
+#[cfg(feature = "sched-eevdf")]
 pub fn publish_prepared_task(publication: PreparedTaskPublication) -> AxTaskRef {
     publication.commit()
 }
@@ -535,26 +536,26 @@ where
 /// Set the priority for current task.
 ///
 /// The range of the priority is dependent on the underlying scheduler. For
-/// example, in the [CFS] scheduler, the priority is the nice value, ranging from
+/// example, in the [EEVDF] scheduler, the priority is the nice value, ranging from
 /// -20 to 19.
 ///
 /// Returns a typed mechanism error when the selected scheduler cannot apply
 /// the update. Linux policy and errno mapping intentionally stay in the OS
 /// personality above this crate.
 ///
-/// [CFS]: https://en.wikipedia.org/wiki/Completely_Fair_Scheduler
+/// [EEVDF]: https://en.wikipedia.org/wiki/Eligible_virtual_deadline_first
 pub fn set_priority(prio: isize) -> Result<(), TaskSchedError> {
     current_run_queue::<NoPreemptIrqSave>().set_current_priority(prio)
 }
 
 /// Returns the runtime scheduling state of a task.
-#[cfg(feature = "sched-cfs")]
+#[cfg(feature = "sched-eevdf")]
 pub fn sched_state(task: &AxTaskRef) -> SchedState {
     task.sched_params()
 }
 
 /// Applies the runtime scheduling state of a task.
-#[cfg(feature = "sched-cfs")]
+#[cfg(feature = "sched-eevdf")]
 pub fn set_sched_state(task: &AxTaskRef, sched_state: SchedState) -> Result<(), TaskSchedError> {
     crate::run_queue::set_task_sched_state_stable(task, sched_state)
 }
@@ -633,7 +634,7 @@ fn try_prepare_migration_task(migrated: &AxTaskRef) -> AxResult<AxTaskRef> {
         .map_err(|_| AxError::NoMemory)?;
     name.push_str(MIGRATION_TASK_NAME);
     let migrated = Arc::downgrade(migrated);
-    let task = TaskInner::try_new(
+    let mut task = TaskInner::try_new(
         move || {
             if let Some(migrated) = migrated.upgrade() {
                 crate::run_queue::migrate_entry(migrated);
@@ -643,6 +644,7 @@ fn try_prepare_migration_task(migrated: &AxTaskRef) -> AxResult<AxTaskRef> {
         MIGRATION_TASK_STACK_SIZE,
     )
     .map_err(map_task_create_error)?;
+    task.mark_migration_helper();
     task.try_into_arc().map_err(map_task_create_error)
 }
 

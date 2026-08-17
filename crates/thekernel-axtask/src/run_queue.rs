@@ -11,8 +11,8 @@ use core::{
 };
 
 use axhal::{mem::total_ram_size, percpu::this_cpu_id};
-#[cfg(feature = "sched-cfs")]
-use axsched::CfsTaskReservation;
+#[cfg(feature = "sched-eevdf")]
+use axsched::EevdfTaskReservation;
 use axsched::{BaseScheduler, DeactivateReason, EnqueueReason, SchedulerError};
 use futures_util::task::AtomicWaker;
 use kernel_guard::BaseGuard;
@@ -579,20 +579,20 @@ impl fmt::Display for TaskEnqueueError {
 
 impl core::error::Error for TaskEnqueueError {}
 
-/// Reserved final publication of one new CFS task.
+/// Reserved final publication of one new EEVDF task.
 ///
 /// The token retains the exact permanent destination run queue and the
 /// scheduler's private ownership/ordering reservation. It is not runnable
 /// until [`crate::publish_prepared_task`] consumes this value. Dropping it
 /// cancels scheduler admission without ever publishing the task.
-#[cfg(feature = "sched-cfs")]
+#[cfg(feature = "sched-eevdf")]
 #[must_use = "dropping the token cancels runnable-task publication"]
 pub struct PreparedTaskPublication {
     run_queue: &'static AxRunQueue,
-    reservation: Option<CfsTaskReservation<TaskInner>>,
+    reservation: Option<EevdfTaskReservation<TaskInner>>,
 }
 
-#[cfg(feature = "sched-cfs")]
+#[cfg(feature = "sched-eevdf")]
 impl PreparedTaskPublication {
     /// Returns the exact unpublished task held by this reservation.
     pub fn task(&self) -> &AxTaskRef {
@@ -604,8 +604,28 @@ impl PreparedTaskPublication {
 
     /// Cancels publication and returns an owned reference to the task.
     pub fn cancel(self) -> AxTaskRef {
-        let task = Arc::clone(self.task());
-        drop(self);
+        let mut publication = self;
+        let reservation = publication
+            .reservation
+            .take()
+            .expect("live task publication always owns its reservation");
+        let task = Arc::clone(reservation.task());
+        if let Err(error) = reservation.cancel() {
+            task.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+            error!(
+                "prepared task {} cancellation invariant failed: {:?}",
+                task.id().as_u64(),
+                error
+            );
+            axhal::power::system_off();
+        }
+        if !task.release_publication_mutation() {
+            error!(
+                "prepared task {} cancellation retained publication mutation",
+                task.id().as_u64()
+            );
+            axhal::power::system_off();
+        }
         task
     }
 
@@ -623,7 +643,7 @@ impl PreparedTaskPublication {
         // lifecycle state. Re-establish the run-queue locking contract only
         // around this final scheduler mutation. Otherwise the local timer IRQ
         // can re-enter `scheduler_timer_tick()` and spin forever on this raw
-        // scheduler lock while publication is refreshing CFS state.
+        // scheduler lock while publication is refreshing EEVDF state.
         let _guard = kernel_guard::NoPreemptIrqSave::new();
         let (publication, publication_claim_corrupt) = {
             let mut scheduler = self.run_queue.scheduler.lock();
@@ -675,7 +695,7 @@ impl PreparedTaskPublication {
     }
 }
 
-#[cfg(feature = "sched-cfs")]
+#[cfg(feature = "sched-eevdf")]
 impl fmt::Debug for PreparedTaskPublication {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -686,11 +706,28 @@ impl fmt::Debug for PreparedTaskPublication {
     }
 }
 
-#[cfg(feature = "sched-cfs")]
+#[cfg(feature = "sched-eevdf")]
 impl Drop for PreparedTaskPublication {
     fn drop(&mut self) {
-        if let Some(reservation) = self.reservation.as_ref() {
-            reservation.task().release_publication_mutation();
+        let Some(reservation) = self.reservation.take() else {
+            return;
+        };
+        let task = Arc::clone(reservation.task());
+        if let Err(error) = reservation.cancel() {
+            task.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+            error!(
+                "dropped task publication {} cancellation invariant failed: {:?}",
+                task.id().as_u64(),
+                error
+            );
+            axhal::power::system_off();
+        }
+        if !task.release_publication_mutation() {
+            error!(
+                "dropped task publication {} retained its mutation claim",
+                task.id().as_u64()
+            );
+            axhal::power::system_off();
         }
     }
 }
@@ -721,7 +758,7 @@ pub enum TaskSchedError {
     Scheduler(SchedulerError),
 }
 
-#[cfg(feature = "sched-cfs")]
+#[cfg(feature = "sched-eevdf")]
 enum TaskSchedUpdate {
     Complete(Result<(), TaskSchedError>),
     #[cfg(feature = "smp")]
@@ -744,10 +781,10 @@ impl From<SchedulerError> for TaskSchedError {
 /// sampled the old ID either completes before the move or observes the redirect
 /// and retries the new owner. The retry bound prevents a hostile migration loop
 /// from keeping the caller in an IRQ/preemption-disabled path indefinitely.
-#[cfg(feature = "sched-cfs")]
+#[cfg(feature = "sched-eevdf")]
 pub(crate) fn set_task_sched_state_stable(
     task: &AxTaskRef,
-    sched_state: axsched::CfsTaskParams,
+    sched_state: axsched::EevdfTaskParams,
 ) -> Result<(), TaskSchedError> {
     #[cfg(not(feature = "smp"))]
     {
@@ -770,6 +807,61 @@ pub(crate) fn set_task_sched_state_stable(
         }
         Err(TaskSchedError::Scheduler(SchedulerError::TaskBusy))
     }
+}
+
+/// Install a scheduler-produced EEVDF fork seed while holding the sampled
+/// parent's run-queue lock.  The CPU publication is rechecked after lock
+/// acquisition; a concurrent migration therefore redirects this bounded
+/// attempt instead of reading the parent's entity outside its owner lock.
+#[cfg(feature = "sched-eevdf")]
+pub(crate) fn install_fork_seed_from_parent(
+    child: &AxTaskRef,
+    parent: &AxTaskRef,
+) -> Result<(), SchedulerError> {
+    if matches!(
+        child.sched_params().class,
+        axsched::EevdfTaskClass::RoundRobin | axsched::EevdfTaskClass::Fifo
+    ) {
+        return Err(SchedulerError::IncompatibleClass);
+    }
+
+    #[cfg(feature = "smp")]
+    let attempts = axconfig::plat::MAX_CPU_NUM.saturating_add(1).max(2);
+    #[cfg(not(feature = "smp"))]
+    let attempts = 1;
+    for _ in 0..attempts {
+        let sampled_cpu = parent.cpu_id() as usize;
+        #[cfg(feature = "smp")]
+        let Some(source) = get_run_queue(sampled_cpu) else {
+            continue;
+        };
+        #[cfg(not(feature = "smp"))]
+        let source = current_run_queue_inner();
+
+        let mut scheduler = source.scheduler.lock();
+        if parent.cpu_id() as usize != sampled_cpu {
+            continue;
+        }
+        match scheduler.fork_seed(parent) {
+            Ok(seed) => return child.install_fork_seed(seed),
+            Err(SchedulerError::IncompatibleClass) => {
+                return Err(SchedulerError::IncompatibleClass);
+            }
+            // A bootstrap task can be Running before it has ever been admitted
+            // to the scheduler's running slot. It has no fair entity to seed.
+            // A Ready task reporting ForeignQueue is instead a concurrent
+            // owner transition (typically migration), so retry after a fresh
+            // CPU snapshot rather than treating it as an unseedable parent.
+            Err(SchedulerError::ForeignQueue)
+                if matches!(parent.state(), TaskState::Running | TaskState::Blocked) =>
+            {
+                return Err(SchedulerError::IncompatibleClass);
+            }
+            Err(SchedulerError::ForeignQueue) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(SchedulerError::TaskBusy)
 }
 
 impl From<TaskCreateError> for TaskRuntimeInitError {
@@ -996,7 +1088,7 @@ pub(crate) fn select_run_queue<G: BaseGuard>(task: &AxTaskRef) -> AxRunQueueRef<
         // A blocked task already owns a target CPU chosen by the blocking or
         // affinity transaction. Keeping its wake on that owner run queue makes
         // wake and scheduler-parameter updates share one scheduler lock. This
-        // excludes a transient CFS CONFIGURING owner from the valid wake path.
+        // excludes a transient EEVDF CONFIGURING owner from the valid wake path.
         let index = if matches!(task.state(), TaskState::Blocked) {
             task.cpu_id() as usize
         } else {
@@ -1013,7 +1105,7 @@ pub(crate) fn select_run_queue<G: BaseGuard>(task: &AxTaskRef) -> AxRunQueueRef<
 
 /// Returns the run queue that currently owns the task, if any.
 #[inline]
-#[cfg(any(feature = "smp", feature = "sched-cfs"))]
+#[cfg(any(feature = "smp", feature = "sched-eevdf"))]
 pub(crate) fn task_run_queue<G: BaseGuard>(task: &AxTaskRef) -> AxRunQueueRef<'static, G> {
     let irq_state = G::acquire();
     #[cfg(not(feature = "smp"))]
@@ -1168,11 +1260,11 @@ impl<G: BaseGuard> AxRunQueueRef<'_, G> {
         }
     }
 
-    #[cfg(feature = "sched-cfs")]
+    #[cfg(feature = "sched-eevdf")]
     fn set_task_sched_state_once(
         &mut self,
         task: &AxTaskRef,
-        sched_state: axsched::CfsTaskParams,
+        sched_state: axsched::EevdfTaskParams,
     ) -> TaskSchedUpdate {
         if matches!(task.state(), TaskState::Exited) {
             return TaskSchedUpdate::Complete(Err(TaskSchedError::TaskExited));
@@ -1192,9 +1284,9 @@ impl<G: BaseGuard> AxRunQueueRef<'_, G> {
     }
 }
 
-#[cfg(feature = "sched-cfs")]
+#[cfg(feature = "sched-eevdf")]
 impl<G: BaseGuard> AxRunQueueRef<'static, G> {
-    /// Reserves final publication of a brand-new CFS task.
+    /// Reserves final publication of a brand-new EEVDF task.
     pub(crate) fn reserve_claimed_new_task(
         &mut self,
         task: AxTaskRef,
@@ -1268,6 +1360,12 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
     #[cfg(feature = "irq")]
     pub fn scheduler_timer_tick(&mut self) {
         let curr = self.current_task();
+        // The migration helper is intentionally outside the source and
+        // destination scheduler's `running` slots. Never lazily adopt it as
+        // an EEVDF current task if a timer happens to interrupt its handoff.
+        if curr.is_migration_helper() {
+            return;
+        }
         #[cfg(feature = "smp")]
         if !curr.cpumask().get(self.inner.cpu_id) {
             #[cfg(feature = "preempt")]
@@ -1421,10 +1519,12 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
         );
         assert!(curr.is_running(), "task is not running: {:?}", curr.state());
         assert!(!curr.is_idle());
-        self.inner
-            .scheduler
-            .lock()
-            .deactivate_task(&curr, DeactivateReason::Exit);
+        if !curr.is_migration_helper() {
+            self.inner
+                .scheduler
+                .lock()
+                .deactivate_task(&curr, DeactivateReason::Exit);
+        }
         if curr.is_init() {
             // This path still owns the IRQ-saving runqueue guard. Exited task
             // and TaskExt destructors may sleep, join, or take scheduler-aware
@@ -1598,11 +1698,24 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
     }
 
     pub fn set_current_priority(&mut self, priority: isize) -> Result<(), TaskSchedError> {
-        self.inner
-            .scheduler
-            .lock()
-            .set_priority(self.current_task(), priority)
-            .map_err(TaskSchedError::from)
+        let mut scheduler = self.inner.scheduler.lock();
+        #[cfg(feature = "sched-eevdf")]
+        {
+            let outcome = scheduler
+                .set_priority(self.current_task(), priority)
+                .map_err(TaskSchedError::from)?;
+            #[cfg(feature = "preempt")]
+            if let Some(current) = outcome.into_preempt_current() {
+                current.set_preempt_pending(true);
+            }
+            Ok(())
+        }
+        #[cfg(not(feature = "sched-eevdf"))]
+        {
+            scheduler
+                .set_priority(self.current_task(), priority)
+                .map_err(TaskSchedError::from)
+        }
     }
 }
 
@@ -1680,7 +1793,9 @@ impl AxRunQueue {
         match target.enqueue_task(task, EnqueueReason::Migrate) {
             Ok(()) => true,
             Err(error) => {
-                contain_enqueue_failure(&error, TaskState::Ready);
+                // EEVDF keeps the parked migration token live on a destination
+                // rejection. This is a recoverable routing failure, so do not
+                // publish a wake fault before the source rollback is attempted.
                 let task = error.task;
                 // Reverse the owner publication under the old target lock for
                 // the same stable-routing protocol used above.
@@ -1699,11 +1814,11 @@ impl AxRunQueue {
         }
     }
 
-    #[cfg(feature = "sched-cfs")]
+    #[cfg(feature = "sched-eevdf")]
     fn set_task_sched_state(
         &self,
         task: &AxTaskRef,
-        sched_state: axsched::CfsTaskParams,
+        sched_state: axsched::EevdfTaskParams,
     ) -> TaskSchedUpdate {
         if matches!(task.state(), TaskState::Exited) {
             return TaskSchedUpdate::Complete(Err(TaskSchedError::TaskExited));
@@ -1713,11 +1828,16 @@ impl AxRunQueue {
         if task.cpu_id() as usize != self.cpu_id {
             return TaskSchedUpdate::Redirect;
         }
-        TaskSchedUpdate::Complete(
-            scheduler
-                .set_task_params(task, sched_state)
-                .map_err(TaskSchedError::from),
-        )
+        let result = scheduler
+            .set_task_params(task, sched_state)
+            .map_err(TaskSchedError::from)
+            .map(|outcome| {
+                #[cfg(feature = "preempt")]
+                if let Some(current) = outcome.into_preempt_current() {
+                    current.set_preempt_pending(true);
+                }
+            });
+        TaskSchedUpdate::Complete(result)
     }
 
     fn new_gc_task(cpu_id: usize) -> Result<AxTaskRef, TaskRuntimeInitError> {
@@ -1735,13 +1855,13 @@ impl AxRunQueue {
         #[cfg(feature = "smp")]
         gc_task.set_cpu_id(cpu_id as u32);
 
-        #[cfg(feature = "sched-cfs")]
+        #[cfg(feature = "sched-eevdf")]
         gc_task
-            .configure(axsched::CfsTaskParams {
+            .configure(axsched::EevdfTaskParams {
                 // Exited-task stacks are only recycled after the GC task runs.
                 // Keep it in the normal fair class so join-heavy thread bursts
                 // cannot outrun cleanup and exhaust kernel stack memory.
-                class: axsched::CfsTaskClass::Normal,
+                class: axsched::EevdfTaskClass::Normal,
                 nice: 0,
                 rt_priority: 0,
             })
@@ -2143,12 +2263,23 @@ pub(crate) fn migrate_entry(migrated_task: AxTaskRef) {
     let source_cpu = migrated_task.cpu_id() as usize;
     let target = select_run_queue::<kernel_guard::NoPreemptIrqSave>(&migrated_task);
     let Some(run_queue) = target.inner else {
-        let error = TaskEnqueueError {
-            kind: TaskEnqueueErrorKind::RunQueueUnavailable(target.selected_cpu),
-            task: migrated_task,
+        // No destination queue exists, but the parked EEVDF migration can
+        // still be rolled back on its source. Release the target-selection
+        // guard before taking the source scheduler lock.
+        drop(target);
+        let Some(source) = get_run_queue(source_cpu) else {
+            migrated_task.record_wake_fault(TaskWakeFault::RunQueueUnavailable);
+            axhal::power::system_off();
         };
-        contain_enqueue_failure(&error, TaskState::Ready);
-        axhal::power::system_off();
+        {
+            let _scheduler = source.scheduler.lock();
+            migrated_task.set_cpu_id(source.cpu_id as _);
+        }
+        if let Err(error) = source.enqueue_task(migrated_task, EnqueueReason::Migrate) {
+            contain_enqueue_failure(&error, TaskState::Ready);
+            axhal::power::system_off();
+        }
+        return;
     };
     let Some(source) = get_run_queue(source_cpu) else {
         let error = TaskEnqueueError {
@@ -2165,8 +2296,20 @@ pub(crate) fn migrate_entry(migrated_task: AxTaskRef) {
         migrated_task.set_cpu_id(run_queue.cpu_id as _);
     }
     if let Err(error) = run_queue.enqueue_task(migrated_task, EnqueueReason::Migrate) {
-        contain_enqueue_failure(&error, TaskState::Ready);
-        axhal::power::system_off();
+        // A destination rejection leaves EEVDF's parked migration token
+        // recoverable. Restore the source CPU publication under the target
+        // lock, then let the source scheduler roll back the migration. A
+        // successful rollback is a normal ready publication and carries no
+        // wake fault.
+        let task = error.task;
+        {
+            let _scheduler = run_queue.scheduler.lock();
+            task.set_cpu_id(source.cpu_id as _);
+        }
+        if let Err(restore_error) = source.enqueue_task(task, EnqueueReason::Migrate) {
+            contain_enqueue_failure(&restore_error, TaskState::Ready);
+            axhal::power::system_off();
+        }
     }
 }
 
@@ -2273,6 +2416,20 @@ mod exited_queue_tests {
             .unwrap()
     }
 
+    fn sleeping_task(name: &str) -> (AxTaskRef, Scheduler) {
+        let task = task(name);
+        let mut scheduler = Scheduler::new();
+        scheduler.add_task(task.clone()).unwrap();
+        let current = scheduler
+            .pick_next_task()
+            .expect("admitted test task must be picked");
+        assert!(Arc::ptr_eq(&current, &task));
+        task.set_state(TaskState::Running);
+        scheduler.deactivate_task(&task, DeactivateReason::Sleep);
+        task.set_state(TaskState::Ready);
+        (task, scheduler)
+    }
+
     #[test]
     fn load_selector_prefers_the_least_loaded_eligible_online_cpu() {
         // `None` models either an affinity-excluded or uninitialized CPU.
@@ -2330,15 +2487,14 @@ mod exited_queue_tests {
 
     #[test]
     fn wake_enqueue_clears_the_exact_claim_before_target_unlock() {
-        let task = task("claimed-wake-enqueue");
-        task.set_state(TaskState::Ready);
+        let (task, scheduler) = sleeping_task("claimed-wake-enqueue");
         assert_eq!(
             task.claim_wake_mutation(),
             crate::task::WakeMutationClaim::Claimed
         );
         let run_queue = AxRunQueue {
             cpu_id: 0,
-            scheduler: SpinRaw::new(Scheduler::new()),
+            scheduler: SpinRaw::new(scheduler),
             load: RunQueueLoad::new(0, false),
         };
 
@@ -2358,8 +2514,7 @@ mod exited_queue_tests {
     #[cfg(feature = "smp")]
     #[test]
     fn deferred_handoff_uses_the_same_target_locked_wake_completion() {
-        let task = task("claimed-deferred-enqueue");
-        task.set_state(TaskState::Ready);
+        let (task, scheduler) = sleeping_task("claimed-deferred-enqueue");
         assert_eq!(
             task.claim_wake_mutation(),
             crate::task::WakeMutationClaim::Claimed
@@ -2380,7 +2535,7 @@ mod exited_queue_tests {
 
         let run_queue = AxRunQueue {
             cpu_id: 0,
-            scheduler: SpinRaw::new(Scheduler::new()),
+            scheduler: SpinRaw::new(scheduler),
             load: RunQueueLoad::new(0, false),
         };
         run_queue

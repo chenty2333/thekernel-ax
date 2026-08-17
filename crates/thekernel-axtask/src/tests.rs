@@ -202,6 +202,7 @@ fn deferred_work_runs_at_yield_and_suppresses_same_task_recursion() {
     assert!(DEFERRED_CALLS.load(Ordering::Acquire) >= 2);
 }
 
+#[cfg(feature = "sched-fifo")]
 #[test]
 fn test_sched_fifo() {
     let _lock = SERIAL.lock();
@@ -948,7 +949,7 @@ fn fallible_task_construction_rejects_invalid_stack_sizes() {
     assert!(crate::TaskInner::try_new(|| {}, String::new(), usize::MAX).is_err());
 }
 
-#[cfg(feature = "sched-cfs")]
+#[cfg(feature = "sched-eevdf")]
 #[test]
 fn sched_state_update_preserves_typed_failure_causes() {
     let _lock = SERIAL.lock();
@@ -988,7 +989,7 @@ fn sched_state_update_preserves_typed_failure_causes() {
     );
 }
 
-#[cfg(feature = "sched-cfs")]
+#[cfg(feature = "sched-eevdf")]
 #[test]
 fn failed_publication_reservation_returns_the_exact_task_owner() {
     let _lock = SERIAL.lock();
@@ -1012,7 +1013,7 @@ fn failed_publication_reservation_returns_the_exact_task_owner() {
     );
 }
 
-#[cfg(feature = "sched-cfs")]
+#[cfg(feature = "sched-eevdf")]
 #[test]
 fn publication_reservation_cancel_returns_the_unpublished_task() {
     let _lock = SERIAL.lock();
@@ -1047,7 +1048,7 @@ fn publication_reservation_cancel_returns_the_unpublished_task() {
     axtask::set_sched_state(&task, Default::default()).unwrap();
 }
 
-#[cfg(feature = "sched-cfs")]
+#[cfg(feature = "sched-eevdf")]
 #[test]
 fn publication_reservation_commits_and_auto_exit_is_reclaimable() {
     let _lock = SERIAL.lock();
@@ -1086,7 +1087,7 @@ fn publication_reservation_commits_and_auto_exit_is_reclaimable() {
     assert!(!axtask::reclaim_exited_tasks_until_clear(128));
 }
 
-#[cfg(not(feature = "sched-cfs"))]
+#[cfg(not(feature = "sched-eevdf"))]
 #[test]
 fn priority_update_is_honestly_unsupported_by_fifo_and_rr() {
     assert_eq!(

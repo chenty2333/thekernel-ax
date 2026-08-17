@@ -16,7 +16,7 @@ by cargo features.
 - `preempt`: Enable preemptive scheduling.
 - `sched-fifo`: Use the FIFO cooperative scheduler (enables `multitask`).
 - `sched-rr`: Use the Round-robin preemptive scheduler (enables `multitask` and `preempt`).
-- `sched-cfs`: Use the Completely Fair Scheduler (enables `multitask` and `preempt`).
+- `sched-eevdf`: Use the EEVDF scheduler (enables `multitask` and `preempt`).
 - `tls`: Enable kernel space thread-local storage support.
 - `smp`: Enable SMP (symmetric multiprocessing) support.
 

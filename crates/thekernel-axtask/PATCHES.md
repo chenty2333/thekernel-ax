@@ -47,7 +47,7 @@ SHA-256
   blocking, timer, and IRQ registration errors instead of silent failure.
 - Preserve `thekernel-axsched` unsupported/invalid/class/queue-ownership
   outcomes through task configuration and runtime priority adapters.
-- Enforce a 16 KiB minimum kernel-task stack after focused CFS tests proved
+- Enforce a 16 KiB minimum kernel-task stack after focused EEVDF tests proved
   smaller stacks could corrupt adjacent allocator state before diagnosis.
 - Keep the inherited `tls` feature name only as a compile-time rejection for
   downstream forwarding compatibility: the registry `axhal` baseline has only
@@ -62,7 +62,7 @@ SHA-256
 - Poll generic interruptible futures before consuming task interruption and
   recheck after interrupt-waker publication, restoring a simultaneous
   interrupt when the wrapped operation wins.
-- Split prepared CFS task publication into fallible target/ownership/ordering
+- Split prepared EEVDF task publication into fallible target/ownership/ordering
   reservation and allocation-free final linking. Reservation failure returns a
   public typed error owning the exact rejected `AxTaskRef`; token cancellation
   returns ownership and token lifetime excludes affinity retargeting.

@@ -30,7 +30,7 @@ pub struct TaskId(u64);
 ///
 /// Context switching, scheduler bookkeeping, and the allocation-free future
 /// executor all run on this stack. Smaller stacks corrupt adjacent allocator
-/// state before Rust can report an error, especially on the CFS path, so the
+/// state before Rust can report an error, especially on the EEVDF path, so the
 /// mechanism rejects them before allocation instead of treating the size as a
 /// performance hint.
 pub const MIN_KERNEL_STACK_SIZE: usize = 16 * 1024;
@@ -43,7 +43,7 @@ const TASK_MUTATION_AFFINITY_WAKE_PENDING: u8 = 5;
 const TASK_MUTATION_BLOCK_WAKE_PENDING: u8 = 6;
 // Include TASK_MUTATION_WAKE so a wait-free wake `fetch_or` leaves an
 // impossible new-task-publication race byte-for-byte unchanged.
-#[cfg(feature = "sched-cfs")]
+#[cfg(feature = "sched-eevdf")]
 const TASK_MUTATION_PUBLICATION: u8 = 12;
 
 /// Failure while constructing an unpublished task.
@@ -561,6 +561,9 @@ pub struct TaskInner {
     name: SpinNoIrq<String>,
     is_idle: bool,
     is_init: bool,
+    /// A short-lived CPU migration helper runs outside the source scheduler's
+    /// `running` slot while it commits/rolls back the parked task handoff.
+    is_migration_helper: bool,
 
     entry: Cell<Option<Box<dyn FnOnce()>>>,
     state: AtomicU8,
@@ -905,7 +908,7 @@ impl TaskInner {
         self.affinity.lock().mask
     }
 
-    #[cfg(feature = "sched-cfs")]
+    #[cfg(feature = "sched-eevdf")]
     pub(crate) fn try_reserve_publication_mutation(&self) -> bool {
         self.mutation
             .compare_exchange(
@@ -917,7 +920,7 @@ impl TaskInner {
             .is_ok()
     }
 
-    #[cfg(feature = "sched-cfs")]
+    #[cfg(feature = "sched-eevdf")]
     pub(crate) fn release_publication_mutation(&self) -> bool {
         if self
             .mutation
@@ -1189,6 +1192,7 @@ impl TaskInner {
             name: SpinNoIrq::new(name),
             is_idle: false,
             is_init: false,
+            is_migration_helper: false,
             entry: Cell::new(None),
             state: AtomicU8::new(TaskState::Ready as u8),
             mutation: AtomicU8::new(TASK_MUTATION_IDLE),
@@ -1316,6 +1320,16 @@ impl TaskInner {
     #[inline]
     pub(crate) const fn is_idle(&self) -> bool {
         self.is_idle
+    }
+
+    #[inline]
+    pub(crate) const fn is_migration_helper(&self) -> bool {
+        self.is_migration_helper
+    }
+
+    #[inline]
+    pub(crate) fn mark_migration_helper(&mut self) {
+        self.is_migration_helper = true;
     }
 
     #[inline]
@@ -2155,7 +2169,7 @@ mod mechanism_tests {
         );
     }
 
-    #[cfg(feature = "sched-cfs")]
+    #[cfg(feature = "sched-eevdf")]
     #[test]
     fn wake_claim_does_not_modify_an_unpublished_task_reservation() {
         let task = TaskInner::new_init("publication-wake-isolation".into()).unwrap();

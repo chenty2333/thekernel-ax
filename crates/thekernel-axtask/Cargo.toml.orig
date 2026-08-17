@@ -34,7 +34,7 @@ smp = ["kspin/smp"]
 
 sched-fifo = ["multitask"]
 sched-rr = ["multitask", "preempt"]
-sched-cfs = ["multitask", "preempt"]
+sched-eevdf = ["multitask", "preempt"]
 
 test = ["percpu?/sp-naive"]
 

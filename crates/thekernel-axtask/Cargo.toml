@@ -52,7 +52,7 @@ legacy-fxsave = ["multitask", "preempt", "axhal/fp-simd"]
 irq-continuation-diagnostics = ["multitask", "preempt", "smp"]
 sched-fifo = ["multitask"]
 sched-rr = ["multitask", "preempt"]
-sched-cfs = ["multitask", "preempt"]
+sched-eevdf = ["multitask", "preempt"]
 test = ["percpu?/sp-naive"]
 
 [dependencies]
@@ -87,7 +87,7 @@ axhal = { version = "=0.3.0-preview.2", features = ["fp-simd"] }
 x86_64 = { version = "=0.15.5", default-features = false }
 
 [package.metadata.docs.rs]
-features = ["multitask", "sched-fifo", "task-ext"]
+features = ["multitask", "sched-eevdf", "task-ext"]
 default-target = "x86_64-unknown-none"
 
 [package.metadata.thekernel]

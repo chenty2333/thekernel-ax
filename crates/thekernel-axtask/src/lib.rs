@@ -20,12 +20,12 @@
 //!   without selecting another scheduler feature.
 //! - `sched-rr`: Use the [Round-robin preemptive scheduler][2]. It also enables
 //!   the `multitask` and `preempt` features if it is enabled.
-//! - `sched-cfs`: Use the [Completely Fair Scheduler][3]. It also enables the
+//! - `sched-eevdf`: Use the [EEVDF scheduler][3]. It also enables the
 //!   `multitask` and `preempt` features if it is enabled.
 //!
 //! [1]: axsched::FifoScheduler
 //! [2]: axsched::RRScheduler
-//! [3]: axsched::CFScheduler
+//! [3]: axsched::EEVDFScheduler
 
 #![cfg_attr(not(test), no_std)]
 #![feature(doc_cfg)]
@@ -44,10 +44,10 @@ mod tests;
 
 #[cfg(any(
     all(feature = "sched-fifo", feature = "sched-rr"),
-    all(feature = "sched-fifo", feature = "sched-cfs"),
-    all(feature = "sched-rr", feature = "sched-cfs"),
+    all(feature = "sched-fifo", feature = "sched-eevdf"),
+    all(feature = "sched-rr", feature = "sched-eevdf"),
 ))]
-compile_error!("select at most one of sched-fifo, sched-rr, or sched-cfs");
+compile_error!("select at most one of sched-fifo, sched-rr, or sched-eevdf");
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "multitask")] {

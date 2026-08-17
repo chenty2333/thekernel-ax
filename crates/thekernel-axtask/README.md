@@ -8,7 +8,7 @@ remains `axtask`:
 [dependencies]
 axtask = { package = "thekernel-axtask", version = "0.1.0", features = [
     "multitask",
-    "sched-cfs",
+    "sched-eevdf",
 ] }
 ```
 
@@ -119,7 +119,7 @@ rule: it checks the wrapped future before consuming an interrupt and rechecks
 after installing the interrupt waker. If both become ready in that race, the
 future result wins and the interrupt remains pending for the next boundary.
 
-`reserve_prepared_task` is the fallible half of two-phase CFS publication. It
+`reserve_prepared_task` is the fallible half of two-phase EEVDF publication. It
 claims scheduler ownership, a permanent target run queue, and a non-reused
 ordering ticket before a lifecycle adapter commits externally visible state.
 Failure returns `TaskEnqueueError`, which owns the exact unpublished task through

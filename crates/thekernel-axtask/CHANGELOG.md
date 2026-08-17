@@ -35,14 +35,14 @@
   excluded through Ready-before-enqueue, and the target scheduler clears the
   wake claim before the task becomes selectable; impossible enqueue/handoff
   failures are fail-stop instead of leaving a woken Blocked task unowned.
-- Preserve scheduler migration lifecycle and queue-relative fair vruntime for
+- Preserve scheduler migration lifecycle and queue-relative fair-state for
   both ready-task and running-task affinity transfers.
 - Add a single-deadline interruptible conditional wait, with typed block,
   interrupt, timer-admission, condition, and timeout outcomes and no slice
   polling.
 - Make the generic interruptible-future adapter condition-first and preserve a
   simultaneously observed interrupt when the wrapped operation completes.
-- Split prepared CFS publication into a fallible reservation which returns the
+- Split prepared EEVDF publication into a fallible reservation which returns the
   exact task owner on failure and an allocation-free final commit. Reservation
   also excludes affinity changes until commit or cancellation; successful
   commit clears that claim under the target scheduler lock before the new task
