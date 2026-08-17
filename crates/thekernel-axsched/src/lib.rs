@@ -19,7 +19,11 @@ pub use cfs::{
     CFSTask, CFScheduler, CfsReservationCommitError, CfsTaskClass, CfsTaskParams,
     CfsTaskReservation, RR_TIMESLICE_TICKS, RT_PRIORITY_MAX, RT_PRIORITY_MIN,
 };
-pub use eevdf::{EEVDFScheduler, EEVDFTask, EevdfTaskClass, EevdfTaskParams};
+pub use eevdf::{
+    EEVDFScheduler, EEVDFTask, EevdfForkSeed, EevdfMigration, EevdfMigrationCommitError,
+    EevdfMigrationOrigin, EevdfParamUpdate, EevdfReservationCommitError, EevdfTaskClass,
+    EevdfTaskParams, EevdfTaskReservation,
+};
 pub use fifo::{FifoScheduler, FifoTask};
 pub use round_robin::{RRScheduler, RRTask};
 

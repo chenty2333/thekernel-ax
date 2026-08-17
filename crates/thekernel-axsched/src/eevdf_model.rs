@@ -764,6 +764,15 @@ impl Entity {
         self.sleeper_v.is_some()
     }
 
+    /// Return the virtual-time point at which this entity entered sleep.
+    ///
+    /// The scheduler keeps the entity itself while a fair task sleeps.  A
+    /// parameter update must therefore retain this anchor rather than
+    /// treating the update as a wakeup/re-admission.
+    pub const fn sleep_anchor(&self) -> Option<i128> {
+        self.sleeper_v
+    }
+
     pub fn lag_at(&self, v: i128) -> Result<i128, ModelError> {
         if self.weight == 0 {
             return Err(ModelError::InvalidWeight);
@@ -784,6 +793,16 @@ impl Entity {
             self.lag_stamp = v;
         }
         Ok(self.lag)
+    }
+
+    /// Freeze an entity at `v` before removing it from fair accounting.
+    ///
+    /// A dormant entity is not represented in `Clock.total_weight`, so the
+    /// fair debt must be materialized exactly once at the class transition.
+    /// Callers that retain the entity while it is in an RT class must use the
+    /// frozen reconfiguration path below when it becomes fair again.
+    pub fn freeze_at(&mut self, v: i128) -> Result<i128, ModelError> {
+        self.materialize(v)
     }
 
     pub fn eligible_at(&self) -> Result<i128, ModelError> {
@@ -875,6 +894,20 @@ impl Entity {
         Ok(())
     }
 
+    /// Mark a frozen dormant entity as sleeping without materializing the
+    /// virtual time elapsed while it was represented by RT.
+    pub fn begin_sleep_frozen(&mut self, v: i128) -> Result<(), ModelError> {
+        if self.weight == 0 {
+            return Err(ModelError::InvalidWeight);
+        }
+        if self.sleeper_v.is_some() {
+            return Err(ModelError::InvalidState);
+        }
+        self.lag_stamp = v;
+        self.sleeper_v = Some(v);
+        Ok(())
+    }
+
     pub fn sleep(&mut self, v: i128) -> Result<(), ModelError> {
         self.begin_sleep(v)
     }
@@ -888,6 +921,86 @@ impl Entity {
         self.lag = lag;
         self.lag_stamp = v;
         self.sleeper_v = None;
+        Ok(())
+    }
+
+    /// End a dormant fair sleeping lifetime without sleeper credit.
+    ///
+    /// This is used when a fair sleeper was temporarily represented by an RT
+    /// sleep marker.  No grace/decay credit is applied, and an already-active
+    /// frozen dormant entity is also re-anchored without materializing the
+    /// virtual time elapsed while the task was RT.
+    pub fn end_sleep_frozen(&mut self, v: i128) -> Result<(), ModelError> {
+        if self.weight == 0 {
+            return Err(ModelError::InvalidWeight);
+        }
+        if let Some(slept_at) = self.sleeper_v {
+            if v < slept_at {
+                return Err(ModelError::InvalidState);
+            }
+        }
+        self.sleeper_v = None;
+        self.lag_stamp = v;
+        Ok(())
+    }
+
+    /// Wake while preserving request progress already converted for the
+    /// eventual runnable aggregate.
+    ///
+    /// Sleeper decay still applies to lag, but `q` and `remaining_ticks` are
+    /// not rescaled a second time.  The request is merely re-anchored at the
+    /// wake point using its existing remaining virtual length.
+    pub fn wake_preserving_progress(&mut self, v: i128) -> Result<(), ModelError> {
+        let slept_at = self.sleeper_v.ok_or(ModelError::InvalidState)?;
+        let elapsed = v
+            .checked_sub(slept_at)
+            .ok_or(ModelError::ArithmeticExhausted)?;
+        if self.weight == 0 || self.request.q == 0 || self.request.remaining_ticks > self.request.q
+        {
+            return Err(ModelError::InvalidState);
+        }
+        let lag = bounded_sleeper_decay_inner(self.class, self.lag, elapsed)?;
+        let start = request_start(v, lag, self.weight)?;
+        let remaining_r = checked_virtual_length(self.request.remaining_ticks, self.weight)?;
+        let deadline = checked_deadline(start, remaining_r)?;
+        let mut request = self.request;
+        request.start = start;
+        request.deadline = deadline;
+        *self = Self {
+            class: self.class,
+            weight: self.weight,
+            lag,
+            lag_stamp: v,
+            request,
+            sleeper_v: None,
+        };
+        Ok(())
+    }
+
+    /// Re-anchor an already-woken request at a clock rebase point without
+    /// changing its converted progress.  Clock denominator changes may move
+    /// `V` by one; this keeps lag/request coordinates consistent with that
+    /// final clock while retaining `q` and `remaining_ticks` exactly.
+    pub fn activate_preserving_progress(&mut self, v: i128) -> Result<(), ModelError> {
+        if self.sleeper_v.is_some() {
+            return Err(ModelError::InvalidState);
+        }
+        if self.weight == 0 {
+            return Err(ModelError::InvalidWeight);
+        }
+        if self.request.q == 0 || self.request.remaining_ticks > self.request.q {
+            return Err(ModelError::InvalidState);
+        }
+        let lag = self.lag_at(v)?;
+        let start = request_start(v, lag, self.weight)?;
+        let remaining_r = checked_virtual_length(self.request.remaining_ticks, self.weight)?;
+        let deadline = checked_deadline(start, remaining_r)?;
+        let mut request = self.request;
+        request.start = start;
+        request.deadline = deadline;
+        self.lag = lag;
+        self.lag_stamp = v;
+        self.request = request;
         Ok(())
     }
 
@@ -948,6 +1061,112 @@ impl Entity {
             sleeper_v: self.sleeper_v,
         };
         *self = next;
+        Ok(())
+    }
+
+    /// Reconfigure a dormant fair entity without materializing elapsed clock
+    /// time.  The entity was frozen when it left fair accounting; RT runtime
+    /// therefore cannot create fair lag or sleeper credit.
+    pub fn reconfigure_frozen(
+        &mut self,
+        new_class: RequestClass,
+        new_weight: u128,
+        new_total_weight: u128,
+        v: i128,
+    ) -> Result<(), ModelError> {
+        if new_weight == 0 {
+            return Err(ModelError::InvalidWeight);
+        }
+        if self.sleeper_v.is_some() {
+            return Err(ModelError::InvalidState);
+        }
+        let old_q = self.request.q;
+        if old_q == 0 || self.request.remaining_ticks > old_q {
+            return Err(ModelError::InvalidState);
+        }
+        // `self.lag` is deliberately used directly: `lag_at(v)` would charge
+        // all virtual time elapsed while the task was in the RT class.
+        let lag = self.lag;
+        let new_q = request_quantum(new_class, new_weight, new_total_weight)?;
+        let new_remaining = if self.request.remaining_ticks == 0 {
+            0
+        } else {
+            checked_mul_div_ceil(self.request.remaining_ticks, new_q, old_q)?
+        };
+        if new_remaining > new_q {
+            return Err(ModelError::InvalidState);
+        }
+        let full_r = checked_virtual_length(new_q, new_weight)?;
+        let remaining_r = checked_virtual_length(new_remaining, new_weight)?;
+        let start = request_start(v, lag, new_weight)?;
+        let deadline = checked_deadline(start, remaining_r)?;
+        let mut request = self.request;
+        request.q = new_q;
+        request.remaining_ticks = new_remaining;
+        request.class = new_class;
+        request.virtual_length = full_r;
+        request.start = start;
+        request.deadline = deadline;
+        *self = Self {
+            class: new_class,
+            weight: new_weight,
+            lag,
+            lag_stamp: v,
+            request,
+            sleeper_v: None,
+        };
+        Ok(())
+    }
+
+    /// Reconfigure a sleeping entity while retaining its sleep anchor and
+    /// active-request progress.
+    ///
+    /// Sleeping entities do not accrue lag while absent from the run queue,
+    /// so all calculations use the saved sleep anchor.  The operation is
+    /// staged through locals and is byte-for-byte atomic on failure.
+    pub fn reconfigure_sleeping(
+        &mut self,
+        new_class: RequestClass,
+        new_weight: u128,
+        new_total_weight: u128,
+    ) -> Result<(), ModelError> {
+        let sleeper_v = self.sleeper_v.ok_or(ModelError::InvalidState)?;
+        if new_weight == 0 {
+            return Err(ModelError::InvalidWeight);
+        }
+        let old_q = self.request.q;
+        if old_q == 0 || self.request.remaining_ticks > old_q {
+            return Err(ModelError::InvalidState);
+        }
+        let lag = self.lag;
+        let new_q = request_quantum(new_class, new_weight, new_total_weight)?;
+        let new_remaining = if self.request.remaining_ticks == 0 {
+            0
+        } else {
+            checked_mul_div_ceil(self.request.remaining_ticks, new_q, old_q)?
+        };
+        if new_remaining > new_q {
+            return Err(ModelError::InvalidState);
+        }
+        let full_r = checked_virtual_length(new_q, new_weight)?;
+        let remaining_r = checked_virtual_length(new_remaining, new_weight)?;
+        let start = request_start(sleeper_v, lag, new_weight)?;
+        let deadline = checked_deadline(start, remaining_r)?;
+        let mut request = self.request;
+        request.q = new_q;
+        request.remaining_ticks = new_remaining;
+        request.class = new_class;
+        request.virtual_length = full_r;
+        request.start = start;
+        request.deadline = deadline;
+        *self = Self {
+            class: new_class,
+            weight: new_weight,
+            lag,
+            lag_stamp: sleeper_v,
+            request,
+            sleeper_v: Some(sleeper_v),
+        };
         Ok(())
     }
 
@@ -1465,6 +1684,43 @@ mod tests {
             Err(ModelError::ArithmeticExhausted)
         );
         assert_eq!(overflow_rebase, before_rebase);
+    }
+
+    #[test]
+    fn frozen_reconfigure_does_not_charge_elapsed_rt_virtual_time() {
+        let mut entity = Entity::new(RequestClass::Normal, NICE_0, NICE_0, 0).unwrap();
+        entity.request.consume(3).unwrap();
+        let remaining = entity.request.remaining_ticks;
+        entity.freeze_at(0).unwrap();
+        entity
+            .reconfigure_frozen(RequestClass::Batch, NICE_0, NICE_0, 17 * ONE as i128)
+            .unwrap();
+        assert_eq!(entity.lag, 0);
+        assert_eq!(entity.lag_stamp, 17 * ONE as i128);
+        assert_eq!(entity.request.remaining_ticks, remaining * 4);
+    }
+
+    #[test]
+    fn frozen_sleep_end_has_no_sleeper_credit_or_rt_lag() {
+        let mut entity = Entity::new(RequestClass::Normal, NICE_0, NICE_0, 0).unwrap();
+        entity.begin_sleep(0).unwrap();
+        let lag = entity.lag;
+        entity.end_sleep_frozen(19 * ONE as i128).unwrap();
+        assert!(!entity.is_sleeping());
+        assert_eq!(entity.lag, lag);
+        assert_eq!(entity.lag_at(19 * ONE as i128).unwrap(), lag);
+    }
+
+    #[test]
+    fn wake_preserving_progress_reanchors_without_rescaling() {
+        let mut entity = Entity::new(RequestClass::Normal, NICE_0, 2 * NICE_0, 0).unwrap();
+        entity.request.consume(2).unwrap();
+        let request = entity.request;
+        entity.begin_sleep(0).unwrap();
+        entity.wake_preserving_progress(GRACE / 2).unwrap();
+        assert_eq!(entity.request.q, request.q);
+        assert_eq!(entity.request.remaining_ticks, request.remaining_ticks);
+        assert!(!entity.is_sleeping());
     }
 
     #[test]
