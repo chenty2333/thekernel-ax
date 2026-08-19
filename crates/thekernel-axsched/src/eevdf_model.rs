@@ -34,8 +34,6 @@ pub enum RequestClass {
     Idle,
 }
 
-pub type EntityClass = RequestClass;
-
 impl RequestClass {
     pub const fn target_ticks(self) -> u128 {
         match self {
@@ -258,9 +256,9 @@ impl Wide {
     fn shl1(self) -> (bool, Self) {
         let mut limbs = [0u64; 4];
         let mut carry = false;
-        for index in 0..4 {
+        for (index, limb) in limbs.iter_mut().enumerate() {
             let value = self.limbs[index];
-            limbs[index] = (value << 1) | u64::from(carry);
+            *limb = (value << 1) | u64::from(carry);
             carry = value >> 63 != 0;
         }
         (carry, Self { limbs })
@@ -269,10 +267,10 @@ impl Wide {
     fn wrapping_sub(self, other: Self) -> Self {
         let mut limbs = [0u64; 4];
         let mut borrow = false;
-        for index in 0..4 {
+        for (index, limb) in limbs.iter_mut().enumerate() {
             let (value, first_borrow) = self.limbs[index].overflowing_sub(other.limbs[index]);
             let (value, second_borrow) = value.overflowing_sub(u64::from(borrow));
-            limbs[index] = value;
+            *limb = value;
             borrow = first_borrow || second_borrow;
         }
         Self { limbs }
@@ -299,12 +297,12 @@ impl Wide {
         let right = [right as u64, (right >> 64) as u64];
         let mut limbs = [0u64; 4];
 
-        for left_index in 0..2 {
+        for (left_index, &left_limb) in left.iter().enumerate() {
             let mut carry = 0u128;
-            for right_index in 0..2 {
+            for (right_index, &right_limb) in right.iter().enumerate() {
                 let index = left_index + right_index;
-                let value = (left[left_index] as u128)
-                    .checked_mul(right[right_index] as u128)?
+                let value = (left_limb as u128)
+                    .checked_mul(right_limb as u128)?
                     .checked_add(limbs[index] as u128)?
                     .checked_add(carry)?;
                 limbs[index] = value as u64;
@@ -332,7 +330,7 @@ impl Wide {
                 .checked_add(result.limbs[index] as u128)?;
             result.limbs[index] = product as u64;
             let mut carry = product >> 64;
-            let high_product = (self.limbs[index] as u128).checked_mul((right >> 64) as u128)?;
+            let high_product = (self.limbs[index] as u128).checked_mul(right >> 64)?;
             // This helper is intentionally limited to multiplying a value
             // which is already known to fit in 256 bits by a scheduler-sized
             // factor.  Fold the high half at the next limb and reject any
@@ -477,13 +475,14 @@ fn checked_mul_div_round_nearest_even(
     let (quotient, remainder) = checked_mul_div_rem(a, b, denominator)?;
     // Comparing `remainder` with `denominator - remainder` avoids forming
     // the potentially overflowing value `2 * remainder`.
-    let round_up = if remainder > denominator - remainder {
-        true
-    } else if remainder < denominator - remainder {
-        false
-    } else {
-        // An exact half rounds to the even quotient.
-        quotient & 1 != 0
+    let round_up = match remainder.cmp(&(denominator / 2)) {
+        core::cmp::Ordering::Greater => true,
+        core::cmp::Ordering::Less => false,
+        core::cmp::Ordering::Equal => {
+            // An exact half rounds to the even quotient.  An odd denominator
+            // has no exact half, so its floor-half remainder rounds down.
+            denominator & 1 == 0 && quotient & 1 != 0
+        }
     };
     if round_up {
         quotient
@@ -491,25 +490,6 @@ fn checked_mul_div_round_nearest_even(
             .ok_or(ModelError::ArithmeticExhausted)
     } else {
         Ok(quotient)
-    }
-}
-
-/// Signed mathematical ceil division by a positive unsigned denominator.
-pub fn signed_ceil_div(numerator: i128, denominator: u128) -> Result<i128, ModelError> {
-    if denominator == 0 {
-        return Err(ModelError::InvalidWeight);
-    }
-    if numerator >= 0 {
-        let result = checked_ceil_div(numerator as u128, denominator)?;
-        checked_i128(result)
-    } else {
-        // ceil(-m/d) = -floor(m/d), including i128::MIN.
-        let quotient = numerator.unsigned_abs() / denominator;
-        if quotient == (1u128 << 127) {
-            Ok(i128::MIN)
-        } else {
-            Ok(-(quotient as i128))
-        }
     }
 }
 
@@ -678,10 +658,16 @@ impl Request {
 
     fn set_fraction(&mut self, fraction_num: u128, fraction_den: u128) -> Result<(), ModelError> {
         let gcd = gcd_u128(fraction_num, fraction_den);
-        let (fraction_num, fraction_den) = if gcd == 0 {
-            (0, 1)
-        } else {
-            (fraction_num / gcd, fraction_den / gcd)
+        let (fraction_num, fraction_den) = match gcd {
+            0 => (0, 1),
+            gcd => (
+                fraction_num
+                    .checked_div(gcd)
+                    .ok_or(ModelError::InvalidState)?,
+                fraction_den
+                    .checked_div(gcd)
+                    .ok_or(ModelError::InvalidState)?,
+            ),
         };
         let (remaining_work, remaining_ticks) =
             Self::projection(self.q, fraction_num, fraction_den)?;
@@ -901,14 +887,6 @@ impl Request {
     }
 }
 
-pub fn deadline_after_yield(start: i128, old_deadline: i128, r: i128) -> Result<i128, ModelError> {
-    checked_deadline(core::cmp::max(start, old_deadline), r)
-}
-
-pub const fn deadline_after_preempt(deadline: i128) -> i128 {
-    deadline
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Clock {
     pub v: i128,
@@ -1119,20 +1097,20 @@ impl Clock {
             return Err(ModelError::InvalidState);
         }
         let rounded = checked_mul_div_round_nearest_even(self.remainder, total_weight, old_weight)?;
-        let (v, remainder) = if rounded == total_weight {
-            (
+        let (v, remainder) = match rounded.cmp(&total_weight) {
+            core::cmp::Ordering::Equal => (
                 self.v
                     .checked_add(1)
                     .ok_or(ModelError::ArithmeticExhausted)?,
                 0,
-            )
-        } else if rounded < total_weight {
-            (self.v, rounded)
-        } else {
-            // This is unreachable for a valid residue, but keeping the
-            // representation check explicit makes the operation atomic even
-            // if a future caller relaxes the invariant above.
-            return Err(ModelError::InvalidState);
+            ),
+            core::cmp::Ordering::Less => (self.v, rounded),
+            core::cmp::Ordering::Greater => {
+                // This is unreachable for a valid residue, but keeping the
+                // representation check explicit makes the operation atomic
+                // even if a future caller relaxes the invariant above.
+                return Err(ModelError::InvalidState);
+            }
         };
         self.v = v;
         self.remainder = remainder;
@@ -1239,6 +1217,7 @@ fn bounded_sleeper_decay_inner(
     }
 }
 
+#[cfg(test)]
 pub fn bounded_sleeper_decay(
     class: RequestClass,
     lag: i128,
@@ -1855,6 +1834,7 @@ impl Entity {
     }
 }
 
+#[cfg(test)]
 pub fn min_eligible_at(entities: &[Entity]) -> Result<Option<i128>, ModelError> {
     let mut minimum = None;
     for entity in entities {
@@ -2484,7 +2464,7 @@ mod tests {
         let before_entity = entity;
         let before_clock = clock;
         assert_eq!(
-            entity.service(&mut clock, 1, (ONE / 2) as u128),
+            entity.service(&mut clock, 1, ONE / 2),
             Err(ModelError::ArithmeticExhausted)
         );
         assert_eq!(entity, before_entity);

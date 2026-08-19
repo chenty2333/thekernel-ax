@@ -303,15 +303,19 @@ impl<K: Ord + Copy, T> EevdfTree<K, T> {
             parent = cursor;
             // SAFETY: every cursor was reached from this tree's links.
             let cursor_key = unsafe { (*(*cursor).state.get()).key };
-            if key < cursor_key {
-                cursor = unsafe { (*(*cursor).state.get()).left };
-            } else if key > cursor_key {
-                cursor = unsafe { (*(*cursor).state.get()).right };
-            } else {
-                return Err(EevdfInsertError {
-                    kind: EevdfTreeError::DuplicateKey,
-                    node: unsafe { Arc::from_raw(raw) },
-                });
+            match key.cmp(&cursor_key) {
+                core::cmp::Ordering::Less => {
+                    cursor = unsafe { (*(*cursor).state.get()).left };
+                }
+                core::cmp::Ordering::Greater => {
+                    cursor = unsafe { (*(*cursor).state.get()).right };
+                }
+                core::cmp::Ordering::Equal => {
+                    return Err(EevdfInsertError {
+                        kind: EevdfTreeError::DuplicateKey,
+                        node: unsafe { Arc::from_raw(raw) },
+                    });
+                }
             }
         }
 
@@ -586,12 +590,14 @@ impl<K: Ord + Copy, T> EevdfTree<K, T> {
         let mut cursor = self.root;
         while !cursor.is_null() {
             let cursor_key = unsafe { (*(*cursor).state.get()).key };
-            if key < cursor_key {
-                cursor = unsafe { (*(*cursor).state.get()).left };
-            } else if key > cursor_key {
-                cursor = unsafe { (*(*cursor).state.get()).right };
-            } else {
-                return cursor == target;
+            match key.cmp(&cursor_key) {
+                core::cmp::Ordering::Less => {
+                    cursor = unsafe { (*(*cursor).state.get()).left };
+                }
+                core::cmp::Ordering::Greater => {
+                    cursor = unsafe { (*(*cursor).state.get()).right };
+                }
+                core::cmp::Ordering::Equal => return cursor == target,
             }
         }
         false

@@ -98,11 +98,15 @@ pub const fn eevdf_profile() -> EevdfProfile {
 mod tests {
     use super::EEVDF_PROFILE;
 
+    fn profile_constraints_hold(profile: super::EevdfProfile) -> bool {
+        profile.normal_target_ticks <= profile.batch_target_ticks
+            && profile.sleeper_grace_ticks <= profile.sleeper_decay_ticks
+    }
+
     #[test]
     fn selected_profile_is_reconstructible_and_power_of_two() {
         assert!(EEVDF_PROFILE.has_power_of_two_parameters());
-        assert!(EEVDF_PROFILE.normal_target_ticks <= EEVDF_PROFILE.batch_target_ticks);
-        assert!(EEVDF_PROFILE.sleeper_grace_ticks <= EEVDF_PROFILE.sleeper_decay_ticks);
+        assert!(profile_constraints_hold(EEVDF_PROFILE));
     }
 
     #[cfg(all(not(feature = "eevdf-latency"), not(feature = "eevdf-throughput")))]

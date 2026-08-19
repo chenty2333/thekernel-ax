@@ -7,7 +7,8 @@
 use core::{
     cell::UnsafeCell,
     fmt,
-    ops::Deref,
+    marker::PhantomData,
+    ops::{Deref, DerefMut},
     sync::atomic::{AtomicU32, AtomicUsize, Ordering},
 };
 
@@ -421,6 +422,37 @@ pub(crate) struct EevdfOwnedState {
     pub(crate) sleep_v: Option<i128>,
 }
 
+/// A mutable view of task-owned scheduler state.
+///
+/// The view carries the same lifetime as the task reference but only exposes
+/// the raw `UnsafeCell` pointer after the caller has accepted the state
+/// ownership contract of [`EevdfTaskPayload::owned_state_mut`].  Keeping the
+/// pointer behind this wrapper avoids manufacturing a direct `&mut` from an
+/// immutable task reference while retaining field-level access for the
+/// scheduler's exclusive owner.
+pub(crate) struct EevdfOwnedStateMut<'a> {
+    pointer: *mut EevdfOwnedState,
+    _marker: PhantomData<&'a mut EevdfOwnedState>,
+}
+
+impl Deref for EevdfOwnedStateMut<'_> {
+    type Target = EevdfOwnedState;
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: construction is restricted to the unsafe state accessor,
+        // whose caller must hold the task's scheduler ownership exclusion.
+        unsafe { &*self.pointer }
+    }
+}
+
+impl DerefMut for EevdfOwnedStateMut<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: the wrapper's exclusive mutable view is valid under the
+        // same scheduler ownership exclusion required by its constructor.
+        unsafe { &mut *self.pointer }
+    }
+}
+
 impl<T> EevdfTaskPayload<T> {
     pub(crate) const fn new(inner: T) -> Self {
         Self {
@@ -611,8 +643,11 @@ impl<T> EevdfTaskPayload<T> {
     ///
     /// The caller must hold the task's queue-owner claim and the run-queue
     /// lock, and must not expose this reference across that exclusion.
-    pub(crate) unsafe fn owned_state_mut(&self) -> &mut EevdfOwnedState {
-        &mut *self.state.get()
+    pub(crate) unsafe fn owned_state_mut(&self) -> EevdfOwnedStateMut<'_> {
+        EevdfOwnedStateMut {
+            pointer: self.state.get(),
+            _marker: PhantomData,
+        }
     }
 
     pub(crate) fn rr_remaining(&self) -> usize {
@@ -627,7 +662,7 @@ impl<T> EevdfTaskPayload<T> {
         let claim = self.claim_configuration()?;
         // SAFETY: the configuration claim excludes every state access.
         unsafe {
-            let state = self.owned_state_mut();
+            let mut state = self.owned_state_mut();
             if state.fork_seed.is_some() {
                 return Err(SchedulerError::AlreadyQueued);
             }
@@ -744,7 +779,7 @@ impl<T> EevdfNode<EevdfReadyKey, EevdfTaskPayload<T>> {
         self.value().owned_state()
     }
 
-    pub(crate) unsafe fn owned_state_mut(&self) -> &mut EevdfOwnedState {
+    pub(crate) unsafe fn owned_state_mut(&self) -> EevdfOwnedStateMut<'_> {
         self.value().owned_state_mut()
     }
 }
@@ -849,7 +884,7 @@ impl<T> fmt::Debug for EevdfReservationCommitError<T> {
 /// A typed, allocation-free handoff of one EEVDF task between run queues.
 ///
 /// A live token owns a CONFIGURING claim.  All rollback metadata remains in
-/// the task's single private [`MigrationState`]; this capability carries only
+/// the task's single private `MigrationState`; this capability carries only
 /// the task, immutable source identity, and whether it is already parked.
 #[must_use = "dropping a migration parks the task for explicit recovery"]
 pub struct EevdfMigration<T> {
@@ -1325,48 +1360,11 @@ impl<T> EEVDFScheduler<T> {
             .expect("EEVDF task owner changed while a claim was held");
     }
 
-    unsafe fn stage_migration_state(
-        task: &Arc<EEVDFTask<T>>,
-        source_scheduler_id: usize,
-        params: EevdfTaskParams,
-        snapshot: Option<MigrationSnapshot>,
-        source_clock: Clock,
-        detached_clock: Clock,
-        source_entity: Option<Entity>,
-        source_key: EevdfReadyKey,
-        source_eligible_at: u128,
-        rr_remaining: usize,
-        runtime_remainder_ns: u64,
-        runtime_fraction_remainder_ns: u64,
-        runtime_fraction_period_ns: u64,
-        runtime_fraction_class: EevdfTaskClass,
-        runtime_fraction_weight: u128,
-        rr_fraction_q: u64,
-        dormant_fair: Option<Entity>,
-        origin: EevdfMigrationOrigin,
-    ) {
-        let state = task.owned_state_mut();
+    unsafe fn stage_migration_state(task: &Arc<EEVDFTask<T>>, migration: MigrationState) {
+        let mut state = task.owned_state_mut();
         state.entity = None;
         state.runtime_remainder_ns = 0;
-        state.migration = Some(MigrationState {
-            source_scheduler_id,
-            params,
-            snapshot,
-            source_clock,
-            detached_clock,
-            source_entity,
-            source_key,
-            source_eligible_at,
-            rr_remaining,
-            runtime_remainder_ns,
-            runtime_fraction_remainder_ns,
-            runtime_fraction_period_ns,
-            runtime_fraction_class,
-            runtime_fraction_weight,
-            rr_fraction_q,
-            dormant_fair,
-            origin,
-        });
+        state.migration = Some(migration);
         state.dormant_fair = None;
         state.rt_sleeping = false;
         state.sleep_v = None;
@@ -1614,7 +1612,7 @@ impl<T> EEVDFScheduler<T> {
         // SAFETY: the reservation's CONFIGURING claim excludes all state
         // access until this publication completes.
         unsafe {
-            let state = task.owned_state_mut();
+            let mut state = task.owned_state_mut();
             state.entity = entity;
             state.runtime_remainder_ns = 0;
             state.runtime_fraction_remainder_ns = 0;
@@ -1702,23 +1700,25 @@ impl<T> EEVDFScheduler<T> {
         unsafe {
             Self::stage_migration_state(
                 &removed,
-                self.id,
-                params,
-                snapshot,
-                source_clock,
-                detached_clock,
-                source_entity,
-                source_key,
-                source_eligible_at,
-                removed.rr_remaining(),
-                old_state.runtime_remainder_ns,
-                old_state.runtime_fraction_remainder_ns,
-                old_state.runtime_fraction_period_ns,
-                old_state.runtime_fraction_class,
-                old_state.runtime_fraction_weight,
-                old_state.rr_fraction_q,
-                old_state.dormant_fair,
-                EevdfMigrationOrigin::Ready,
+                MigrationState {
+                    source_scheduler_id: self.id,
+                    params,
+                    snapshot,
+                    source_clock,
+                    detached_clock,
+                    source_entity,
+                    source_key,
+                    source_eligible_at,
+                    rr_remaining: removed.rr_remaining(),
+                    runtime_remainder_ns: old_state.runtime_remainder_ns,
+                    runtime_fraction_remainder_ns: old_state.runtime_fraction_remainder_ns,
+                    runtime_fraction_period_ns: old_state.runtime_fraction_period_ns,
+                    runtime_fraction_class: old_state.runtime_fraction_class,
+                    runtime_fraction_weight: old_state.runtime_fraction_weight,
+                    rr_fraction_q: old_state.rr_fraction_q,
+                    dormant_fair: old_state.dormant_fair,
+                    origin: EevdfMigrationOrigin::Ready,
+                },
             );
         }
         self.clock = detached_clock;
@@ -1759,23 +1759,25 @@ impl<T> EEVDFScheduler<T> {
         unsafe {
             Self::stage_migration_state(
                 task,
-                self.id,
-                params,
-                snapshot,
-                source_clock,
-                detached_clock,
-                source_entity,
-                source_key,
-                source_eligible_at,
-                task.rr_remaining(),
-                old_state.runtime_remainder_ns,
-                old_state.runtime_fraction_remainder_ns,
-                old_state.runtime_fraction_period_ns,
-                old_state.runtime_fraction_class,
-                old_state.runtime_fraction_weight,
-                old_state.rr_fraction_q,
-                old_state.dormant_fair,
-                EevdfMigrationOrigin::Running,
+                MigrationState {
+                    source_scheduler_id: self.id,
+                    params,
+                    snapshot,
+                    source_clock,
+                    detached_clock,
+                    source_entity,
+                    source_key,
+                    source_eligible_at,
+                    rr_remaining: task.rr_remaining(),
+                    runtime_remainder_ns: old_state.runtime_remainder_ns,
+                    runtime_fraction_remainder_ns: old_state.runtime_fraction_remainder_ns,
+                    runtime_fraction_period_ns: old_state.runtime_fraction_period_ns,
+                    runtime_fraction_class: old_state.runtime_fraction_class,
+                    runtime_fraction_weight: old_state.runtime_fraction_weight,
+                    rr_fraction_q: old_state.rr_fraction_q,
+                    dormant_fair: old_state.dormant_fair,
+                    origin: EevdfMigrationOrigin::Running,
+                },
             );
         }
         self.clock = detached_clock;
@@ -1877,7 +1879,7 @@ impl<T> EEVDFScheduler<T> {
                 Ok(sequence) => sequence,
                 Err(kind) => return Err(Self::migration_error(kind, migration)),
             };
-            let (key, eligible_at) = match Self::fair_key(&entity, sequence) {
+            let (key, eligible_at) = match Self::fair_key(entity, sequence) {
                 Ok(value) => value,
                 Err(kind) => return Err(Self::migration_error(kind, migration)),
             };
@@ -1909,7 +1911,7 @@ impl<T> EEVDFScheduler<T> {
         }
         // SAFETY: the task remains behind CONFIGURING until publication.
         unsafe {
-            let state = task.owned_state_mut();
+            let mut state = task.owned_state_mut();
             state.entity = entity;
             state.runtime_remainder_ns = metadata.runtime_remainder_ns;
             state.runtime_fraction_remainder_ns = metadata.runtime_fraction_remainder_ns;
@@ -2046,7 +2048,7 @@ impl<T> EEVDFScheduler<T> {
         });
         // SAFETY: CONFIGURING excludes all task-state access.
         unsafe {
-            let state = task.owned_state_mut();
+            let mut state = task.owned_state_mut();
             state.entity = entity;
             state.runtime_remainder_ns = metadata.runtime_remainder_ns;
             state.runtime_fraction_remainder_ns = metadata.runtime_fraction_remainder_ns;
@@ -2279,12 +2281,12 @@ impl<T> EEVDFScheduler<T> {
                     // allowed before admission, so moving a seeded child to
                     // RT must clear the seed atomically with publication.
                     unsafe {
-                        let next = task.owned_state_mut();
+                        let mut next = task.owned_state_mut();
                         if is_rt_class(params.class) {
                             next.fork_seed = None;
                         }
                         if clear_fraction {
-                            Self::clear_runtime_fraction(next);
+                            Self::clear_runtime_fraction(&mut next);
                         }
                     }
                     task.value().apply_validated(params);
@@ -2294,7 +2296,7 @@ impl<T> EEVDFScheduler<T> {
                     self.sleeping_reconfigured_state(state, old_params, params)?;
                 // SAFETY: CONFIGURING claim excludes all task-state access.
                 unsafe {
-                    let next = task.owned_state_mut();
+                    let mut next = task.owned_state_mut();
                     next.entity = entity;
                     next.rr_fraction_q = if matches!(old_params.class, EevdfTaskClass::RoundRobin)
                         && matches!(params.class, EevdfTaskClass::RoundRobin)
@@ -2307,7 +2309,7 @@ impl<T> EEVDFScheduler<T> {
                     next.rt_sleeping = rt_sleeping;
                     next.sleep_v = state.sleep_v;
                     if clear_fraction {
-                        Self::clear_runtime_fraction(next);
+                        Self::clear_runtime_fraction(&mut next);
                     }
                     task.value().publish_validated(
                         params,
@@ -2410,7 +2412,7 @@ impl<T> EEVDFScheduler<T> {
                     let seq_kind = if new_fair { Some(true) } else { Some(false) };
                     (Some(removed), key, eligible_at, seq_kind)
                 };
-                if let Some(_) = sequence_kind {
+                if sequence_kind.is_some() {
                     let (key, eligible_at) =
                         replacement.expect("ready replacement key missing after preflight");
                     if let Err(error) =
@@ -2434,7 +2436,7 @@ impl<T> EEVDFScheduler<T> {
                 // SAFETY: this scheduler owns the task and either keeps it
                 // running or has reinserted its ready node.
                 unsafe {
-                    let next = task.owned_state_mut();
+                    let mut next = task.owned_state_mut();
                     next.entity = entity;
                     next.rr_fraction_q = if matches!(old_params.class, EevdfTaskClass::RoundRobin)
                         && matches!(params.class, EevdfTaskClass::RoundRobin)
@@ -2448,7 +2450,7 @@ impl<T> EEVDFScheduler<T> {
                     next.migration = None;
                     next.sleep_v = None;
                     if clear_fraction {
-                        Self::clear_runtime_fraction(next);
+                        Self::clear_runtime_fraction(&mut next);
                     }
                 }
                 task.value().publish_validated(params, next_rr);
@@ -2872,9 +2874,7 @@ impl<T> EEVDFScheduler<T> {
             return Err(SchedulerError::InconsistentState);
         };
 
-        if let Err(error) = self.insert_staged(&prev, key, eligible_at, old_key, old_eligible_at) {
-            return Err(error);
-        }
+        self.insert_staged(&prev, key, eligible_at, old_key, old_eligible_at)?;
         if reset_rr {
             Self::reset_rr_slice(&prev);
         }
@@ -3257,7 +3257,7 @@ impl<T> EEVDFScheduler<T> {
             return Err(SchedulerError::InconsistentState);
         }
         let conversion_remainder = (numerator % u128::from(period_ns)) as u64;
-        let whole = (fraction_ticks / ONE) as u128;
+        let whole = fraction_ticks / ONE;
         let fraction_q = (fraction_ticks % ONE) as u64;
         let params = current.sched_params();
         let fraction_weight = Self::runtime_fraction_weight(params)?;
@@ -3274,10 +3274,10 @@ impl<T> EEVDFScheduler<T> {
             self.fair_service_transaction(current, whole, fraction_q)?
         };
         unsafe {
-            let state = current.owned_state_mut();
+            let mut state = current.owned_state_mut();
             state.runtime_remainder_ns = 0;
             Self::publish_runtime_fraction_owner(
-                state,
+                &mut state,
                 params,
                 fraction_weight,
                 conversion_remainder,
@@ -3359,14 +3359,14 @@ impl<T> EEVDFScheduler<T> {
         // Publishing this bounded conversion token cannot fail, so a retry
         // after an arithmetic error observes the original bytes exactly.
         unsafe {
-            let state = current.owned_state_mut();
+            let mut state = current.owned_state_mut();
             state.runtime_remainder_ns = next_remainder;
             // Keep the new fixed-point conversion residue even when it did
             // not yet produce a whole scheduler tick.  Reusing
             // `old_remainder` here drops the low bits of a second fragment;
             // repeated sub-period samples then slowly lose service.
             Self::publish_runtime_fraction_owner(
-                state,
+                &mut state,
                 params,
                 fraction_weight,
                 conversion_remainder,
