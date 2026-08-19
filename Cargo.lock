@@ -1840,6 +1840,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "thekernel-axrcu"
+version = "0.1.0"
+dependencies = [
+ "kspin",
+ "static_assertions",
+]
+
+[[package]]
 name = "thekernel-axsched"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,19 @@
+[package]
+name = "thekernel-axrcu"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["TheKernel contributors"]
+description = "Bounded epoch publication and task-context reclamation primitives"
+license = "Apache-2.0"
+repository = "https://github.com/chenty2333/thekernel-ax"
+
+[lib]
+name = "axrcu"
+path = "src/lib.rs"
+
+[dependencies]
+kspin = { version = "0.1", features = ["smp"] }
+
+[dev-dependencies]
+static_assertions = "1.1"
