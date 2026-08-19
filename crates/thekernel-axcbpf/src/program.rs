@@ -1,7 +1,9 @@
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::{Instruction, opcode};
+use crate::{
+    Ancillary, Instruction, PacketInput, PacketMetadataProvider, ancillary_from_offset, opcode,
+};
 
 /// Maximum number of instructions in one verified classic-BPF program.
 pub const MAX_INSTRUCTIONS: usize = 4096;
@@ -47,6 +49,16 @@ pub trait Input {
 
     /// Loads one value at an already resolved absolute offset.
     fn load(&self, offset: u32, width: LoadWidth) -> Option<u32>;
+
+    /// Loads one typed Linux classic-socket-filter ancillary value.
+    ///
+    /// Ordinary byte inputs have no metadata provider and therefore return
+    /// `None`.  Verified packet programs only reach this method for supported
+    /// `SKF_AD_*` offsets; a missing provider follows Linux's safe zero result
+    /// instead of turning the encoded negative offset into a packet address.
+    fn ancillary(&self, _field: Ancillary) -> Option<u32> {
+        None
+    }
 }
 
 impl Input for [u8] {
@@ -63,6 +75,20 @@ impl Input for [u8] {
             LoadWidth::Half => Some(u32::from(u16::from_be_bytes([bytes[0], bytes[1]]))),
             LoadWidth::Word => Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
         }
+    }
+}
+
+impl Input for PacketInput<'_> {
+    fn len(&self) -> u32 {
+        u32::try_from(self.bytes().len()).unwrap_or(u32::MAX)
+    }
+
+    fn load(&self, offset: u32, width: LoadWidth) -> Option<u32> {
+        self.bytes().load(offset, width)
+    }
+
+    fn ancillary(&self, field: Ancillary) -> Option<u32> {
+        Some(self.packet_metadata().ancillary(field))
     }
 }
 
@@ -86,7 +112,8 @@ pub enum VerifyError {
         /// Rejected raw opcode.
         code: u16,
     },
-    /// A negative encoded load offset selects an unsupported ancillary extension.
+    /// A negative encoded load offset is not a supported Linux ancillary
+    /// extension.
     UnsupportedAncillaryLoad {
         /// Instruction index.
         pc: usize,
@@ -226,6 +253,44 @@ impl Program {
         self.instructions.is_empty()
     }
 
+    /// Returns whether the verified source reads Linux packet metadata.
+    ///
+    /// Adapters that cannot provide a real packet metadata snapshot must
+    /// reject such a program rather than silently evaluating it with a
+    /// fabricated byte-prefix or unrelated default values.
+    pub fn uses_ancillary(&self) -> bool {
+        self.instructions.iter().copied().any(|instruction| {
+            matches!(
+                instruction.code,
+                opcode::LD_W_ABS | opcode::LD_H_ABS | opcode::LD_B_ABS
+            ) && crate::ancillary_from_offset(instruction.k).is_some()
+        })
+    }
+
+    /// Translates this verified program into an immutable x86_64 code image.
+    ///
+    /// Translation only produces bytes and metadata. It does not make pages
+    /// executable, patch relocations, or invoke an external function. A
+    /// publisher is responsible for resolving the returned relocations under
+    /// its own W^X and lifetime policy.
+    pub fn translate(&self) -> Result<crate::CodeImage, crate::TranslationError> {
+        self.translate_with_profile(crate::InputProfile::PacketBytesBigEndian)
+    }
+
+    /// Translates using an explicit input ABI profile.
+    pub fn translate_with_profile(
+        &self,
+        profile: crate::InputProfile,
+    ) -> Result<crate::CodeImage, crate::TranslationError> {
+        crate::translate::translate_program(self.instructions(), profile)
+    }
+
+    /// Alias for [`Program::translate`] that makes the target architecture
+    /// explicit at call sites.
+    pub fn translate_x86_64(&self) -> Result<crate::CodeImage, crate::TranslationError> {
+        self.translate()
+    }
+
     /// Evaluates the program without allocation.
     ///
     /// A failed input load, an indirect-offset overflow, or a run-time X
@@ -249,20 +314,35 @@ impl Program {
             match instruction.code {
                 opcode::LD_IMM => accumulator = instruction.k,
                 opcode::LD_W_ABS => {
-                    let Some(value) = input.load(instruction.k, LoadWidth::Word) else {
-                        return (0, steps);
+                    let value = if let Some(field) = ancillary_from_offset(instruction.k) {
+                        input.ancillary(field).unwrap_or(0)
+                    } else {
+                        let Some(value) = input.load(instruction.k, LoadWidth::Word) else {
+                            return (0, steps);
+                        };
+                        value
                     };
                     accumulator = value;
                 }
                 opcode::LD_H_ABS => {
-                    let Some(value) = input.load(instruction.k, LoadWidth::Half) else {
-                        return (0, steps);
+                    let value = if let Some(field) = ancillary_from_offset(instruction.k) {
+                        input.ancillary(field).unwrap_or(0)
+                    } else {
+                        let Some(value) = input.load(instruction.k, LoadWidth::Half) else {
+                            return (0, steps);
+                        };
+                        value
                     };
                     accumulator = value;
                 }
                 opcode::LD_B_ABS => {
-                    let Some(value) = input.load(instruction.k, LoadWidth::Byte) else {
-                        return (0, steps);
+                    let value = if let Some(field) = ancillary_from_offset(instruction.k) {
+                        input.ancillary(field).unwrap_or(0)
+                    } else {
+                        let Some(value) = input.load(instruction.k, LoadWidth::Byte) else {
+                            return (0, steps);
+                        };
+                        value
                     };
                     accumulator = value;
                 }
@@ -442,9 +522,16 @@ fn verify_structure(instructions: &[Instruction]) -> Result<(), VerifyError> {
                     return Err(VerifyError::JumpOutOfRange { pc });
                 }
             }
-            opcode::LD_W_ABS | opcode::LD_H_ABS | opcode::LD_B_ABS | opcode::LDX_B_MSH
-                if (instruction.k as i32) < 0 =>
+            opcode::LD_W_ABS | opcode::LD_H_ABS | opcode::LD_B_ABS
+                if instruction.k & 0x8000_0000 != 0
+                    && crate::ancillary_from_offset(instruction.k).is_none() =>
             {
+                return Err(VerifyError::UnsupportedAncillaryLoad {
+                    pc,
+                    offset: instruction.k,
+                });
+            }
+            opcode::LDX_B_MSH if instruction.k & 0x8000_0000 != 0 => {
                 return Err(VerifyError::UnsupportedAncillaryLoad {
                     pc,
                     offset: instruction.k,

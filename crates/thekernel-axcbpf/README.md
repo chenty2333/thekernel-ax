@@ -3,9 +3,9 @@
 `thekernel-axcbpf` is a `no_std`, unsafe-free classic-BPF verifier and
 interpreter for operating-system mechanism layers. It accepts the ordinary
 classic instruction set, including packet-style absolute and indirect loads,
-sixteen scratch words, forward jumps, and 32-bit arithmetic. It deliberately
-does not implement Linux seccomp actions, syscall metadata, socket ownership,
-errno, signals, or ancillary packet extensions.
+sixteen scratch words, forward jumps, 32-bit arithmetic, and the common Linux
+socket-filter ancillary fields (protocol, packet type, interface index, mark,
+queue, and VLAN metadata).
 
 ## Contract
 
@@ -27,10 +27,37 @@ The built-in `[u8]` input uses network-byte-order halfword and word loads,
 which is useful for ordinary socket-filter data. A seccomp adapter can instead
 expose native-endian aligned words from its immutable syscall snapshot.
 
-Negative encoded absolute offsets are rejected rather than interpreted as
-Linux `SKF_AD_*`, link-layer, or network-layer ancillary extensions. A future
-socket adapter may add those facilities outside this core without widening
-the verifier's ordinary-input contract.
+Linux `SKF_AD_*` loads are resolved through a typed `PacketMetadata` provider;
+unknown or unsupported negative offsets are rejected rather than treated as
+packet addresses. `PacketInput` is the allocation-free interpreter adapter.
+The packet-aware x86 profile uses a `PacketInputContext`, retaining the
+two-argument native entry ABI while loading the original packet pointer,
+length, and aligned metadata fields from one immutable context snapshot.
+Ancillary values never participate in packet bounds arithmetic, so a metadata
+load cannot read outside the packet.
+
+`Program::translate` emits a real immutable SysV x86_64 function with ABI
+`extern "C" fn(*const u8, u32) -> u32`. The image contains no helper calls or
+address-bearing relocations: input bounds, indirect-offset overflow, arithmetic,
+branches, and failure-to-zero paths are emitted directly. A publisher may copy
+`CodeImage::bytes` into a W^X executable mapping; `entry()` is zero and
+`page_aligned_size_upper_bound()` gives the exact mapping upper bound. Use
+`InputProfile::PacketContextBigEndian` for a packet filter that uses ancillary
+loads; its first argument points to `PacketInputContext` rather than directly
+to packet bytes.
+
+Use `Program::translate_with_profile(InputProfile::NativeAlignedWords)` for a
+seccomp-style native-endian aligned-word input. That profile rejects byte and
+halfword source loads, rejects unaligned absolute word offsets, and checks
+indirect word alignment at runtime. `NativeWordInput` is the corresponding
+safe reference-model adapter. Both the interpreter and JIT check indirect word
+alignment using the logical offset before adding the data pointer.
+`NativeWordInput::new` intentionally keeps that logical rule independent from
+an incidental Rust slice address; adapters with a four-byte-aligned
+snapshot-base ABI can use `NativeWordInput::new_aligned` at their boundary.
+`TranslationValidator` independently decodes the restricted native instruction
+subset, checks the source semantic trace, direct targets, prologue/epilogue,
+and the empty relocation set; it does not make pages executable.
 
 ## Example
 

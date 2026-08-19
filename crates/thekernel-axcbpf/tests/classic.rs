@@ -1,6 +1,9 @@
 use core::mem::{align_of, offset_of, size_of};
 
-use axcbpf::{Input, Instruction, LoadWidth, Program, VerifyError, opcode};
+use axcbpf::{
+    Ancillary, Input, Instruction, LoadWidth, PacketInput, PacketMetadata, Program, VerifyError,
+    ancillary_from_offset, opcode,
+};
 
 fn statement(code: u16, k: u32) -> Instruction {
     Instruction::statement(code, k)
@@ -68,7 +71,7 @@ fn rejects_empty_and_oversized_programs() {
 }
 
 #[test]
-fn rejects_unsupported_opcode_and_ancillary_offset() {
+fn rejects_unsupported_opcode_and_unknown_ancillary_offset() {
     assert_eq!(
         Program::verify(&[statement(0xffff, 0), statement(opcode::RET_K, 0)]).unwrap_err(),
         VerifyError::UnsupportedOpcode {
@@ -78,15 +81,46 @@ fn rejects_unsupported_opcode_and_ancillary_offset() {
     );
     assert_eq!(
         Program::verify(&[
-            statement(opcode::LD_W_ABS, 0xffff_f000),
+            statement(opcode::LD_W_ABS, 0xffff_f002),
             statement(opcode::RET_A, 0),
         ])
         .unwrap_err(),
         VerifyError::UnsupportedAncillaryLoad {
             pc: 0,
-            offset: 0xffff_f000
+            offset: 0xffff_f002
         }
     );
+}
+
+#[test]
+fn packet_ancillary_loads_use_typed_metadata_without_packet_access() {
+    let metadata = PacketMetadata::new(0x0800, 7, 4, 0x1234_5678, 3, 0x8100, true, 0x8100);
+    let input = PacketInput::new(&[0xaa][..], metadata);
+    let fields = [
+        (Ancillary::Protocol, 0x0800),
+        (Ancillary::Pkttype, 4),
+        (Ancillary::Ifindex, 7),
+        (Ancillary::Mark, 0x1234_5678),
+        (Ancillary::Queue, 3),
+        (Ancillary::VlanTag, 0x8100),
+        (Ancillary::VlanTagPresent, 1),
+        (Ancillary::VlanTpid, 0x8100),
+    ];
+    for (field, expected) in fields {
+        let program = program(&[
+            statement(opcode::LD_W_ABS, field.encoded_offset()),
+            statement(opcode::RET_A, 0),
+        ]);
+        assert_eq!(program.evaluate(&input), expected, "{field:?}");
+        assert_eq!(ancillary_from_offset(field.encoded_offset()), Some(field));
+    }
+    // The metadata path must not be allowed to read a one-byte packet even
+    // when the load spelling requests a word.
+    let program = program(&[
+        statement(opcode::LD_W_ABS, Ancillary::Mark.encoded_offset()),
+        statement(opcode::RET_A, 0),
+    ]);
+    assert_eq!(program.evaluate(&input), metadata.mark);
 }
 
 #[test]
