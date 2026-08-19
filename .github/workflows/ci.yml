@@ -142,13 +142,13 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Test axtask feature matrix
         run: |
-          features='multitask irq preempt smp sched-cfs task-ext irq-continuation-diagnostics irq-exit'
-          test_features='test multitask irq preempt smp sched-cfs task-ext irq-continuation-diagnostics irq-exit'
+          features='multitask irq preempt smp sched-eevdf task-ext irq-continuation-diagnostics irq-exit'
+          test_features='test multitask irq preempt smp sched-eevdf task-ext irq-continuation-diagnostics irq-exit'
           cargo +nightly check -p thekernel-axtask --no-default-features --locked
           cargo +nightly test -p thekernel-axtask --all-targets --locked --features "$test_features"
           cargo +nightly clippy -p thekernel-axtask --all-targets --locked --features "$test_features" -- -D warnings
           RUSTDOCFLAGS='-D warnings' cargo +nightly doc -p thekernel-axtask --no-deps --locked --features "$features"
-          for scheduler in sched-fifo sched-rr sched-cfs; do
+          for scheduler in sched-fifo sched-rr sched-eevdf; do
             cargo +nightly check -p thekernel-axtask --locked --features "multitask irq preempt smp task-ext $scheduler"
           done
       - name: Test publish and unpacked release artifacts

@@ -248,7 +248,7 @@ impl EevdfReadyCursor {
     }
 
     /// Forget continuation state and restart at the first ready key.
-    pub const fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.0 = None;
     }
 }

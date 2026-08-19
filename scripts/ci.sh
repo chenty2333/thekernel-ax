@@ -39,9 +39,9 @@ cargo +1.85.0 clippy -p thekernel-axpoll --all-targets --locked -- -D warnings
 RUSTDOCFLAGS='-D warnings' \
     cargo +1.85.0 doc -p thekernel-axpoll --no-deps --locked
 
-nightly_features='multitask irq preempt smp sched-cfs task-ext'
+nightly_features='multitask irq preempt smp sched-eevdf task-ext'
 diagnostic_features="$nightly_features irq-continuation-diagnostics irq-exit"
-nightly_test_features='test multitask irq preempt smp sched-cfs task-ext irq-continuation-diagnostics irq-exit'
+nightly_test_features='test multitask irq preempt smp sched-eevdf task-ext irq-continuation-diagnostics irq-exit'
 cargo +nightly check -p thekernel-axtask --no-default-features --locked
 cargo +nightly test \
     -p thekernel-axtask --all-targets --locked --features "$nightly_test_features"
@@ -52,7 +52,7 @@ RUSTDOCFLAGS='-D warnings' \
     cargo +nightly doc \
         -p thekernel-axtask --no-deps --locked --features "$diagnostic_features"
 
-for scheduler in sched-fifo sched-rr sched-cfs; do
+for scheduler in sched-fifo sched-rr sched-eevdf; do
     cargo +nightly check \
         -p thekernel-axtask \
         --locked \

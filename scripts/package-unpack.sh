@@ -205,7 +205,7 @@ CARGO_TARGET_DIR="$tmp/test-target/axtask" \
         --all-targets \
         --locked \
         --offline \
-        --features "test multitask irq preempt smp sched-cfs task-ext irq-exit" \
+        --features "test multitask irq preempt smp sched-eevdf task-ext irq-exit" \
         "${patches[@]}"
 CARGO_TARGET_DIR="$tmp/test-target/axtask-minimal" \
     run_cargo check \

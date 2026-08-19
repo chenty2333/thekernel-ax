@@ -28,17 +28,13 @@ multitask = [
 ]
 task-ext = ["dep:extern-trait"]
 irq = ["axhal/irq"]
-# Remote wakeups publish the target run queue first, then use the maintained
-# axhal reason broker to kick the target CPU.
-remote-resched = ["axhal/ipi"]
 tls = ["axhal/tls"]
 preempt = ["irq", "percpu?/preempt", "kernel_guard/preempt"]
 smp = ["kspin/smp"]
 
 sched-fifo = ["multitask"]
 sched-rr = ["multitask", "preempt"]
-sched-eevdf = ["multitask", "preempt"]
-idle-steal = ["smp", "sched-eevdf"]
+sched-cfs = ["multitask", "preempt"]
 
 test = ["percpu?/sp-naive"]
 
