@@ -8,18 +8,30 @@ use alloc::{
 use axerrno::{AxError, AxResult};
 #[cfg(feature = "sched-eevdf")]
 pub use axsched::{
-    EevdfTaskClass as SchedClass, EevdfTaskParams as SchedState, RR_TIMESLICE_TICKS,
-    RT_PRIORITY_MAX, RT_PRIORITY_MIN,
+    EEVDF_PROFILE, EevdfProfile, EevdfTaskClass as SchedClass, EevdfTaskParams as SchedState,
+    RR_TIMESLICE_TICKS, RT_PRIORITY_MAX, RT_PRIORITY_MIN, eevdf_profile,
 };
 use kernel_guard::NoPreemptIrqSave;
 use spin::Once;
 
 #[cfg(feature = "sched-eevdf")]
 pub use crate::run_queue::PreparedTaskPublication;
+#[cfg(feature = "sched-eevdf")]
+pub use crate::run_queue::{IDLE_STEAL_CONFIG, IdleStealConfig, idle_steal_config};
+#[cfg(feature = "idle-steal")]
+pub use crate::run_queue::{IdleStealDiagnosticsSnapshot, idle_steal_diagnostics};
 pub use crate::run_queue::{
     SchedulerLoadSnapshot, TaskEnqueueError, TaskEnqueueErrorKind, TaskRuntimeInitError,
     TaskSchedError, scheduler_load_snapshot,
 };
+
+/// Failure to install the late remote scheduler-kick consumer.
+#[cfg(all(feature = "remote-resched", target_os = "none"))]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum RemoteReschedInitError {
+    /// The HAL reason broker is not ready or its reschedule lane is occupied.
+    BrokerUnavailableOrOccupied,
+}
 pub(crate) use crate::run_queue::{current_run_queue, select_run_queue};
 #[doc(cfg(all(feature = "multitask", feature = "task-ext")))]
 #[cfg(feature = "task-ext")]
@@ -274,6 +286,25 @@ pub(crate) fn cpu_mask_full() -> AxCpuMask {
 /// Initializes the task scheduler for secondary CPUs.
 pub fn init_scheduler_secondary() -> Result<(), TaskRuntimeInitError> {
     crate::run_queue::init_secondary()
+}
+
+/// Register the allocation-free remote scheduler-kick consumer.
+///
+/// The raw IPI broker is initialized by the platform runtime after task
+/// runqueues are online, so this is intentionally a separate late-init step
+/// rather than part of [`init_scheduler`]. Repeating the registration is
+/// idempotent at the HAL boundary; a false result means the broker is absent or
+/// another owner already occupies the reason lane.
+#[cfg(all(feature = "remote-resched", target_os = "none"))]
+pub fn init_remote_resched_ipi() -> Result<(), RemoteReschedInitError> {
+    if axhal::irq::register_ipi_reason(
+        axhal::irq::IpiReason::Reschedule,
+        crate::run_queue::remote_resched_ipi_handler,
+    ) {
+        Ok(())
+    } else {
+        Err(RemoteReschedInitError::BrokerUnavailableOrOccupied)
+    }
 }
 
 /// Handles periodic timer ticks for the task manager.
@@ -956,6 +987,19 @@ pub fn run_idle() -> ! {
         // A dispatcher running after the yield may make a blocked task ready.
         // Honor that wakeup before entering the architecture idle instruction.
         resched_if_needed();
+        #[cfg(feature = "idle-steal")]
+        match crate::run_queue::current_run_queue::<NoPreemptIrqSave>().idle_steal_once() {
+            crate::run_queue::IdleStealOutcome::Stole
+            | crate::run_queue::IdleStealOutcome::LocalWorkWon => {
+                // A successful pull or a local-work race publishes/observes
+                // runnable work on this CPU. Turn that result into the normal
+                // bounded preemption boundary; the steal itself never
+                // dispatches while holding both queues.
+                current().set_preempt_pending(true);
+                resched_if_needed();
+            }
+            crate::run_queue::IdleStealOutcome::NoWork => {}
+        }
         trace!("idle task: waiting for IRQs...");
         #[cfg(feature = "irq")]
         axhal::asm::wait_for_irqs();

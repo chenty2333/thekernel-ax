@@ -10,15 +10,21 @@ use core::{
     task::{Context, Poll},
 };
 
-use axhal::{mem::total_ram_size, percpu::this_cpu_id};
+use axhal::{
+    mem::total_ram_size,
+    percpu::this_cpu_id,
+    time::{NANOS_PER_SEC, monotonic_time_nanos},
+};
 #[cfg(feature = "sched-eevdf")]
 use axsched::EevdfTaskReservation;
-use axsched::{BaseScheduler, DeactivateReason, EnqueueReason, SchedulerError};
+use axsched::{BaseScheduler, DeactivateReason, EnqueueReason, RuntimeDelta, SchedulerError};
 use futures_util::task::AtomicWaker;
 use kernel_guard::BaseGuard;
 use kspin::SpinRaw;
 use lazyinit::LazyInit;
 
+#[cfg(feature = "idle-steal")]
+use crate::task::IdleStealMutation;
 #[cfg(feature = "smp")]
 use crate::task::{CpuHandoffCompletion, MigrationClaim, WakeHandoffPublication};
 use crate::{
@@ -29,6 +35,9 @@ use crate::{
         TaskExitQueueFault, TaskStack, TaskState, TaskWakeFault,
     },
 };
+
+#[cfg(all(feature = "remote-resched", feature = "smp", target_os = "none"))]
+use axhal::irq::{IpiReason, IpiTarget};
 
 macro_rules! percpu_static {
     ($(
@@ -211,6 +220,99 @@ struct GcWake {
     retry_delay: AtomicU32,
 }
 
+#[cfg(feature = "idle-steal")]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct IdleStealDiagnosticsSnapshot {
+    pub attempts: u64,
+    pub local_work_won: u64,
+    pub victim_scans: u64,
+    pub victim_lock_busy: u64,
+    pub destination_lock_busy: u64,
+    pub no_victim: u64,
+    pub candidate_scans: u64,
+    pub candidate_rejects: u64,
+    pub candidate_none: u64,
+    pub mutation_busy: u64,
+    pub affinity_rejects: u64,
+    pub commit_failures: u64,
+    pub successes: u64,
+    pub rollbacks: u64,
+    pub rollback_failures: u64,
+}
+
+#[cfg(feature = "idle-steal")]
+struct IdleStealDiagnostics {
+    attempts: AtomicU64,
+    local_work_won: AtomicU64,
+    victim_scans: AtomicU64,
+    victim_lock_busy: AtomicU64,
+    destination_lock_busy: AtomicU64,
+    no_victim: AtomicU64,
+    candidate_scans: AtomicU64,
+    candidate_rejects: AtomicU64,
+    candidate_none: AtomicU64,
+    mutation_busy: AtomicU64,
+    affinity_rejects: AtomicU64,
+    commit_failures: AtomicU64,
+    successes: AtomicU64,
+    rollbacks: AtomicU64,
+    rollback_failures: AtomicU64,
+}
+
+#[cfg(feature = "idle-steal")]
+#[repr(align(64))]
+struct IdleStealVictimCursor(usize);
+
+#[cfg(feature = "idle-steal")]
+impl IdleStealVictimCursor {
+    const fn new() -> Self {
+        Self(0)
+    }
+}
+
+#[cfg(feature = "idle-steal")]
+impl IdleStealDiagnostics {
+    const fn new() -> Self {
+        Self {
+            attempts: AtomicU64::new(0),
+            local_work_won: AtomicU64::new(0),
+            victim_scans: AtomicU64::new(0),
+            victim_lock_busy: AtomicU64::new(0),
+            destination_lock_busy: AtomicU64::new(0),
+            no_victim: AtomicU64::new(0),
+            candidate_scans: AtomicU64::new(0),
+            candidate_rejects: AtomicU64::new(0),
+            candidate_none: AtomicU64::new(0),
+            mutation_busy: AtomicU64::new(0),
+            affinity_rejects: AtomicU64::new(0),
+            commit_failures: AtomicU64::new(0),
+            successes: AtomicU64::new(0),
+            rollbacks: AtomicU64::new(0),
+            rollback_failures: AtomicU64::new(0),
+        }
+    }
+
+    fn snapshot(&self) -> IdleStealDiagnosticsSnapshot {
+        IdleStealDiagnosticsSnapshot {
+            attempts: self.attempts.load(Ordering::Relaxed),
+            local_work_won: self.local_work_won.load(Ordering::Relaxed),
+            victim_scans: self.victim_scans.load(Ordering::Relaxed),
+            victim_lock_busy: self.victim_lock_busy.load(Ordering::Relaxed),
+            destination_lock_busy: self.destination_lock_busy.load(Ordering::Relaxed),
+            no_victim: self.no_victim.load(Ordering::Relaxed),
+            candidate_scans: self.candidate_scans.load(Ordering::Relaxed),
+            candidate_rejects: self.candidate_rejects.load(Ordering::Relaxed),
+            candidate_none: self.candidate_none.load(Ordering::Relaxed),
+            mutation_busy: self.mutation_busy.load(Ordering::Relaxed),
+            affinity_rejects: self.affinity_rejects.load(Ordering::Relaxed),
+            commit_failures: self.commit_failures.load(Ordering::Relaxed),
+            successes: self.successes.load(Ordering::Relaxed),
+            rollbacks: self.rollbacks.load(Ordering::Relaxed),
+            rollback_failures: self.rollback_failures.load(Ordering::Relaxed),
+        }
+    }
+}
+
 #[cfg(feature = "irq")]
 const GC_RETRY_MIN_TICKS: u32 = 1;
 #[cfg(feature = "irq")]
@@ -332,6 +434,23 @@ percpu_static! {
     /// Stores the weak reference to the previous task that is running on this CPU.
     #[cfg(feature = "smp")]
     PREV_TASK: Weak<crate::AxTask> = Weak::new(),
+    /// Exact CPU+generation token belonging to [`PREV_TASK`].  The resumed
+    /// stack uses this token to release only the owner it suspended; a delayed
+    /// old stack can therefore never clear a newer owner of the same task.
+    #[cfg(feature = "smp")]
+    PREV_TASK_OWNER: AtomicU64 = AtomicU64::new(0),
+    #[cfg(feature = "idle-steal")]
+    IDLE_STEAL_DIAGNOSTICS: IdleStealDiagnostics = IdleStealDiagnostics::new(),
+    /// Destination-local victim continuation.  Idle CPUs never update a
+    /// shared atomic when rotating their bounded victim window.
+    #[cfg(feature = "idle-steal")]
+    IDLE_STEAL_VICTIM_CURSOR: IdleStealVictimCursor = IdleStealVictimCursor::new(),
+    /// One structural continuation per possible victim CPU.  This is
+    /// destination-CPU local state, so idle pullers never contend on a
+    /// system-wide cursor cache line.
+    #[cfg(feature = "idle-steal")]
+    IDLE_STEAL_CURSORS: [axsched::EevdfReadyCursor; axconfig::plat::MAX_CPU_NUM] =
+        [axsched::EevdfReadyCursor::new(); axconfig::plat::MAX_CPU_NUM],
 }
 
 const MIB: usize = 1024 * 1024;
@@ -339,6 +458,13 @@ static IDLE_TICKS: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
 static GC_RECLAIM_ROUNDS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(all(
+    test,
+    feature = "smp",
+    any(feature = "preempt", feature = "remote-resched")
+))]
+static DEFERRED_WAKE_RESCHEDULE_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 
 pub(crate) fn idle_ticks() -> u64 {
     IDLE_TICKS.load(Ordering::Relaxed)
@@ -809,6 +935,33 @@ pub(crate) fn set_task_sched_state_stable(
     }
 }
 
+/// Materialize a running parent's pending runtime before taking a fork
+/// snapshot.  The caller holds the parent's run-queue lock for the complete
+/// operation, so the entity and queue clock advance together.
+#[cfg(feature = "sched-eevdf")]
+fn materialize_fork_parent_runtime(
+    scheduler: &mut Scheduler,
+    parent: &AxTaskRef,
+    runtime: RuntimeDelta,
+) -> Result<bool, SchedulerError> {
+    if !scheduler.is_running_task(parent)
+        || !parent.is_running()
+        || !AxRunQueue::should_account_runtime(parent.is_idle(), parent.is_migration_helper())
+    {
+        return Ok(false);
+    }
+
+    let mut needs_reschedule = false;
+    if !runtime.is_zero() {
+        needs_reschedule = scheduler.account_runtime(parent, runtime);
+    }
+    // A fork snapshot must not inherit a lag which is still hidden in the
+    // owner's sub-period carry.  Keep this under the same scheduler lock as
+    // `fork_seed`, so the entity and queue clock advance as one transaction.
+    needs_reschedule |= scheduler.settle_runtime_remainder(parent, runtime.period_ns())?;
+    Ok(needs_reschedule)
+}
+
 /// Install a scheduler-produced EEVDF fork seed while holding the sampled
 /// parent's run-queue lock.  The CPU publication is rechecked after lock
 /// acquisition; a concurrent migration therefore redirects this bounded
@@ -830,6 +983,11 @@ pub(crate) fn install_fork_seed_from_parent(
     #[cfg(not(feature = "smp"))]
     let attempts = 1;
     for _ in 0..attempts {
+        // The sampled CPU and the source scheduler lock form one ownership
+        // transaction.  Disable local IRQs before taking the sample so the
+        // timer cannot re-enter `scheduler_timer_tick()` on this CPU while
+        // the raw source lock is held and self-spin on it.
+        let _guard = kernel_guard::NoPreemptIrqSave::new();
         let sampled_cpu = parent.cpu_id() as usize;
         #[cfg(feature = "smp")]
         let Some(source) = get_run_queue(sampled_cpu) else {
@@ -842,7 +1000,20 @@ pub(crate) fn install_fork_seed_from_parent(
         if parent.cpu_id() as usize != sampled_cpu {
             continue;
         }
-        match scheduler.fork_seed(parent) {
+        let runtime = if scheduler.is_running_task(parent)
+            && parent.is_running()
+            && AxRunQueue::should_account_runtime(parent.is_idle(), parent.is_migration_helper())
+        {
+            source.runtime_delta_flags(parent.is_idle(), parent.is_migration_helper())
+        } else {
+            RuntimeDelta::new(0, AxRunQueue::scheduler_period_ns())
+        };
+        if materialize_fork_parent_runtime(&mut scheduler, parent, runtime)? {
+            request_reschedule_cpu(sampled_cpu, parent);
+        }
+        let seed = scheduler.fork_seed(parent);
+        drop(scheduler);
+        match seed {
             Ok(seed) => return child.install_fork_seed(seed),
             Err(SchedulerError::IncompatibleClass) => {
                 return Err(SchedulerError::IncompatibleClass);
@@ -1056,6 +1227,182 @@ pub fn scheduler_load_snapshot(cpu_id: usize) -> Option<SchedulerLoadSnapshot> {
     get_run_queue(cpu_id).map(|run_queue| run_queue.load.snapshot())
 }
 
+/// Compile-time idle-stealing limits exposed separately from EEVDF tuning.
+///
+/// Stealing changes run-queue ownership and is therefore not an EEVDF gain or
+/// profile parameter.  The values remain available in non-SMP builds so a
+/// diagnostic consumer can reconstruct the configured policy without adding a
+/// runtime branch to the scheduler path.
+#[cfg(feature = "sched-eevdf")]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct IdleStealConfig {
+    /// Whether the current build has the SMP idle-stealing path enabled.
+    pub enabled: bool,
+    /// Maximum remote victim queues sampled by one idle attempt.
+    pub victim_scan_limit: usize,
+    /// Maximum key-ordered tasks inspected in one victim queue.
+    pub candidate_scan_limit: usize,
+    /// Minimum residency used by the cache-hotness guard.
+    pub hot_residency_ns: u64,
+    /// Ready-task count at which an active victim is considered severely
+    /// imbalanced and may override the hotness guard.
+    pub severe_imbalance_ready_tasks: usize,
+}
+
+#[cfg(feature = "sched-eevdf")]
+pub const IDLE_STEAL_CONFIG: IdleStealConfig = IdleStealConfig {
+    enabled: cfg!(feature = "idle-steal"),
+    victim_scan_limit: IDLE_STEAL_VICTIM_SCAN_LIMIT,
+    candidate_scan_limit: IDLE_STEAL_CANDIDATE_SCAN_LIMIT,
+    hot_residency_ns: IDLE_STEAL_HOT_NS,
+    severe_imbalance_ready_tasks: IDLE_STEAL_SEVERE_READY_TASKS,
+};
+
+/// Return the immutable idle-stealing limits for this build.
+#[cfg(feature = "sched-eevdf")]
+pub const fn idle_steal_config() -> IdleStealConfig {
+    IDLE_STEAL_CONFIG
+}
+
+#[cfg(feature = "idle-steal")]
+pub fn idle_steal_diagnostics() -> IdleStealDiagnosticsSnapshot {
+    // Diagnostics are per-CPU and intentionally sampled only on the caller's
+    // CPU. Remote cache-line reads are not part of the idle hot path.
+    unsafe { IDLE_STEAL_DIAGNOSTICS.current_ref_raw() }.snapshot()
+}
+
+#[cfg(feature = "sched-eevdf")]
+const IDLE_STEAL_VICTIM_SCAN_LIMIT: usize = 4;
+#[cfg(feature = "sched-eevdf")]
+const IDLE_STEAL_CANDIDATE_SCAN_LIMIT: usize = 8;
+#[cfg(feature = "sched-eevdf")]
+const IDLE_STEAL_HOT_NS: u64 = 500_000;
+#[cfg(feature = "sched-eevdf")]
+const IDLE_STEAL_SEVERE_READY_TASKS: usize = 2;
+
+#[cfg(feature = "idle-steal")]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum IdleStealOutcome {
+    Stole,
+    LocalWorkWon,
+    NoWork,
+}
+
+#[cfg(feature = "idle-steal")]
+fn idle_steal_recently_hot(last_cpu: u32, last_ns: u64, victim_cpu: usize, now: u64) -> bool {
+    if last_ns == 0 || last_cpu as usize != victim_cpu {
+        return false;
+    }
+    // A backwards monotonic sample is conservatively hot: do not pull a task
+    // across CPUs until the clock source catches up.
+    if now < last_ns {
+        return true;
+    }
+    now - last_ns < IDLE_STEAL_HOT_NS
+}
+
+#[cfg(feature = "idle-steal")]
+fn idle_steal_candidate_allowed(
+    task: &TaskInner,
+    destination_cpu: usize,
+    victim_cpu: usize,
+    now: u64,
+    severe_imbalance: bool,
+    class: axsched::EevdfTaskClass,
+) -> bool {
+    let allowed_class = matches!(
+        class,
+        axsched::EevdfTaskClass::Normal
+            | axsched::EevdfTaskClass::Batch
+            | axsched::EevdfTaskClass::Idle
+    );
+    task.is_ready()
+        && !task.is_idle()
+        && !task.is_migration_helper()
+        // A yielded/preempted task remains Ready until the actual switch
+        // boundary releases its old CPU token.  It is locally selectable but
+        // cannot be detached and restored on another CPU in this window.
+        && !task.has_cpu_owner_or_handoff()
+        && allowed_class
+        && task.cpu_id() as usize == victim_cpu
+        && task.cpumask().get(destination_cpu)
+        && (!idle_steal_recently_hot(task.last_run_cpu(), task.last_run_ns(), victim_cpu, now)
+            || severe_imbalance)
+}
+
+#[cfg(feature = "idle-steal")]
+fn next_idle_steal_start(cursor: &mut usize, cpu_count: usize) -> usize {
+    if cpu_count == 0 {
+        return 0;
+    }
+    let start = *cursor % cpu_count;
+    *cursor = if start == cpu_count - 1 { 0 } else { start + 1 };
+    start
+}
+
+#[cfg(feature = "idle-steal")]
+fn choose_idle_steal_victim(
+    cpu_count: usize,
+    start: usize,
+    destination_cpu: usize,
+    mut load: impl FnMut(usize) -> Option<SchedulerLoadSnapshot>,
+) -> ([usize; IDLE_STEAL_VICTIM_SCAN_LIMIT], usize, usize) {
+    let mut selected = [usize::MAX; IDLE_STEAL_VICTIM_SCAN_LIMIT];
+    let mut selected_load = [0usize; IDLE_STEAL_VICTIM_SCAN_LIMIT];
+    if cpu_count == 0 {
+        return (selected, 0, 0);
+    }
+    // The destination is not a victim.  Count only remote queues toward the
+    // bound so a rotating window that crosses the destination still gets the
+    // full four victim attempts.
+    let scan_limit = cpu_count
+        .saturating_sub(1)
+        .min(IDLE_STEAL_VICTIM_SCAN_LIMIT);
+    let mut scans = 0;
+    let mut offset = 0;
+    let mut selected_count = 0;
+    while offset < cpu_count && scans < scan_limit {
+        let index = (start + offset) % cpu_count;
+        offset += 1;
+        if index == destination_cpu {
+            continue;
+        }
+        scans += 1;
+        let Some(snapshot) = load(index) else {
+            continue;
+        };
+        if snapshot.ready_tasks == 0 {
+            continue;
+        }
+        let runnable = snapshot.runnable_tasks();
+        let mut position = selected_count;
+        if position < IDLE_STEAL_VICTIM_SCAN_LIMIT {
+            selected_count += 1;
+        } else if runnable <= selected_load[IDLE_STEAL_VICTIM_SCAN_LIMIT - 1] {
+            continue;
+        } else {
+            position = IDLE_STEAL_VICTIM_SCAN_LIMIT - 1;
+        }
+        while position > 0 && runnable > selected_load[position - 1] {
+            selected[position] = selected[position - 1];
+            selected_load[position] = selected_load[position - 1];
+            position -= 1;
+        }
+        selected[position] = index;
+        selected_load[position] = runnable;
+    }
+    (selected, selected_count, scans)
+}
+
+#[cfg(feature = "idle-steal")]
+#[inline]
+fn idle_steal_local_work_won(scheduler: &Scheduler) -> bool {
+    // The caller holds the destination scheduler lock.  The advisory load
+    // sample is intentionally not consulted here: a remote wake can publish
+    // a ready task after the sample and before this exact check.
+    scheduler.ready_len() != 0
+}
+
 /// Selects the appropriate run queue for the provided task.
 ///
 /// * In a single-core system, this function always returns a reference to the global run queue.
@@ -1141,6 +1488,11 @@ pub(crate) struct AxRunQueue {
     /// two-phase operation released that reference. IRQ handlers may use the
     /// raw lock only because the interrupted task cannot then own it locally.
     scheduler: SpinRaw<Scheduler>,
+    /// Monotonic timestamp of the last ownership/accounting boundary on this
+    /// CPU. The owner CPU normally advances it; a remote scheduling-parameter
+    /// update may also sample it while holding this queue's scheduler lock so
+    /// the old model receives all pending runtime before reconfiguration.
+    running_accounted_ns: AtomicU64,
     /// Lock-free placement/diagnostic view, deliberately isolated from the
     /// scheduler lock's cache line.
     load: RunQueueLoad,
@@ -1226,6 +1578,7 @@ impl<G: BaseGuard> AxRunQueueRef<'_, G> {
     /// which means the task is already unblocked by other cores.
     pub fn unblock_task(&mut self, task: AxTaskRef, resched: bool) -> WakeTaskOutcome {
         let task_id = task.id().as_u64();
+        let task_owner = task.clone();
         let Some(run_queue) = self.inner else {
             return WakeTaskOutcome::Rejected(self.unavailable(task));
         };
@@ -1239,11 +1592,8 @@ impl<G: BaseGuard> AxRunQueueRef<'_, G> {
                 // Since now, the task to be unblocked is in the `Ready` state.
                 let cpu_id = run_queue.cpu_id;
                 debug!("task unblock: id={task_id} on run_queue {cpu_id}");
-                // Note: when the task is unblocked on another CPU's run queue,
-                // we just ingiore the `resched` flag.
-                if resched && cpu_id == this_cpu_id() {
-                    #[cfg(feature = "preempt")]
-                    crate::current().set_preempt_pending(true);
+                if resched {
+                    request_reschedule_cpu(cpu_id, &task_owner);
                 }
                 WakeTaskOutcome::Enqueued
             }
@@ -1266,7 +1616,7 @@ impl<G: BaseGuard> AxRunQueueRef<'_, G> {
         task: &AxTaskRef,
         sched_state: axsched::EevdfTaskParams,
     ) -> TaskSchedUpdate {
-        if matches!(task.state(), TaskState::Exited) {
+        if task.is_terminalizing() || matches!(task.state(), TaskState::Exited) {
             return TaskSchedUpdate::Complete(Err(TaskSchedError::TaskExited));
         }
         let Some(run_queue) = self.inner else {
@@ -1282,6 +1632,78 @@ impl<G: BaseGuard> AxRunQueueRef<'_, G> {
         self.inner
             .is_some_and(|run_queue| run_queue.migrate_ready_task(task))
     }
+}
+
+/// Handle one coalesced remote scheduler-kick reason on the destination CPU.
+///
+/// The IPI only sets the task-local pending bit. IRQ-exit/preemption-boundary
+/// code owns the actual dispatch, so the interrupt handler never takes a
+/// scheduler lock, allocates, or busy-polls.
+#[cfg(all(feature = "remote-resched", target_os = "none"))]
+pub(crate) fn remote_resched_ipi_handler() {
+    if let Some(current) = crate::current_may_uninit() {
+        #[cfg(feature = "preempt")]
+        current.set_preempt_pending(true);
+        #[cfg(not(feature = "preempt"))]
+        let _ = current;
+    }
+}
+
+/// Request a scheduler re-evaluation on `cpu_id` after runnable publication.
+///
+/// Local requests use the existing task-local pending bit. Remote requests
+/// publish the coalesced HAL reason after the destination queue is linked, so
+/// an IPI race can only produce an early or repeated check, never a lost wake.
+/// An IPI failure is diagnostic only: the task is already runnable and the
+/// periodic timer provides a bounded fallback.
+#[cfg(feature = "smp")]
+fn request_reschedule_cpu(cpu_id: usize, task: &AxTaskRef) {
+    if cpu_id == this_cpu_id() {
+        #[cfg(feature = "preempt")]
+        crate::current().set_preempt_pending(true);
+        return;
+    }
+
+    #[cfg(all(feature = "remote-resched", target_os = "none"))]
+    {
+        if let Err(error) =
+            axhal::irq::send_ipi_reason(IpiReason::Reschedule, IpiTarget::Other { cpu_id })
+        {
+            error!(
+                "remote reschedule kick rejected for task {} on CPU {}: {:?}",
+                task.id().as_u64(),
+                cpu_id,
+                error
+            );
+            task.record_wake_fault(TaskWakeFault::RemoteRescheduleFailed);
+        }
+    }
+
+    #[cfg(not(all(feature = "remote-resched", target_os = "none")))]
+    {
+        let _ = (cpu_id, task);
+    }
+}
+
+#[cfg(not(feature = "smp"))]
+fn request_reschedule_cpu(_cpu_id: usize, _task: &AxTaskRef) {
+    #[cfg(feature = "preempt")]
+    crate::current().set_preempt_pending(true);
+}
+
+/// Complete the scheduler-kick half of an old-CPU delegated wake.
+///
+/// Cooperative SMP builds without the remote-reschedule capability have no
+/// kick primitive, so they intentionally leave this call out.  A remote IPI
+/// is still required for cooperative schedulers when that capability is
+/// selected; an idle target otherwise has no event that makes it inspect its
+/// newly published queue.
+#[cfg(all(feature = "smp", any(feature = "preempt", feature = "remote-resched")))]
+#[inline]
+fn request_deferred_wake_reschedule(cpu_id: usize, task: &AxTaskRef) {
+    #[cfg(test)]
+    DEFERRED_WAKE_RESCHEDULE_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    request_reschedule_cpu(cpu_id, task);
 }
 
 #[cfg(feature = "sched-eevdf")]
@@ -1331,9 +1753,32 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
             .expect("current task ownership was already released")
     }
 
+    #[cfg(feature = "idle-steal")]
+    pub(crate) fn idle_steal_once(&self) -> IdleStealOutcome {
+        self.inner.idle_steal_once()
+    }
+
     #[cfg(feature = "smp")]
     fn maybe_migrate_current(&mut self) -> bool {
         let curr = self.current_task();
+        // Idle and migration-helper tasks are scheduler handoff sentinels,
+        // not EEVDF entities.  In particular, the helper runs while the
+        // source scheduler has already cleared its `running` slot; probing
+        // runtime/lifecycle hooks here would lazily adopt that unadmitted
+        // task as the next fair current.
+        if !AxRunQueue::should_account_runtime(curr.is_idle(), curr.is_migration_helper()) {
+            return false;
+        }
+        let mut scheduler = self.inner.scheduler.lock();
+        let runtime = self.inner.runtime_delta(curr);
+        if !runtime.is_zero() {
+            let _ = scheduler.account_runtime(curr, runtime);
+        }
+        #[cfg(feature = "sched-eevdf")]
+        scheduler
+            .settle_runtime_remainder(curr, AxRunQueue::scheduler_period_ns())
+            .expect("EEVDF migration boundary retained an invalid runtime remainder");
+        drop(scheduler);
         match curr.claim_migration(self.inner.cpu_id) {
             MigrationClaim::Allowed => false,
             MigrationClaim::Prepared(migration_task) => {
@@ -1368,16 +1813,35 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
         }
         #[cfg(feature = "smp")]
         if !curr.cpumask().get(self.inner.cpu_id) {
+            if !AxRunQueue::should_account_runtime(curr.is_idle(), curr.is_migration_helper()) {
+                if curr.is_idle() {
+                    IDLE_TICKS.fetch_add(1, Ordering::Relaxed);
+                }
+                return;
+            }
+            let mut scheduler = self.inner.scheduler.lock();
+            let runtime = self.inner.runtime_delta(curr);
+            if !runtime.is_zero() {
+                let _ = scheduler.account_runtime(curr, runtime);
+            }
+            drop(scheduler);
             #[cfg(feature = "preempt")]
             curr.set_preempt_pending(true);
             return;
         }
-        if curr.is_idle() {
-            // Diagnostic time may wrap only after `u64::MAX` scheduler ticks;
-            // unlike an identity or ownership generation it is not used for
-            // correctness and must not add a contended CAS retry loop here.
-            IDLE_TICKS.fetch_add(1, Ordering::Relaxed);
-        } else if self.inner.scheduler.lock().task_tick(curr) {
+        if !AxRunQueue::should_account_runtime(curr.is_idle(), curr.is_migration_helper()) {
+            if curr.is_idle() {
+                // Diagnostic time may wrap only after `u64::MAX` scheduler
+                // ticks; unlike an identity or ownership generation it is
+                // not used for correctness and must not add a contended CAS
+                // retry loop here.
+                IDLE_TICKS.fetch_add(1, Ordering::Relaxed);
+            }
+            return;
+        }
+        let mut scheduler = self.inner.scheduler.lock();
+        let runtime = self.inner.runtime_delta(curr);
+        if scheduler.account_runtime(curr, runtime) {
             #[cfg(feature = "preempt")]
             curr.set_preempt_pending(true);
         }
@@ -1399,6 +1863,22 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
         #[cfg(feature = "smp")]
         if self.maybe_migrate_current() {
             return;
+        }
+
+        #[cfg(not(feature = "smp"))]
+        {
+            let mut scheduler = self.inner.scheduler.lock();
+            if AxRunQueue::should_account_runtime(curr.is_idle(), curr.is_migration_helper()) {
+                let runtime = self.inner.runtime_delta_task(&curr);
+                if !runtime.is_zero() {
+                    let _ = scheduler.account_runtime(&curr, runtime);
+                }
+                #[cfg(feature = "sched-eevdf")]
+                scheduler
+                    .settle_runtime_remainder(&curr, AxRunQueue::scheduler_period_ns())
+                    .expect("EEVDF preemption boundary retained an invalid runtime remainder");
+            }
+            drop(scheduler);
         }
 
         if curr.is_idle() {
@@ -1435,6 +1915,10 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
 
         {
             let mut scheduler = self.inner.scheduler.lock();
+            #[cfg(feature = "sched-eevdf")]
+            scheduler
+                .settle_runtime_remainder(curr, AxRunQueue::scheduler_period_ns())
+                .expect("EEVDF migration deactivation retained an invalid runtime remainder");
             scheduler.deactivate_task(curr, DeactivateReason::Migrate);
 
             // Mark current task's state as `Ready`, but do not publish it in
@@ -1480,6 +1964,21 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
             if self.maybe_migrate_current() {
                 return;
             }
+            #[cfg(not(feature = "smp"))]
+            {
+                let mut scheduler = self.inner.scheduler.lock();
+                if AxRunQueue::should_account_runtime(curr.is_idle(), curr.is_migration_helper()) {
+                    let runtime = self.inner.runtime_delta_task(&curr);
+                    if !runtime.is_zero() {
+                        let _ = scheduler.account_runtime(&curr, runtime);
+                    }
+                    #[cfg(feature = "sched-eevdf")]
+                    scheduler
+                        .settle_runtime_remainder(&curr, AxRunQueue::scheduler_period_ns())
+                        .expect("EEVDF yield boundary retained an invalid runtime remainder");
+                }
+                drop(scheduler);
+            }
             if curr.is_idle() {
                 self.inner.resched();
                 return;
@@ -1519,12 +2018,29 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
         );
         assert!(curr.is_running(), "task is not running: {:?}", curr.state());
         assert!(!curr.is_idle());
-        if !curr.is_migration_helper() {
-            self.inner
-                .scheduler
-                .lock()
-                .deactivate_task(&curr, DeactivateReason::Exit);
+        // Publish terminal intent before taking the scheduler lock. The
+        // externally visible TaskState remains Running until notify_exit can
+        // publish the exit code, but no parameter update may enter the
+        // ownerless post-deactivate representation as if it were virgin.
+        curr.begin_terminal_transaction();
+        let mut scheduler = self.inner.scheduler.lock();
+        if AxRunQueue::should_account_runtime(curr.is_idle(), curr.is_migration_helper()) {
+            let runtime = self.inner.runtime_delta(&curr);
+            if !runtime.is_zero() {
+                let _ = scheduler.account_runtime(&curr, runtime);
+            }
+            #[cfg(feature = "sched-eevdf")]
+            scheduler
+                .settle_runtime_remainder(&curr, AxRunQueue::scheduler_period_ns())
+                .expect("EEVDF exit boundary retained an invalid runtime remainder");
         }
+        if !curr.is_migration_helper() {
+            // Keep settlement and terminal scheduler removal under the same
+            // run-queue lock. A remote parameter update must not slip between
+            // charging the old tuple and observing the exit class/weight.
+            scheduler.deactivate_task(&curr, DeactivateReason::Exit);
+        }
+        drop(scheduler);
         if curr.is_init() {
             // This path still owns the IRQ-saving runqueue guard. Exited task
             // and TaskExt destructors may sleep, join, or take scheduler-aware
@@ -1571,7 +2087,9 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
     /// check and the scheduler handoff.
     pub(crate) fn blocked_resched_atomic(&mut self, token: BlockWaitToken) -> BlockReschedOutcome {
         let curr = self.current_task();
-        if !curr.is_running() || curr.is_idle() {
+        if !curr.is_running()
+            || !AxRunQueue::should_account_runtime(curr.is_idle(), curr.is_migration_helper())
+        {
             return BlockReschedOutcome::StateLost;
         }
         #[cfg(all(feature = "preempt", target_os = "none"))]
@@ -1582,6 +2100,13 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
         if !curr.can_preempt(0) {
             return BlockReschedOutcome::CannotBlock;
         }
+
+        let mut scheduler = self.inner.scheduler.lock();
+        let runtime = self.inner.runtime_delta(curr);
+        if !runtime.is_zero() {
+            let _ = scheduler.account_runtime(curr, runtime);
+        }
+        drop(scheduler);
 
         match curr.claim_block_wait(token) {
             BlockWaitClaim::Woken => return BlockReschedOutcome::Woken,
@@ -1651,6 +2176,10 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
             let commit = curr.commit_block_wait(token);
             match commit {
                 BlockWaitCommit::Blocked => {
+                    #[cfg(feature = "sched-eevdf")]
+                    scheduler
+                        .settle_runtime_remainder(curr, AxRunQueue::scheduler_period_ns())
+                        .expect("EEVDF sleep boundary retained an invalid runtime remainder");
                     scheduler.deactivate_task(curr, DeactivateReason::Sleep);
                 }
                 BlockWaitCommit::Woken | BlockWaitCommit::Stale => {
@@ -1699,14 +2228,32 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
 
     pub fn set_current_priority(&mut self, priority: isize) -> Result<(), TaskSchedError> {
         let mut scheduler = self.inner.scheduler.lock();
+        if AxRunQueue::should_account_runtime(
+            self.current_task().is_idle(),
+            self.current_task().is_migration_helper(),
+        ) {
+            let runtime = self.inner.runtime_delta(self.current_task());
+            if !runtime.is_zero() {
+                #[cfg(feature = "preempt")]
+                if scheduler.account_runtime(self.current_task(), runtime) {
+                    self.current_task().set_preempt_pending(true);
+                }
+                #[cfg(not(feature = "preempt"))]
+                let _ = scheduler.account_runtime(self.current_task(), runtime);
+            }
+        }
         #[cfg(feature = "sched-eevdf")]
         {
             let outcome = scheduler
-                .set_priority(self.current_task(), priority)
+                .set_priority_with_runtime(
+                    self.current_task(),
+                    priority,
+                    AxRunQueue::scheduler_period_ns(),
+                )
                 .map_err(TaskSchedError::from)?;
             #[cfg(feature = "preempt")]
             if let Some(current) = outcome.into_preempt_current() {
-                current.set_preempt_pending(true);
+                request_reschedule_cpu(self.inner.cpu_id, &current);
             }
             Ok(())
         }
@@ -1720,6 +2267,97 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
 }
 
 impl AxRunQueue {
+    fn scheduler_period_ns() -> u64 {
+        (NANOS_PER_SEC / axconfig::TICKS_PER_SEC as u64).max(1)
+    }
+
+    /// Only a real, admitted task may own the run-time accounting boundary.
+    /// Idle and migration-helper tasks are handoff sentinels: their presence
+    /// in the task layer does not mean that EEVDF admitted them as a running
+    /// entity, and consulting the scheduler for either one could adopt a
+    /// stale/fallback selection as `scheduler.running`.
+    #[inline]
+    fn should_account_runtime(is_idle: bool, is_migration_helper: bool) -> bool {
+        !is_idle && !is_migration_helper
+    }
+
+    /// Captures exactly one elapsed-runtime token for the current run-queue
+    /// owner. The scheduler never reads a platform clock; this task-layer
+    /// boundary owns the monotonic source and treats a backwards sample as a
+    /// zero delta without lowering the timestamp high-water mark.
+    fn runtime_delta(&self, current: &CurrentTask) -> RuntimeDelta {
+        self.runtime_delta_flags(current.is_idle(), current.is_migration_helper())
+    }
+
+    #[cfg(not(feature = "smp"))]
+    fn runtime_delta_task(&self, current: &AxTaskRef) -> RuntimeDelta {
+        self.runtime_delta_flags(current.is_idle(), current.is_migration_helper())
+    }
+
+    fn runtime_delta_flags(&self, is_idle: bool, is_migration_helper: bool) -> RuntimeDelta {
+        self.runtime_delta_at(monotonic_time_nanos(), is_idle, is_migration_helper)
+    }
+
+    /// Capture an elapsed-runtime token at an explicit timestamp. Keeping the
+    /// timestamp as an argument makes ownership-boundary tests deterministic;
+    /// production callers use [`Self::runtime_delta_flags`] above. The stored
+    /// timestamp is a high-water mark: stale samples never move it backwards.
+    fn runtime_delta_at(&self, now: u64, is_idle: bool, is_migration_helper: bool) -> RuntimeDelta {
+        if is_idle || is_migration_helper {
+            return RuntimeDelta::new(0, Self::scheduler_period_ns());
+        }
+        let mut previous = self.running_accounted_ns.load(Ordering::Acquire);
+        let elapsed = loop {
+            if now == previous {
+                break 0;
+            }
+            if now < previous {
+                // Keep the timestamp as a monotonic high-water mark.  A
+                // stale sample must not move it backwards, or a later valid
+                // sample would charge the same interval twice (100 -> 90 ->
+                // 110 must account 10, not 20).
+                break 0;
+            }
+            match self.running_accounted_ns.compare_exchange(
+                previous,
+                now,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break now - previous,
+                Err(observed) => previous = observed,
+            }
+        };
+        RuntimeDelta::new(elapsed, Self::scheduler_period_ns())
+    }
+
+    /// Start a fresh runtime-accounting interval for the task that is about to
+    /// own this CPU. Scheduler selection and context-switch work between the
+    /// old task's final accounting boundary and this publication belongs to
+    /// neither task, so it must not remain in the per-CPU timestamp.
+    fn reset_runtime_accounting(&self) {
+        self.reset_runtime_accounting_at(monotonic_time_nanos());
+    }
+
+    fn reset_runtime_accounting_at(&self, now: u64) {
+        // Keep the timestamp a monotonic high-water mark even when a stale
+        // reset races a newer owner sample.  A plain store here could move
+        // the boundary backwards and make the next runtime sample charge the
+        // same interval twice.
+        let mut previous = self.running_accounted_ns.load(Ordering::Acquire);
+        while now > previous {
+            match self.running_accounted_ns.compare_exchange_weak(
+                previous,
+                now,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => previous = observed,
+            }
+        }
+    }
+
     fn enqueue_task(&self, task: AxTaskRef, reason: EnqueueReason) -> Result<(), TaskEnqueueError> {
         // Retain caller ownership across the scheduler call. Scheduler traits
         // consume their item even on rejection, so this clone is performed
@@ -1766,6 +2404,12 @@ impl AxRunQueue {
         if !matches!(task.state(), TaskState::Ready) {
             return false;
         }
+        // Fast reject the common yield-window case before any remote target
+        // lookup. The source-lock check below remains authoritative for the
+        // actual detach transaction.
+        if task.has_cpu_owner_or_handoff() {
+            return false;
+        }
 
         let target_index = select_run_queue_index(task.cpumask());
         if target_index == self.cpu_id {
@@ -1778,6 +2422,14 @@ impl AxRunQueue {
 
         let task = {
             let mut scheduler = self.scheduler.lock();
+            // Yield/preempt makes the task Ready before the old stack has
+            // actually switched away.  Detaching here would let a remote
+            // destination restore the same TaskContext while that old stack
+            // is still live.  Recheck under the source lock so selection and
+            // this ownership predicate form one transaction.
+            if task.has_cpu_owner_or_handoff() {
+                return false;
+            }
             let task = match scheduler.remove_task_for_migration(task) {
                 Ok(Some(task)) => task,
                 Ok(None) | Err(_) => return false,
@@ -1790,8 +2442,16 @@ impl AxRunQueue {
             task
         };
 
+        let reschedule_task = task.clone();
         match target.enqueue_task(task, EnqueueReason::Migrate) {
-            Ok(()) => true,
+            Ok(()) => {
+                // A migration publishes runnable work on a different owner
+                // queue.  Preserve the same post-publication wake ordering as
+                // an ordinary remote wake so an idle destination does not
+                // wait for its next periodic tick.
+                request_reschedule_cpu(target.cpu_id, &reschedule_task);
+                true
+            }
             Err(error) => {
                 // EEVDF keeps the parked migration token live on a destination
                 // rejection. This is a recoverable routing failure, so do not
@@ -1814,27 +2474,224 @@ impl AxRunQueue {
         }
     }
 
+    /// Perform one pull-only idle steal attempt.
+    ///
+    /// The caller owns this CPU's IRQ/preemption exclusion. The destination
+    /// scheduler is acquired first with `try_lock`; the selected victim is
+    /// then acquired with a second `try_lock`. There is no polling loop and at
+    /// most one ready task is detached and committed per invocation.
+    #[cfg(feature = "idle-steal")]
+    fn idle_steal_once(&self) -> IdleStealOutcome {
+        let diagnostics = unsafe { IDLE_STEAL_DIAGNOSTICS.current_ref_raw() };
+        // The continuation array is per destination CPU.  It is accessed only
+        // while this CPU owns its IRQ/preemption exclusion, so no additional
+        // lock or contended atomic is needed on the hot pull path.
+        let cursors = unsafe { IDLE_STEAL_CURSORS.current_ref_mut_raw() };
+        let victim_cursor = unsafe { &mut (*IDLE_STEAL_VICTIM_CURSOR.current_ref_mut_raw()).0 };
+        diagnostics.attempts.fetch_add(1, Ordering::Relaxed);
+
+        let cpu_count = axhal::cpu_num().min(axconfig::plat::MAX_CPU_NUM);
+        let start = next_idle_steal_start(victim_cursor, cpu_count);
+        let (victims, victim_count, scans) =
+            choose_idle_steal_victim(cpu_count, start, self.cpu_id, |index| {
+                get_run_queue(index).map(|queue| queue.load.snapshot())
+            });
+        diagnostics
+            .victim_scans
+            .fetch_add(scans as u64, Ordering::Relaxed);
+        if victim_count == 0 {
+            diagnostics.no_victim.fetch_add(1, Ordering::Relaxed);
+            return IdleStealOutcome::NoWork;
+        }
+
+        let Some(mut destination_scheduler) = self.scheduler.try_lock() else {
+            diagnostics
+                .destination_lock_busy
+                .fetch_add(1, Ordering::Relaxed);
+            return IdleStealOutcome::NoWork;
+        };
+        // A remote wake may have won between the lock-free victim hint and
+        // this destination lock. Re-check exact scheduler state while the
+        // destination lock is held; do not pull work into a queue that is no
+        // longer idle.
+        if idle_steal_local_work_won(&destination_scheduler) {
+            diagnostics.local_work_won.fetch_add(1, Ordering::Relaxed);
+            return IdleStealOutcome::LocalWorkWon;
+        }
+
+        for victim_index in victims.into_iter().take(victim_count) {
+            let Some(victim) = get_run_queue(victim_index) else {
+                continue;
+            };
+            let Some(mut victim_scheduler) = victim.scheduler.try_lock() else {
+                diagnostics.victim_lock_busy.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+
+            // Check once more after taking the victim lock: a local wake may
+            // have committed while the destination lock was being acquired.
+            if idle_steal_local_work_won(&destination_scheduler) {
+                diagnostics.local_work_won.fetch_add(1, Ordering::Relaxed);
+                return IdleStealOutcome::LocalWorkWon;
+            }
+
+            let victim_load = victim.load.snapshot();
+            let severe_imbalance = victim_load.running_non_idle
+                && victim_load.ready_tasks >= IDLE_STEAL_SEVERE_READY_TASKS;
+            let now = monotonic_time_nanos();
+            let mut candidate_visited = 0usize;
+            let mut candidate_rejects = 0usize;
+            let candidate = victim_scheduler.bounded_ready_candidate_from(
+                &mut cursors[victim.cpu_id],
+                IDLE_STEAL_CANDIDATE_SCAN_LIMIT,
+                |task| {
+                    candidate_visited += 1;
+                    let inner = task.inner();
+                    let class = task.sched_params().class;
+                    let accepted = idle_steal_candidate_allowed(
+                        inner,
+                        self.cpu_id,
+                        victim.cpu_id,
+                        now,
+                        severe_imbalance,
+                        class,
+                    );
+                    if !accepted {
+                        candidate_rejects += 1;
+                        return false;
+                    }
+                    // Claim inside the bounded predicate so a busy first
+                    // candidate is rejected and successor traversal continues
+                    // to the next eligible task without restarting at root.
+                    if !inner.try_begin_idle_steal_mutation() {
+                        diagnostics.mutation_busy.fetch_add(1, Ordering::Relaxed);
+                        candidate_rejects += 1;
+                        return false;
+                    }
+                    true
+                },
+            );
+            diagnostics
+                .candidate_scans
+                .fetch_add(candidate_visited as u64, Ordering::Relaxed);
+            diagnostics
+                .candidate_rejects
+                .fetch_add(candidate_rejects as u64, Ordering::Relaxed);
+            let Some(candidate) = candidate else {
+                diagnostics.candidate_none.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            let task = Arc::clone(candidate.task());
+            // The predicate already claimed the task mutation. The guard now
+            // owns release even if migration validation or rollback returns.
+            let _mutation = IdleStealMutation::claimed(&task);
+            // Affinity may have changed before the claim; the claim excludes
+            // a concurrent affinity owner, so this second check is stable.
+            if !task.cpumask().get(self.cpu_id) || task.cpu_id() as usize != victim.cpu_id {
+                diagnostics.affinity_rejects.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+
+            let migration = match victim_scheduler.begin_ready_migration(&task) {
+                Ok(migration) => migration,
+                Err(_) => {
+                    diagnostics
+                        .candidate_rejects
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            };
+            victim.load.ready_dequeued();
+            task.set_cpu_id(self.cpu_id as _);
+
+            match destination_scheduler.commit_migration(migration) {
+                Ok(_) => {
+                    self.load.ready_enqueued();
+                    diagnostics.successes.fetch_add(1, Ordering::Relaxed);
+                    return IdleStealOutcome::Stole;
+                }
+                Err(error) => {
+                    diagnostics.commit_failures.fetch_add(1, Ordering::Relaxed);
+                    // Keep the source lock held while restoring both the
+                    // routing publication and exact migration snapshot.
+                    task.set_cpu_id(victim.cpu_id as _);
+                    match victim_scheduler.rollback_migration(error.into_migration()) {
+                        Ok(_) => {
+                            victim.load.ready_enqueued();
+                            diagnostics.rollbacks.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(_) => {
+                            diagnostics
+                                .rollback_failures
+                                .fetch_add(1, Ordering::Relaxed);
+                            task.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+                            axhal::power::system_off();
+                        }
+                    }
+                    // One edge migrates at most one task; after a failed
+                    // destination commit, rollback is complete and the edge
+                    // ends without attempting another task.
+                    return IdleStealOutcome::NoWork;
+                }
+            }
+        }
+        IdleStealOutcome::NoWork
+    }
+
     #[cfg(feature = "sched-eevdf")]
     fn set_task_sched_state(
         &self,
         task: &AxTaskRef,
         sched_state: axsched::EevdfTaskParams,
     ) -> TaskSchedUpdate {
-        if matches!(task.state(), TaskState::Exited) {
+        if task.is_terminalizing() || matches!(task.state(), TaskState::Exited) {
             return TaskSchedUpdate::Complete(Err(TaskSchedError::TaskExited));
         }
         let mut scheduler = self.scheduler.lock();
+        // Revalidate after acquiring the same scheduler lock used by
+        // exit_current. A pre-lock Running observation is not sufficient:
+        // exit_current may already have detached the entity and released its
+        // owner while notify_exit is still pending on the old stack.
+        if task.is_terminalizing() || matches!(task.state(), TaskState::Exited) {
+            return TaskSchedUpdate::Complete(Err(TaskSchedError::TaskExited));
+        }
         #[cfg(feature = "smp")]
         if task.cpu_id() as usize != self.cpu_id {
             return TaskSchedUpdate::Redirect;
         }
+
+        // Serialize runtime accounting with the parameter transaction.  This
+        // matters for a remote setter: the caller cannot use its own
+        // `CurrentTask` handle to identify the destination's running task,
+        // while changing its old class/weight before charging the pending
+        // interval would account that interval under the wrong model.
+        // `pick_next_task` removes a selected task from the ready tree and
+        // publishes it in the scheduler's `running` slot before the task
+        // layer performs the actual state/context switch.  A remote update
+        // arriving in that window must not charge the selected Ready task as
+        // if it had executed; `switch_to` owns the fresh accounting boundary.
+        let executing = scheduler.is_running_task(task)
+            && task.is_running()
+            && AxRunQueue::should_account_runtime(task.is_idle(), task.is_migration_helper());
+        if executing {
+            let runtime = self.runtime_delta_flags(task.is_idle(), task.is_migration_helper());
+            if !runtime.is_zero() {
+                let needs_resched = scheduler.account_runtime(task, runtime);
+                #[cfg(feature = "preempt")]
+                if needs_resched {
+                    request_reschedule_cpu(self.cpu_id, task);
+                }
+            }
+        }
         let result = scheduler
-            .set_task_params(task, sched_state)
+            .set_task_params_with_runtime(task, sched_state, Self::scheduler_period_ns())
             .map_err(TaskSchedError::from)
             .map(|outcome| {
-                #[cfg(feature = "preempt")]
                 if let Some(current) = outcome.into_preempt_current() {
-                    current.set_preempt_pending(true);
+                    // The outcome can refer to a task currently executing on
+                    // another CPU.  Publish the task-local bit and kick that
+                    // CPU so the remote scheduler observes it promptly.
+                    request_reschedule_cpu(self.cpu_id, &current);
                 }
             });
         TaskSchedUpdate::Complete(result)
@@ -1885,6 +2742,7 @@ impl AxRunQueue {
         Ok(Self {
             cpu_id,
             scheduler: SpinRaw::new(scheduler),
+            running_accounted_ns: AtomicU64::new(monotonic_time_nanos()),
             // The per-CPU GC task is linked before publication.
             load: RunQueueLoad::new(1, running_non_idle),
         })
@@ -2013,11 +2871,38 @@ impl AxRunQueue {
             prev_task.id().as_u64(),
             next_task.id().as_u64()
         );
+        #[cfg(feature = "smp")]
+        let previous_owner = prev_task.cpu_owner_token().unwrap_or_else(|| {
+            prev_task.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+            error!(
+                "running task {} had no CPU owner at switch-out",
+                prev_task.id().as_u64()
+            );
+            axhal::power::system_off()
+        });
         self.load.set_running(!next_task.is_idle());
-        next_task.set_state(TaskState::Running);
+        // The old task was accounted before entering resched(). Publish a
+        // fresh timestamp before exposing the new task as Running.  A remote
+        // parameter update can observe scheduler.running during this narrow
+        // handoff; leaving the task Ready until the reset completes prevents
+        // that selection window from charging switch overhead to it.  This
+        // also intentionally runs when prev == next.
+        self.reset_runtime_accounting();
         if prev_task.ptr_eq(&next_task) {
+            // A task yielded while it was the only runnable entity remains
+            // owned by the same CPU token. Do not mark it a second time.
+            next_task.set_state(TaskState::Running);
             return;
         }
+
+        // Claim the destination owner before exposing Running.  This CAS is
+        // the only place a task can become owned by a CPU; a duplicate mark is
+        // a fail-stop invariant violation rather than an overwrite.
+        #[cfg(feature = "smp")]
+        let _next_owner = next_task.mark_running_on_cpu();
+        next_task.set_state(TaskState::Running);
+        #[cfg(feature = "idle-steal")]
+        next_task.record_last_run(self.cpu_id as _, monotonic_time_nanos());
 
         #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
         {
@@ -2043,11 +2928,6 @@ impl AxRunQueue {
             );
         }
 
-        // Claim the task as running, we do this before switching to it
-        // such that any running task will have this set.
-        #[cfg(feature = "smp")]
-        next_task.mark_running_on_cpu();
-
         #[cfg(feature = "task-ext")]
         {
             use crate::TaskExt;
@@ -2068,6 +2948,9 @@ impl AxRunQueue {
             #[cfg(feature = "smp")]
             {
                 *PREV_TASK.current_ref_mut_raw() = Arc::downgrade(&prev_task);
+                PREV_TASK_OWNER
+                    .current_ref_raw()
+                    .store(previous_owner, Ordering::Release);
             }
 
             // `prev_task` is an owned public handle in addition to the per-CPU
@@ -2211,6 +3094,22 @@ fn reclaim_exited_tasks_pinned_gc_batch() -> (bool, bool) {
             );
         }
         let task = dequeued.task;
+        if !task.can_reclaim_stack() {
+            // The exited queue can become visible before the old context
+            // switch frame has completed. Keep the queue ownership unit and
+            // defer both Arc::try_unwrap and stack extraction until the exact
+            // CPU generation is released.
+            retained = true;
+            if let Err(error) = requeue_retained_exited_task(task) {
+                error!(
+                    "cannot requeue exited task {} with a live CPU owner: {:?}",
+                    error.task.id().as_u64(),
+                    error.fault
+                );
+                axhal::power::system_off();
+            }
+            continue;
+        }
         match Arc::try_unwrap(task) {
             Ok(task) => {
                 let mut task = task.into_inner();
@@ -2260,6 +3159,17 @@ pub(crate) fn gc_reclaim_rounds_for_test() -> u64 {
 /// then puts the task to the scheduler of target run queue.
 #[cfg(feature = "smp")]
 pub(crate) fn migrate_entry(migrated_task: AxTaskRef) {
+    // The helper is entered only after the old CPU's exact switch epilogue has
+    // released this task. Restoring its context while a token remains live
+    // would recreate the remote-stack aliasing bug.
+    if migrated_task.has_cpu_owner_or_handoff() {
+        migrated_task.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+        error!(
+            "migration helper observed task {} with a live CPU owner",
+            migrated_task.id().as_u64()
+        );
+        axhal::power::system_off();
+    }
     let source_cpu = migrated_task.cpu_id() as usize;
     let target = select_run_queue::<kernel_guard::NoPreemptIrqSave>(&migrated_task);
     let Some(run_queue) = target.inner else {
@@ -2295,6 +3205,7 @@ pub(crate) fn migrate_entry(migrated_task: AxTaskRef) {
         // scheduling-parameter updates can revalidate and follow the redirect.
         migrated_task.set_cpu_id(run_queue.cpu_id as _);
     }
+    let reschedule_task = migrated_task.clone();
     if let Err(error) = run_queue.enqueue_task(migrated_task, EnqueueReason::Migrate) {
         // A destination rejection leaves EEVDF's parked migration token
         // recoverable. Restore the source CPU publication under the target
@@ -2310,19 +3221,32 @@ pub(crate) fn migrate_entry(migrated_task: AxTaskRef) {
             contain_enqueue_failure(&restore_error, TaskState::Ready);
             axhal::power::system_off();
         }
+    } else {
+        // The destination queue is remote to the migration helper.  Runnable
+        // publication alone is not enough to make that CPU leave an idle or
+        // lower-priority current task; kick it after the destination lock has
+        // committed the task.
+        request_reschedule_cpu(run_queue.cpu_id, &reschedule_task);
     }
 }
 
 /// Clear the `on_cpu` field of previous task running on this CPU.
 #[cfg(feature = "smp")]
 pub(crate) unsafe fn clear_prev_task_on_cpu() {
+    let expected = unsafe { PREV_TASK_OWNER.current_ref_raw() }.load(Ordering::Acquire);
     let Some(previous) = (unsafe { PREV_TASK.current_ref_raw() }).upgrade() else {
+        if expected != 0 {
+            error!("previous task owner token has no matching task reference");
+            axhal::power::system_off();
+        }
         return;
     };
-    match previous.finish_cpu_handoff() {
+    match previous.finish_cpu_handoff_exact(expected) {
         CpuHandoffCompletion::Cleared | CpuHandoffCompletion::AlreadyCleared => {}
         CpuHandoffCompletion::Wake(task) => {
             let target_cpu = task.cpu_id() as usize;
+            #[cfg(any(feature = "preempt", feature = "remote-resched"))]
+            let task_owner = task.clone();
             let result = match get_run_queue(target_cpu) {
                 Some(run_queue) => run_queue.enqueue_task(task, EnqueueReason::Wakeup),
                 None => Err(TaskEnqueueError {
@@ -2343,6 +3267,8 @@ pub(crate) unsafe fn clear_prev_task_on_cpu() {
                 // fail-stop until a preallocated retry owner exists.
                 axhal::power::system_off();
             }
+            #[cfg(any(feature = "preempt", feature = "remote-resched"))]
+            request_deferred_wake_reschedule(target_cpu, &task_owner);
         }
         CpuHandoffCompletion::MissingWake => {
             previous.record_wake_fault(TaskWakeFault::HandoffCorrupt);
@@ -2352,7 +3278,19 @@ pub(crate) unsafe fn clear_prev_task_on_cpu() {
             );
             axhal::power::system_off();
         }
+        CpuHandoffCompletion::Stale => {
+            // Never clear the currently published owner: this old stack has
+            // lost its generation race. Preserve the newer owner and stop the
+            // scheduler rather than attempting an unsafe best-effort clear.
+            previous.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+            error!(
+                "stale CPU owner clear for task {} left newer owner intact",
+                previous.id().as_u64()
+            );
+            axhal::power::system_off();
+        }
     }
+    unsafe { PREV_TASK_OWNER.current_ref_raw() }.store(0, Ordering::Release);
 }
 pub(crate) fn init() -> Result<(), TaskRuntimeInitError> {
     let cpu_id = this_cpu_id();
@@ -2485,6 +3423,365 @@ mod exited_queue_tests {
         assert_eq!(load.snapshot().runnable_tasks(), 2);
     }
 
+    #[cfg(feature = "sched-eevdf")]
+    #[test]
+    fn fork_seed_materializes_parent_subperiod_before_snapshot() {
+        let parent = task("fork-runtime-parent");
+        let mut scheduler = Scheduler::new();
+        scheduler.add_task(parent.clone()).unwrap();
+        let current = scheduler
+            .pick_next_task()
+            .expect("admitted parent must be picked");
+        assert!(Arc::ptr_eq(&current, &parent));
+        parent.set_state(TaskState::Running);
+
+        let before = scheduler.clock();
+        assert!(!scheduler.account_runtime(&parent, RuntimeDelta::new(5, 10)));
+        assert_eq!(scheduler.clock(), before);
+
+        materialize_fork_parent_runtime(&mut scheduler, &parent, RuntimeDelta::new(0, 10)).unwrap();
+        assert_ne!(
+            scheduler.clock(),
+            before,
+            "fork snapshot must not observe the parent's stale pre-service lag"
+        );
+
+        let seed = scheduler.fork_seed(&parent).unwrap();
+        let child = task("fork-runtime-child");
+        child.install_fork_seed(seed).unwrap();
+    }
+
+    #[cfg(feature = "sched-eevdf")]
+    #[test]
+    fn idle_steal_limits_are_reported_separately_from_eevdf_profile() {
+        let config = idle_steal_config();
+        assert_eq!(config, IDLE_STEAL_CONFIG);
+        assert_eq!(config.enabled, cfg!(feature = "idle-steal"));
+        assert_eq!(config.victim_scan_limit, 4);
+        assert_eq!(config.candidate_scan_limit, 8);
+        assert_eq!(config.hot_residency_ns, 500_000);
+        assert_eq!(config.severe_imbalance_ready_tasks, 2);
+    }
+
+    #[cfg(not(feature = "idle-steal"))]
+    #[test]
+    fn idle_steal_feature_off_keeps_eevdf_without_pull_path() {
+        assert!(!idle_steal_config().enabled);
+    }
+
+    #[cfg(feature = "idle-steal")]
+    #[test]
+    fn idle_steal_victim_cursor_rotates_locally_and_wraps() {
+        let mut cursor = 0;
+        assert_eq!(next_idle_steal_start(&mut cursor, 4), 0);
+        assert_eq!(next_idle_steal_start(&mut cursor, 4), 1);
+        assert_eq!(next_idle_steal_start(&mut cursor, 4), 2);
+        assert_eq!(next_idle_steal_start(&mut cursor, 4), 3);
+        assert_eq!(next_idle_steal_start(&mut cursor, 4), 0);
+        assert_eq!(cursor, 1);
+    }
+
+    #[cfg(feature = "idle-steal")]
+    #[test]
+    fn idle_steal_victim_scan_is_rotated_sorted_and_bounded() {
+        let loads = [
+            Some(SchedulerLoadSnapshot {
+                ready_tasks: 1,
+                running_non_idle: false,
+            }),
+            Some(SchedulerLoadSnapshot {
+                ready_tasks: 5,
+                running_non_idle: false,
+            }),
+            Some(SchedulerLoadSnapshot {
+                ready_tasks: 3,
+                running_non_idle: false,
+            }),
+            Some(SchedulerLoadSnapshot {
+                ready_tasks: 7,
+                running_non_idle: false,
+            }),
+            Some(SchedulerLoadSnapshot {
+                ready_tasks: 0,
+                running_non_idle: false,
+            }),
+            Some(SchedulerLoadSnapshot {
+                ready_tasks: 2,
+                running_non_idle: false,
+            }),
+        ];
+        let probes = Cell::new(0);
+        let (victims, count, scans) = choose_idle_steal_victim(6, 5, 0, |cpu| {
+            probes.set(probes.get() + 1);
+            loads[cpu]
+        });
+
+        // The rotating window starts at 5 and crosses the destination.  CPU 0
+        // is skipped without consuming the four-victim bound; the remote
+        // window is [5, 1, 2, 3], ordered by load as [3, 1, 2, 5].
+        assert_eq!(scans, IDLE_STEAL_VICTIM_SCAN_LIMIT);
+        assert_eq!(probes.get(), 4, "the destination is not sampled");
+        assert_eq!(count, 4);
+        assert_eq!(&victims[..count], &[3, 1, 2, 5]);
+    }
+
+    #[cfg(feature = "idle-steal")]
+    #[test]
+    fn idle_steal_continues_after_a_busy_first_victim() {
+        let victims = [3, 1, 2, usize::MAX];
+        let mut attempts = 0;
+        let selected = victims.iter().take(3).copied().find(|_| {
+            attempts += 1;
+            attempts == 2
+        });
+
+        assert_eq!(selected, Some(1));
+        assert_eq!(attempts, 2, "a busy first lock cannot end the bounded scan");
+    }
+
+    #[cfg(feature = "idle-steal")]
+    #[test]
+    fn idle_steal_candidate_query_continues_after_a_busy_first_mutation() {
+        let first = task("idle-steal-candidate-first");
+        let second = task("idle-steal-candidate-second");
+        let mut scheduler = Scheduler::new();
+        scheduler.add_task(first.clone()).unwrap();
+        scheduler.add_task(second.clone()).unwrap();
+
+        // Identify the first structural candidate without mutating the tree,
+        // then hold its task mutation as another owner would.
+        let first_candidate = scheduler
+            .bounded_ready_candidate(1, |_| true)
+            .expect("first ready candidate");
+        let busy_task = Arc::clone(first_candidate.task());
+        drop(first_candidate);
+        let busy_owner = IdleStealMutation::try_begin(&busy_task).expect("busy owner");
+
+        let mut visited = 0;
+        let candidate = scheduler.bounded_ready_candidate(8, |candidate| {
+            visited += 1;
+            candidate.inner().try_begin_idle_steal_mutation()
+        });
+        let candidate = candidate.expect("successor remains eligible");
+        assert_eq!(visited, 2, "the busy first candidate is within the bound");
+        assert!(!Arc::ptr_eq(candidate.task(), &busy_task));
+        let selected = Arc::clone(candidate.task());
+        drop(candidate);
+        let selected_owner = IdleStealMutation::claimed(&selected);
+        assert_eq!(scheduler.ready_len(), 2, "the query does not detach work");
+        drop(selected_owner);
+        drop(busy_owner);
+    }
+
+    #[cfg(feature = "idle-steal")]
+    #[test]
+    fn idle_steal_rechecks_exact_destination_work_under_lock() {
+        let mut scheduler = Scheduler::new();
+        assert!(!idle_steal_local_work_won(&scheduler));
+
+        scheduler.add_task(task("local-wakeup-race")).unwrap();
+        assert!(idle_steal_local_work_won(&scheduler));
+    }
+
+    #[cfg(feature = "idle-steal")]
+    #[test]
+    fn idle_steal_hot_policy_treats_clock_backwards_as_hot() {
+        assert!(idle_steal_recently_hot(2, 900, 2, 100));
+        assert!(idle_steal_recently_hot(2, 900, 2, 900));
+        assert!(!idle_steal_recently_hot(2, 900, 2, 900 + IDLE_STEAL_HOT_NS));
+        assert!(!idle_steal_recently_hot(1, 900, 2, 100));
+    }
+
+    #[cfg(feature = "idle-steal")]
+    #[test]
+    fn idle_steal_allows_fair_idle_class_but_not_rt_classes() {
+        let task = TaskInner::new_init("idle-steal-class-filter".into()).unwrap();
+        task.set_cpu_id(1);
+        let owner = task.cpu_owner_token().expect("init owner token");
+        assert!(matches!(
+            task.finish_cpu_handoff_exact(owner),
+            CpuHandoffCompletion::Cleared
+        ));
+
+        assert!(idle_steal_candidate_allowed(
+            &task,
+            0,
+            1,
+            1_000_000,
+            false,
+            axsched::EevdfTaskClass::Idle,
+        ));
+        assert!(!idle_steal_candidate_allowed(
+            &task,
+            0,
+            1,
+            1_000_000,
+            false,
+            axsched::EevdfTaskClass::RoundRobin,
+        ));
+        assert!(!idle_steal_candidate_allowed(
+            &task,
+            0,
+            1,
+            1_000_000,
+            false,
+            axsched::EevdfTaskClass::Fifo,
+        ));
+    }
+
+    #[cfg(feature = "idle-steal")]
+    #[test]
+    fn idle_steal_rejects_ready_task_until_switch_owner_is_released() {
+        let task = TaskInner::new_init("idle-steal-yield-window".into()).unwrap();
+        task.set_cpu_id(1);
+        task.set_state(TaskState::Ready);
+
+        assert!(task.has_cpu_owner_or_handoff());
+        assert!(!idle_steal_candidate_allowed(
+            &task,
+            0,
+            1,
+            1_000_000,
+            true,
+            axsched::EevdfTaskClass::Normal,
+        ));
+
+        let owner = task.cpu_owner_token().expect("yield-window owner");
+        assert!(matches!(
+            task.finish_cpu_handoff_exact(owner),
+            CpuHandoffCompletion::Cleared
+        ));
+        assert!(idle_steal_candidate_allowed(
+            &task,
+            0,
+            1,
+            1_000_000,
+            true,
+            axsched::EevdfTaskClass::Normal,
+        ));
+    }
+
+    #[cfg(feature = "smp")]
+    #[test]
+    fn remote_ready_migration_refuses_the_yield_window_before_detach() {
+        let task = TaskInner::new_init("remote-migrate-yield-window".into())
+            .unwrap()
+            .into_arc()
+            .unwrap();
+        task.set_state(TaskState::Ready);
+        let mut scheduler = Scheduler::new();
+        scheduler.add_task(task.clone()).unwrap();
+        let source = AxRunQueue {
+            cpu_id: 0,
+            scheduler: SpinRaw::new(scheduler),
+            running_accounted_ns: AtomicU64::new(0),
+            load: RunQueueLoad::new(1, false),
+        };
+
+        assert!(task.has_cpu_owner_or_handoff());
+        assert!(!source.migrate_ready_task(&task));
+        assert_eq!(source.scheduler.lock().ready_len(), 1);
+
+        let owner = task.cpu_owner_token().expect("yield-window owner");
+        assert!(matches!(
+            task.finish_cpu_handoff_exact(owner),
+            CpuHandoffCompletion::Cleared
+        ));
+    }
+
+    #[cfg(feature = "idle-steal")]
+    #[test]
+    fn idle_steal_rollback_restores_ready_load_once() {
+        let source = RunQueueLoad::new(1, false);
+        let destination = RunQueueLoad::new(0, false);
+
+        source.ready_dequeued();
+        assert_eq!(source.snapshot().ready_tasks, 0);
+        // This is the exact rollback accounting: one source decrement before
+        // commit, followed by one source increment after a rejected commit.
+        source.ready_enqueued();
+        assert_eq!(source.snapshot().ready_tasks, 1);
+        assert_eq!(destination.snapshot().ready_tasks, 0);
+    }
+
+    #[test]
+    fn owner_timestamp_reset_excludes_switch_overhead_from_next_task() {
+        let run_queue = AxRunQueue {
+            cpu_id: 0,
+            scheduler: SpinRaw::new(Scheduler::new()),
+            running_accounted_ns: AtomicU64::new(100),
+            load: RunQueueLoad::new(0, false),
+        };
+
+        // The old owner receives only the interval up to its final boundary.
+        assert_eq!(
+            run_queue.runtime_delta_at(150, false, false).elapsed_ns(),
+            50
+        );
+
+        // Model selection/context-switch work from t=150 to t=250. The
+        // publication reset makes that interval belong to neither task.
+        run_queue.reset_runtime_accounting_at(250);
+        assert_eq!(
+            run_queue.runtime_delta_at(300, false, false).elapsed_ns(),
+            50
+        );
+    }
+
+    #[test]
+    fn backward_runtime_sample_preserves_timestamp_high_water_mark() {
+        let run_queue = AxRunQueue {
+            cpu_id: 0,
+            scheduler: SpinRaw::new(Scheduler::new()),
+            running_accounted_ns: AtomicU64::new(100),
+            load: RunQueueLoad::new(0, false),
+        };
+
+        assert_eq!(run_queue.runtime_delta_at(90, false, false).elapsed_ns(), 0);
+        assert_eq!(
+            run_queue.runtime_delta_at(110, false, false).elapsed_ns(),
+            10
+        );
+    }
+
+    #[test]
+    fn sentinel_runtime_samples_do_not_move_the_owner_boundary() {
+        let run_queue = AxRunQueue {
+            cpu_id: 0,
+            scheduler: SpinRaw::new(Scheduler::new()),
+            running_accounted_ns: AtomicU64::new(100),
+            load: RunQueueLoad::new(0, false),
+        };
+
+        assert!(run_queue.runtime_delta_at(200, true, false).is_zero());
+        assert!(run_queue.runtime_delta_at(200, false, true).is_zero());
+        assert_eq!(
+            run_queue.runtime_delta_at(150, false, false).elapsed_ns(),
+            50,
+            "idle/helper probes cannot adopt or advance the executing task's boundary"
+        );
+    }
+
+    #[test]
+    fn stale_runtime_reset_cannot_undo_newer_owner_sample() {
+        let run_queue = AxRunQueue {
+            cpu_id: 0,
+            scheduler: SpinRaw::new(Scheduler::new()),
+            running_accounted_ns: AtomicU64::new(100),
+            load: RunQueueLoad::new(0, false),
+        };
+
+        // A newer owner boundary may win the CAS before a delayed reset from
+        // the old owner arrives.  The delayed reset must not move the high
+        // water mark backwards.
+        run_queue.reset_runtime_accounting_at(200);
+        run_queue.reset_runtime_accounting_at(150);
+        assert_eq!(
+            run_queue.runtime_delta_at(210, false, false).elapsed_ns(),
+            10
+        );
+    }
+
     #[test]
     fn wake_enqueue_clears_the_exact_claim_before_target_unlock() {
         let (task, scheduler) = sleeping_task("claimed-wake-enqueue");
@@ -2495,6 +3792,7 @@ mod exited_queue_tests {
         let run_queue = AxRunQueue {
             cpu_id: 0,
             scheduler: SpinRaw::new(scheduler),
+            running_accounted_ns: AtomicU64::new(0),
             load: RunQueueLoad::new(0, false),
         };
 
@@ -2527,7 +3825,8 @@ mod exited_queue_tests {
             CpuHandoffCompletion::Wake(owned) => owned,
             CpuHandoffCompletion::Cleared
             | CpuHandoffCompletion::AlreadyCleared
-            | CpuHandoffCompletion::MissingWake => {
+            | CpuHandoffCompletion::MissingWake
+            | CpuHandoffCompletion::Stale => {
                 panic!("old CPU lost the claimed deferred wake")
             }
         };
@@ -2536,6 +3835,7 @@ mod exited_queue_tests {
         let run_queue = AxRunQueue {
             cpu_id: 0,
             scheduler: SpinRaw::new(scheduler),
+            running_accounted_ns: AtomicU64::new(0),
             load: RunQueueLoad::new(0, false),
         };
         run_queue
@@ -2548,6 +3848,64 @@ mod exited_queue_tests {
         );
     }
 
+    #[cfg(all(
+        feature = "smp",
+        feature = "remote-resched",
+        feature = "sched-fifo",
+        not(feature = "preempt")
+    ))]
+    #[test]
+    fn cooperative_remote_deferred_wake_kicks_an_idle_target() {
+        if axconfig::plat::MAX_CPU_NUM < 2 {
+            return;
+        }
+        let target_cpu = if this_cpu_id() == 0 { 1 } else { 0 };
+        assert_ne!(target_cpu, this_cpu_id());
+        let (task, scheduler) = sleeping_task("cooperative-remote-deferred-wake");
+        task.set_cpu_id(target_cpu as _);
+
+        assert_eq!(
+            task.claim_wake_mutation(),
+            crate::task::WakeMutationClaim::Claimed
+        );
+        assert!(matches!(
+            task.publish_wake_handoff(task.clone()),
+            crate::task::WakeHandoffPublication::Deferred
+        ));
+        let owned = match task.finish_cpu_handoff() {
+            CpuHandoffCompletion::Wake(owned) => owned,
+            CpuHandoffCompletion::Cleared
+            | CpuHandoffCompletion::AlreadyCleared
+            | CpuHandoffCompletion::MissingWake
+            | CpuHandoffCompletion::Stale => {
+                panic!("old CPU lost the cooperative delegated wake")
+            }
+        };
+
+        // Model the target CPU's idle queue.  Publication must happen before
+        // the remote kick, otherwise an arriving IPI could inspect an empty
+        // queue and the idle target would still sleep until its next tick.
+        let run_queue = AxRunQueue {
+            cpu_id: target_cpu,
+            scheduler: SpinRaw::new(scheduler),
+            running_accounted_ns: AtomicU64::new(0),
+            load: RunQueueLoad::new(0, false),
+        };
+        run_queue
+            .enqueue_task(owned, EnqueueReason::Wakeup)
+            .unwrap();
+        assert_eq!(run_queue.load.snapshot().ready_tasks, 1);
+
+        DEFERRED_WAKE_RESCHEDULE_REQUESTS.store(0, Ordering::Relaxed);
+        request_deferred_wake_reschedule(target_cpu, &task);
+        assert_eq!(
+            DEFERRED_WAKE_RESCHEDULE_REQUESTS.load(Ordering::Relaxed),
+            1,
+            "remote delegated wakes must request a target kick without preemption"
+        );
+        assert_eq!(run_queue.load.snapshot().ready_tasks, 1);
+    }
+
     #[test]
     fn idle_probe_does_not_publish_a_fake_ready_state() {
         let idle = task("idle");
@@ -2556,6 +3914,7 @@ mod exited_queue_tests {
         let run_queue = AxRunQueue {
             cpu_id: 0,
             scheduler: SpinRaw::new(Scheduler::new()),
+            running_accounted_ns: AtomicU64::new(0),
             load: RunQueueLoad::new(0, false),
         };
 
@@ -2567,6 +3926,120 @@ mod exited_queue_tests {
         assert!(is_valid_idle_fallback(&idle));
         idle.set_state(TaskState::Blocked);
         assert!(!is_valid_idle_fallback(&idle));
+    }
+
+    #[cfg(feature = "sched-eevdf")]
+    #[test]
+    fn handoff_sentinels_are_not_adopted_before_subsequent_selection() {
+        let idle = task("idle");
+        assert!(idle.is_idle());
+        assert!(!AxRunQueue::should_account_runtime(
+            idle.is_idle(),
+            idle.is_migration_helper(),
+        ));
+
+        let mut helper = TaskInner::new_init("migration-helper".into()).unwrap();
+        helper.mark_migration_helper();
+        let helper = helper.into_arc().unwrap();
+        assert!(helper.is_migration_helper());
+        assert!(!AxRunQueue::should_account_runtime(
+            helper.is_idle(),
+            helper.is_migration_helper(),
+        ));
+
+        // Neither sentinel is admitted to this scheduler.  An empty ready
+        // tree therefore leaves `running` empty, and the first real task is
+        // still selected normally after the handoff window.
+        let mut scheduler = Scheduler::new();
+        assert!(scheduler.pick_next_task().is_none());
+        let next = task("post-handoff-task");
+        scheduler.add_task(next.clone()).unwrap();
+        let selected = scheduler
+            .pick_next_task()
+            .expect("the subsequent ready task must be selected");
+        assert!(Arc::ptr_eq(&selected, &next));
+        assert!(scheduler.is_running_task(&selected));
+        assert!(selected.is_ready());
+    }
+
+    #[cfg(feature = "sched-eevdf")]
+    #[test]
+    fn remote_params_do_not_charge_ready_selection_window() {
+        let selected = task("remote-selection-window");
+        let mut scheduler = Scheduler::new();
+        scheduler.add_task(selected.clone()).unwrap();
+        let selected = scheduler
+            .pick_next_task()
+            .expect("admitted task must enter the selection window");
+        assert!(selected.is_ready());
+        assert!(scheduler.is_running_task(&selected));
+
+        let run_queue = AxRunQueue {
+            cpu_id: 0,
+            scheduler: SpinRaw::new(scheduler),
+            running_accounted_ns: AtomicU64::new(123),
+            load: RunQueueLoad::new(0, false),
+        };
+        assert!(matches!(
+            run_queue.set_task_sched_state(&selected, axsched::EevdfTaskParams::default()),
+            TaskSchedUpdate::Complete(Ok(()))
+        ));
+        assert_eq!(
+            run_queue.running_accounted_ns.load(Ordering::Acquire),
+            123,
+            "a selected Ready task has not executed and must not move the runtime boundary"
+        );
+        assert!(selected.is_ready());
+
+        // Once the task crosses the actual switch boundary, it follows the
+        // ordinary running -> ready -> running lifecycle and remains
+        // selectable on the next pass.
+        selected.set_state(TaskState::Running);
+        let mut scheduler = run_queue.scheduler.lock();
+        scheduler.put_prev_task(selected.clone(), false).unwrap();
+        let next = scheduler
+            .pick_next_task()
+            .expect("the switched task must remain selectable");
+        assert!(Arc::ptr_eq(&next, &selected));
+    }
+
+    #[cfg(feature = "sched-eevdf")]
+    #[test]
+    fn terminal_transaction_blocks_ownerless_exit_window_reconfiguration() {
+        let task = task("terminal-parameter-window");
+        let mut scheduler = Scheduler::new();
+        scheduler.add_task(task.clone()).unwrap();
+        let selected = scheduler
+            .pick_next_task()
+            .expect("admitted task must be selected");
+        assert!(Arc::ptr_eq(&selected, &task));
+        task.set_state(TaskState::Running);
+
+        let run_queue = AxRunQueue {
+            cpu_id: 0,
+            scheduler: SpinRaw::new(scheduler),
+            running_accounted_ns: AtomicU64::new(0),
+            load: RunQueueLoad::new(0, false),
+        };
+
+        // Mirror the exact exit window: terminal intent is published while
+        // the task still reports Running, then scheduler teardown releases its
+        // owner before notify_exit publishes Exited.
+        task.begin_terminal_transaction();
+        {
+            let mut scheduler = run_queue.scheduler.lock();
+            scheduler.deactivate_task(&task, DeactivateReason::Exit);
+        }
+        assert_eq!(task.state(), TaskState::Running);
+        assert!(task.is_terminalizing());
+        assert!(!run_queue.scheduler.lock().is_running_task(&task));
+
+        let result = run_queue.set_task_sched_state(&task, axsched::EevdfTaskParams::default());
+        assert!(matches!(
+            result,
+            TaskSchedUpdate::Complete(Err(TaskSchedError::TaskExited))
+        ));
+        assert_eq!(task.sched_params(), axsched::EevdfTaskParams::default());
     }
 
     #[test]

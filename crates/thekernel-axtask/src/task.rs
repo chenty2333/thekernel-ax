@@ -41,6 +41,13 @@ const TASK_MUTATION_BLOCK: u8 = 2;
 const TASK_MUTATION_WAKE: u8 = 4;
 const TASK_MUTATION_AFFINITY_WAKE_PENDING: u8 = 5;
 const TASK_MUTATION_BLOCK_WAKE_PENDING: u8 = 6;
+// Idle stealing is a ready-task handoff, not a blocked-task publication.
+// Keep its owner outside the existing exact mutation values; a stale wake
+// may set bit 4 and is absorbed when this transaction releases.
+#[cfg(feature = "idle-steal")]
+const TASK_MUTATION_IDLE_STEAL: u8 = 16;
+#[cfg(feature = "idle-steal")]
+const TASK_MUTATION_IDLE_STEAL_WAKE_PENDING: u8 = 20;
 // Include TASK_MUTATION_WAKE so a wait-free wake `fetch_or` leaves an
 // impossible new-task-publication race byte-for-byte unchanged.
 #[cfg(feature = "sched-eevdf")]
@@ -77,6 +84,10 @@ pub enum TaskWakeFault {
     SchedulerInvariant = 3,
     /// A context-switch wake handoff token was missing or duplicated.
     HandoffCorrupt = 4,
+    /// The task was published runnable, but the target CPU rejected the
+    /// best-effort remote reschedule kick. The periodic scheduler tick remains
+    /// the bounded fallback; the wake itself was not lost.
+    RemoteRescheduleFailed = 5,
 }
 
 /// Durable fault in allocation-free exited-task queue ownership.
@@ -373,11 +384,18 @@ impl BlockWaitState {
 }
 
 #[cfg(feature = "smp")]
-const CPU_HANDOFF_OFF: u8 = 0;
+const CPU_OWNER_NONE: u64 = 0;
 #[cfg(feature = "smp")]
-const CPU_HANDOFF_RUNNING: u8 = 1;
+const CPU_OWNER_WAKE_PENDING: u64 = 1 << 63;
 #[cfg(feature = "smp")]
-const CPU_HANDOFF_WAKE_PENDING: u8 = 2;
+// The supported x86_64 platform has far fewer than 2^16 CPUs. Keep a fixed
+// tag width so the remaining owner-token bits provide a practical lifetime
+// budget for a task that is switched in and out repeatedly.
+const CPU_OWNER_CPU_BITS: u32 = 16;
+#[cfg(feature = "smp")]
+const CPU_OWNER_CPU_MASK: u64 = (1u64 << CPU_OWNER_CPU_BITS) - 1;
+#[cfg(feature = "smp")]
+const CPU_OWNER_GENERATION_MASK: u64 = (1u64 << (64 - 1 - CPU_OWNER_CPU_BITS)) - 1;
 
 /// Publication result when a blocked task is still owned by a remote CPU's
 /// context-switch epilogue.
@@ -403,6 +421,10 @@ pub(crate) enum CpuHandoffCompletion {
     AlreadyCleared,
     /// The wake state was published without its required owned task pointer.
     MissingWake,
+    /// The expected old owner was already replaced by a newer generation.
+    /// The newer owner is left untouched; callers must contain the stale
+    /// clear rather than retrying with the current token.
+    Stale,
 }
 
 struct TaskIdAllocator(AtomicU64);
@@ -511,6 +533,40 @@ pub(crate) enum AffinityMutationCompletion {
     Corrupt,
 }
 
+/// RAII owner for one bounded idle-steal task mutation.
+///
+/// The guard is intentionally separate from [`AffinityMutationCompletion`]:
+/// an idle steal only transfers a task which is already Ready, so a racing
+/// wake is not allowed to create a second enqueue obligation.
+#[cfg(feature = "idle-steal")]
+pub(crate) struct IdleStealMutation<'a>(&'a AxTaskRef);
+
+#[cfg(feature = "idle-steal")]
+impl<'a> IdleStealMutation<'a> {
+    #[cfg(test)]
+    pub(crate) fn try_begin(task: &'a AxTaskRef) -> Option<Self> {
+        if task.try_begin_idle_steal_mutation() {
+            Some(Self(task))
+        } else {
+            None
+        }
+    }
+
+    /// Reify a guard after the bounded scheduler predicate has claimed the
+    /// task. The caller must pass the exact task reference whose claim it
+    /// owns; no additional mutation transition is performed here.
+    pub(crate) fn claimed(task: &'a AxTaskRef) -> Self {
+        Self(task)
+    }
+}
+
+#[cfg(feature = "idle-steal")]
+impl Drop for IdleStealMutation<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.finish_idle_steal_mutation();
+    }
+}
+
 /// Result of releasing one Running -> Blocked publication transaction.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum BlockMutationCompletion {
@@ -567,6 +623,11 @@ pub struct TaskInner {
 
     entry: Cell<Option<Box<dyn FnOnce()>>>,
     state: AtomicU8,
+    /// Terminal transaction marker published before the scheduler tears down
+    /// the current task. `state` remains `Running` until `notify_exit` can
+    /// publish the exit code and wake joiners, so scheduler-parameter updates
+    /// must consult this marker under the run-queue lock as well.
+    terminalizing: AtomicBool,
 
     /// Serializes new-task, affinity, block-owner, and wake publication. A raw
     /// waker performs only a bounded sequence of exact state transitions: it
@@ -585,9 +646,26 @@ pub struct TaskInner {
 
     /// Used to indicate the CPU ID where the task is running or will run.
     cpu_id: AtomicU32,
-    /// Used to indicate whether the task is running on a CPU.
+    /// CPU on which this task most recently received a context-switch-in.
+    /// This is separate from `cpu_id`, which is the current routing owner and
+    /// may be published ahead of a migration commit.
+    #[cfg(feature = "idle-steal")]
+    last_run_cpu: AtomicU32,
+    /// Monotonic timestamp of the most recent context-switch-in. A zero value
+    /// means the task has not yet been observed running by the scheduler.
+    #[cfg(feature = "idle-steal")]
+    last_run_ns: AtomicU64,
+    /// One task-local CPU+generation owner. Zero means that no context-switch
+    /// lifecycle currently owns the task; the high bit marks a wake pointer
+    /// delegated to the exact owner generation. The owner is intentionally a
+    /// single atomic so ready migration can reject a task with one cache-hot
+    /// Acquire load and the old CPU can clear only its saved token.
     #[cfg(feature = "smp")]
-    cpu_handoff: AtomicU8,
+    cpu_handoff: AtomicU64,
+    /// Monotonic per-task owner generation. It is never reused or wrapped,
+    /// preventing a delayed old-CPU clear from matching a future owner.
+    #[cfg(feature = "smp")]
+    cpu_handoff_generation: AtomicU64,
     /// At most one strong self reference delegated by a remote blocked-task
     /// wake while the old CPU completes its context-switch epilogue.
     #[cfg(feature = "smp")]
@@ -900,6 +978,20 @@ impl TaskInner {
         self.cpu_id.load(Ordering::Acquire)
     }
 
+    /// Return the CPU which most recently switched this task in.
+    #[inline]
+    #[cfg(feature = "idle-steal")]
+    pub(crate) fn last_run_cpu(&self) -> u32 {
+        self.last_run_cpu.load(Ordering::Acquire)
+    }
+
+    /// Return the monotonic timestamp of the most recent switch-in.
+    #[inline]
+    #[cfg(feature = "idle-steal")]
+    pub(crate) fn last_run_ns(&self) -> u64 {
+        self.last_run_ns.load(Ordering::Acquire)
+    }
+
     /// Gets the cpu affinity mask of the task.
     ///
     /// Returns the cpu affinity mask of the task in type [`AxCpuMask`].
@@ -950,6 +1042,51 @@ impl TaskInner {
             .is_ok()
     }
 
+    /// Claim the independent ready-task idle-steal transaction.
+    #[cfg(feature = "idle-steal")]
+    pub(crate) fn try_begin_idle_steal_mutation(&self) -> bool {
+        self.mutation
+            .compare_exchange(
+                TASK_MUTATION_IDLE,
+                TASK_MUTATION_IDLE_STEAL,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Release idle-steal ownership, absorbing a stale wake bit from a task
+    /// which remained ready throughout the handoff.
+    #[cfg(feature = "idle-steal")]
+    pub(crate) fn finish_idle_steal_mutation(&self) -> bool {
+        if self
+            .mutation
+            .compare_exchange(
+                TASK_MUTATION_IDLE_STEAL,
+                TASK_MUTATION_IDLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            return true;
+        }
+        if self
+            .mutation
+            .compare_exchange(
+                TASK_MUTATION_IDLE_STEAL_WAKE_PENDING,
+                TASK_MUTATION_IDLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            return true;
+        }
+        self.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+        false
+    }
+
     pub(crate) fn finish_affinity_mutation(&self) -> AffinityMutationCompletion {
         match self.mutation.compare_exchange(
             TASK_MUTATION_AFFINITY,
@@ -996,6 +1133,10 @@ impl TaskInner {
             Err(
                 TASK_MUTATION_AFFINITY | TASK_MUTATION_WAKE | TASK_MUTATION_AFFINITY_WAKE_PENDING,
             ) => BlockMutationClaim::Busy,
+            #[cfg(feature = "idle-steal")]
+            Err(TASK_MUTATION_IDLE_STEAL | TASK_MUTATION_IDLE_STEAL_WAKE_PENDING) => {
+                BlockMutationClaim::Busy
+            }
             Err(_) => {
                 self.record_wake_fault(TaskWakeFault::SchedulerInvariant);
                 BlockMutationClaim::Corrupt
@@ -1050,6 +1191,10 @@ impl TaskInner {
             TASK_MUTATION_WAKE
             | TASK_MUTATION_AFFINITY_WAKE_PENDING
             | TASK_MUTATION_BLOCK_WAKE_PENDING => WakeMutationClaim::AlreadyOwned,
+            #[cfg(feature = "idle-steal")]
+            TASK_MUTATION_IDLE_STEAL | TASK_MUTATION_IDLE_STEAL_WAKE_PENDING => {
+                WakeMutationClaim::AlreadyOwned
+            }
             _ => {
                 self.record_wake_fault(TaskWakeFault::SchedulerInvariant);
                 WakeMutationClaim::Corrupt
@@ -1195,12 +1340,19 @@ impl TaskInner {
             is_migration_helper: false,
             entry: Cell::new(None),
             state: AtomicU8::new(TaskState::Ready as u8),
+            terminalizing: AtomicBool::new(false),
             mutation: AtomicU8::new(TASK_MUTATION_IDLE),
             // By default, the task is allowed to run on all CPUs.
             affinity: SpinNoIrq::new(TaskAffinity::new(crate::api::cpu_mask_full())),
             cpu_id: AtomicU32::new(0),
+            #[cfg(feature = "idle-steal")]
+            last_run_cpu: AtomicU32::new(0),
+            #[cfg(feature = "idle-steal")]
+            last_run_ns: AtomicU64::new(0),
             #[cfg(feature = "smp")]
-            cpu_handoff: AtomicU8::new(CPU_HANDOFF_OFF),
+            cpu_handoff: AtomicU64::new(CPU_OWNER_NONE),
+            #[cfg(feature = "smp")]
+            cpu_handoff_generation: AtomicU64::new(0),
             #[cfg(feature = "smp")]
             wake_handoff: AtomicPtr::new(core::ptr::null_mut()),
             #[cfg(feature = "preempt")]
@@ -1236,6 +1388,8 @@ impl TaskInner {
     pub(crate) fn new_init(name: String) -> Result<Self, TaskCreateError> {
         let mut t = Self::new_common(TaskId::try_new()?, name);
         t.is_init = true;
+        #[cfg(feature = "smp")]
+        t.set_cpu_id(axhal::percpu::this_cpu_id() as u32);
         #[cfg(feature = "smp")]
         t.mark_running_on_cpu();
         if t.name.lock().as_str() == "idle" {
@@ -1274,6 +1428,26 @@ impl TaskInner {
     #[inline]
     pub(crate) fn set_state(&self, state: TaskState) {
         self.state.store(state as u8, Ordering::Release)
+    }
+
+    /// Begin the one-way terminal transaction before scheduler ownership is
+    /// released. The marker closes the interval in which the task is still
+    /// externally `Running` but no longer has a scheduler entity.
+    pub(crate) fn begin_terminal_transaction(&self) {
+        assert!(
+            self.terminalizing
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "task terminal transaction began twice"
+        );
+    }
+
+    /// Whether terminal teardown has started. Callers pair this Acquire load
+    /// with the scheduler lock when deciding whether a parameter publication
+    /// may proceed.
+    #[inline]
+    pub(crate) fn is_terminalizing(&self) -> bool {
+        self.terminalizing.load(Ordering::Acquire)
     }
 
     /// Transition the task state from `current_state` to `new_state`,
@@ -1516,8 +1690,30 @@ impl TaskInner {
         self.ctx.get()
     }
 
+    /// Return whether the task has crossed the final stack-reclamation gate.
+    ///
+    /// An exited task can remain represented by a suspended context-switch
+    /// frame for a short interval.  GC must not unwrap it or recycle its stack
+    /// until both the CPU owner token and any delegated wake pointer are gone.
+    #[cfg(feature = "smp")]
+    #[inline]
+    pub(crate) fn can_reclaim_stack(&self) -> bool {
+        !self.has_cpu_owner_or_handoff()
+    }
+
+    /// Return whether the task has crossed the final stack-reclamation gate.
+    #[cfg(not(feature = "smp"))]
+    #[inline]
+    pub(crate) fn can_reclaim_stack(&self) -> bool {
+        true
+    }
+
     /// Remove and return the kernel stack owned by this task, if any.
     pub(crate) fn take_kernel_stack(&mut self) -> Option<TaskStack> {
+        assert!(
+            self.can_reclaim_stack(),
+            "task stack reclaimed while its CPU owner or wake handoff remained"
+        );
         self.kstack.take()
     }
 
@@ -1528,12 +1724,85 @@ impl TaskInner {
         self.cpu_id.store(cpu_id, Ordering::Release);
     }
 
-    /// Marks the task as owned by a CPU's context-switch lifecycle.
+    /// Publish the last-run hint at the context-switch boundary. This hint is
+    /// advisory only; scheduler ownership, affinity and task state remain
+    /// authoritative for migration correctness.
+    #[cfg(feature = "idle-steal")]
+    #[inline]
+    pub(crate) fn record_last_run(&self, cpu_id: u32, now: u64) {
+        self.last_run_cpu.store(cpu_id, Ordering::Release);
+        self.last_run_ns.store(now, Ordering::Release);
+    }
+
+    /// Return the currently published CPU owner token, excluding the wake
+    /// pending marker. The value is only a snapshot; clearing requires the
+    /// exact token captured by the old CPU before it switched away.
     #[cfg(feature = "smp")]
     #[inline]
-    pub(crate) fn mark_running_on_cpu(&self) {
+    pub(crate) fn cpu_owner_token(&self) -> Option<u64> {
+        let state = self.cpu_handoff.load(Ordering::Acquire);
+        let token = state & !CPU_OWNER_WAKE_PENDING;
+        (token != CPU_OWNER_NONE).then_some(token)
+    }
+
+    /// Return whether a context-switch owner or delegated wake handoff still
+    /// retains this task. The pointer check closes the interval after an owner
+    /// CAS and before the publisher has reclaimed its exact Arc.
+    #[cfg(feature = "smp")]
+    #[inline]
+    pub(crate) fn has_cpu_owner_or_handoff(&self) -> bool {
+        self.cpu_handoff.load(Ordering::Acquire) != CPU_OWNER_NONE
+            || !self.wake_handoff.load(Ordering::Acquire).is_null()
+    }
+
+    /// Try to claim one new CPU+generation owner. A duplicate mark is a
+    /// rejected operation, allowing deterministic tests to inspect the
+    /// invariant without invoking the fail-stop wrapper.
+    #[cfg(feature = "smp")]
+    pub(crate) fn try_mark_running_on_cpu(&self, cpu_id: u32) -> Option<u64> {
+        if (cpu_id as u64) > CPU_OWNER_CPU_MASK {
+            return None;
+        }
+        if self.cpu_handoff.load(Ordering::Acquire) != CPU_OWNER_NONE {
+            return None;
+        }
+        // `AtomicU64::try_update` returns the value observed before the
+        // successful update.  Encode the value published by the update, not
+        // that old value: the first owner must be generation one rather than
+        // the all-zero NONE token.
+        let previous_generation = self
+            .cpu_handoff_generation
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                let next = current.checked_add(1)?;
+                (next <= CPU_OWNER_GENERATION_MASK).then_some(next)
+            })
+            .ok()?;
+        let generation = previous_generation.checked_add(1)?;
+        let token = (generation << CPU_OWNER_CPU_BITS) | cpu_id as u64;
         self.cpu_handoff
-            .store(CPU_HANDOFF_RUNNING, Ordering::Release);
+            .compare_exchange(CPU_OWNER_NONE, token, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| token)
+    }
+
+    /// Marks the task as owned by this CPU's context-switch lifecycle. A
+    /// duplicate owner is a scheduler invariant violation and fail-stops;
+    /// ordinary migration paths must use [`Self::try_mark_running_on_cpu`]
+    /// when they need a recoverable predicate.
+    #[cfg(feature = "smp")]
+    #[inline]
+    pub(crate) fn mark_running_on_cpu(&self) -> u64 {
+        match self.try_mark_running_on_cpu(axhal::percpu::this_cpu_id() as u32) {
+            Some(token) => token,
+            None => {
+                self.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+                error!(
+                    "task {} received a duplicate or exhausted CPU owner",
+                    self.id().as_u64()
+                );
+                axhal::power::system_off()
+            }
+        }
     }
 
     /// Delegates one owned task reference to the old CPU instead of spinning
@@ -1546,6 +1815,13 @@ impl TaskInner {
     /// enqueue without a polling loop.
     #[cfg(feature = "smp")]
     pub(crate) fn publish_wake_handoff(&self, task: AxTaskRef) -> WakeHandoffPublication {
+        let owner = self.cpu_handoff.load(Ordering::Acquire);
+        if owner == CPU_OWNER_NONE {
+            return WakeHandoffPublication::Ready(task);
+        }
+        if owner & CPU_OWNER_WAKE_PENDING != 0 {
+            return WakeHandoffPublication::Occupied(task);
+        }
         let raw = Arc::into_raw(task).cast_mut();
         if self
             .wake_handoff
@@ -1563,13 +1839,13 @@ impl TaskInner {
         }
 
         match self.cpu_handoff.compare_exchange(
-            CPU_HANDOFF_RUNNING,
-            CPU_HANDOFF_WAKE_PENDING,
+            owner,
+            owner | CPU_OWNER_WAKE_PENDING,
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
             Ok(_) => WakeHandoffPublication::Deferred,
-            Err(CPU_HANDOFF_OFF) => {
+            Err(CPU_OWNER_NONE) => {
                 let task = self.take_wake_handoff();
                 match task {
                     Some(task) => WakeHandoffPublication::Ready(task),
@@ -1580,9 +1856,17 @@ impl TaskInner {
                     }
                 }
             }
-            Err(_) => {
+            Err(observed) => {
                 let task = self.take_wake_handoff();
                 match task {
+                    // The old owner may have completed and a newer owner may
+                    // already have been marked before this publisher's CAS.
+                    // In that case this exact pointer is still a valid ready
+                    // publication; only a still-pending owner means another
+                    // handoff already owns the slot.
+                    Some(task) if observed & CPU_OWNER_WAKE_PENDING == 0 => {
+                        WakeHandoffPublication::Ready(task)
+                    }
                     Some(task) => WakeHandoffPublication::Occupied(task),
                     None => WakeHandoffPublication::Deferred,
                 }
@@ -1604,17 +1888,63 @@ impl TaskInner {
         }
     }
 
-    /// Completes old-CPU ownership and claims a delegated remote wake, if any.
+    /// Completes old-CPU ownership and claims a delegated remote wake, if any,
+    /// using the exact token captured before the context switch. A no-argument
+    /// form remains useful for local mechanism tests; production switch
+    /// epilogues must call [`Self::finish_cpu_handoff_exact`].
     #[cfg(feature = "smp")]
+    #[cfg(test)]
     pub(crate) fn finish_cpu_handoff(&self) -> CpuHandoffCompletion {
-        match self.cpu_handoff.swap(CPU_HANDOFF_OFF, Ordering::AcqRel) {
-            CPU_HANDOFF_RUNNING => CpuHandoffCompletion::Cleared,
-            CPU_HANDOFF_WAKE_PENDING => self.take_wake_handoff().map_or(
-                CpuHandoffCompletion::MissingWake,
-                CpuHandoffCompletion::Wake,
-            ),
-            CPU_HANDOFF_OFF => CpuHandoffCompletion::AlreadyCleared,
-            _ => CpuHandoffCompletion::MissingWake,
+        let state = self.cpu_handoff.load(Ordering::Acquire);
+        self.finish_cpu_handoff_exact(state & !CPU_OWNER_WAKE_PENDING)
+    }
+
+    /// Clear an old CPU owner only if `expected` is still the published
+    /// generation. This CAS is the stale-clear firewall: a delayed old stack
+    /// cannot clear a newer owner, even if the task has already been switched
+    /// in again elsewhere.
+    #[cfg(feature = "smp")]
+    pub(crate) fn finish_cpu_handoff_exact(&self, expected: u64) -> CpuHandoffCompletion {
+        if expected == CPU_OWNER_NONE {
+            return CpuHandoffCompletion::AlreadyCleared;
+        }
+        let pending = expected | CPU_OWNER_WAKE_PENDING;
+        loop {
+            match self.cpu_handoff.load(Ordering::Acquire) {
+                observed if observed == expected => {
+                    if self
+                        .cpu_handoff
+                        .compare_exchange(
+                            expected,
+                            CPU_OWNER_NONE,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return CpuHandoffCompletion::Cleared;
+                    }
+                }
+                observed if observed == pending => {
+                    if self
+                        .cpu_handoff
+                        .compare_exchange(
+                            pending,
+                            CPU_OWNER_NONE,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return self.take_wake_handoff().map_or(
+                            CpuHandoffCompletion::MissingWake,
+                            CpuHandoffCompletion::Wake,
+                        );
+                    }
+                }
+                CPU_OWNER_NONE => return CpuHandoffCompletion::AlreadyCleared,
+                _ => return CpuHandoffCompletion::Stale,
+            }
         }
     }
 
@@ -1673,6 +2003,7 @@ impl TaskInner {
             2 => Some(TaskWakeFault::SchedulerCapacity),
             3 => Some(TaskWakeFault::SchedulerInvariant),
             4 => Some(TaskWakeFault::HandoffCorrupt),
+            5 => Some(TaskWakeFault::RemoteRescheduleFailed),
             _ => Some(TaskWakeFault::SchedulerInvariant),
         }
     }
@@ -2133,6 +2464,53 @@ mod mechanism_tests {
         assert!(task.finish_wake_mutation());
     }
 
+    #[cfg(feature = "idle-steal")]
+    #[test]
+    fn idle_steal_mutation_is_exclusive_and_absorbs_a_stale_wake() {
+        let first = TaskInner::new_init("idle-steal-first".into())
+            .unwrap()
+            .into_arc()
+            .unwrap();
+        let second = TaskInner::new_init("idle-steal-second".into())
+            .unwrap()
+            .into_arc()
+            .unwrap();
+
+        // A candidate whose mutation is already owned must not prevent the
+        // bounded successor scan from claiming the next candidate.
+        let first_owner = IdleStealMutation::try_begin(&first).expect("first claim");
+        assert_eq!(
+            first.inner().mutation.load(Ordering::Acquire),
+            TASK_MUTATION_IDLE_STEAL
+        );
+        assert!(IdleStealMutation::try_begin(&first).is_none());
+        let second_owner = IdleStealMutation::try_begin(&second).expect("successor claim");
+
+        // A wake on a task which remains Ready is only a stale publication
+        // hint.  The idle-steal owner absorbs that bit and releases exactly
+        // once, without creating another enqueue obligation.
+        assert_eq!(
+            first.inner().mutation.load(Ordering::Acquire),
+            TASK_MUTATION_IDLE_STEAL
+        );
+        assert_eq!(
+            first.inner().claim_wake_mutation(),
+            WakeMutationClaim::AlreadyOwned
+        );
+        drop(second_owner);
+        drop(first_owner);
+        assert!(first.inner().try_begin_affinity_mutation());
+        assert_eq!(
+            first.inner().finish_affinity_mutation(),
+            AffinityMutationCompletion::Released
+        );
+        assert!(second.inner().try_begin_affinity_mutation());
+        assert_eq!(
+            second.inner().finish_affinity_mutation(),
+            AffinityMutationCompletion::Released
+        );
+    }
+
     #[test]
     fn wake_owner_excludes_affinity_until_exact_completion() {
         let task = TaskInner::new_init("wake-before-affinity".into()).unwrap();
@@ -2194,6 +2572,17 @@ mod mechanism_tests {
         assert!(task.record_wake_fault(TaskWakeFault::SchedulerCapacity));
         assert!(!task.record_wake_fault(TaskWakeFault::HandoffCorrupt));
         assert_eq!(task.wake_fault(), Some(TaskWakeFault::SchedulerCapacity));
+    }
+
+    #[test]
+    fn remote_reschedule_failure_is_diagnostic_and_first_wins() {
+        let task = TaskInner::new_init("remote-resched-fault".into()).unwrap();
+        assert!(task.record_wake_fault(TaskWakeFault::RemoteRescheduleFailed));
+        assert!(!task.record_wake_fault(TaskWakeFault::HandoffCorrupt));
+        assert_eq!(
+            task.wake_fault(),
+            Some(TaskWakeFault::RemoteRescheduleFailed)
+        );
     }
 
     #[cfg(feature = "preempt")]
@@ -2333,7 +2722,8 @@ mod mechanism_tests {
             CpuHandoffCompletion::Wake(owned) => assert!(Arc::ptr_eq(&owned, &task)),
             CpuHandoffCompletion::Cleared
             | CpuHandoffCompletion::AlreadyCleared
-            | CpuHandoffCompletion::MissingWake => panic!("delegated wake ownership was lost"),
+            | CpuHandoffCompletion::MissingWake
+            | CpuHandoffCompletion::Stale => panic!("delegated wake ownership was lost"),
         }
         assert!(matches!(
             task.finish_cpu_handoff(),
@@ -2357,7 +2747,8 @@ mod mechanism_tests {
             CpuHandoffCompletion::Wake(owned) => owned,
             CpuHandoffCompletion::Cleared
             | CpuHandoffCompletion::AlreadyCleared
-            | CpuHandoffCompletion::MissingWake => {
+            | CpuHandoffCompletion::MissingWake
+            | CpuHandoffCompletion::Stale => {
                 panic!("deferred handoff lost its exact task owner")
             }
         };
@@ -2384,5 +2775,111 @@ mod mechanism_tests {
                 panic!("completed handoff must return enqueue ownership")
             }
         }
+    }
+
+    #[cfg(feature = "smp")]
+    #[test]
+    fn duplicate_cpu_owner_mark_is_rejected_and_generation_is_unique() {
+        let task = TaskInner::new_init("owner-generation".into())
+            .unwrap()
+            .into_arc()
+            .unwrap();
+        let first = task.cpu_owner_token().expect("init owner token");
+        assert!(task.try_mark_running_on_cpu(0).is_none());
+        assert!(matches!(
+            task.finish_cpu_handoff_exact(first),
+            CpuHandoffCompletion::Cleared
+        ));
+
+        let second = task
+            .try_mark_running_on_cpu(1)
+            .expect("released task can receive a new owner");
+        assert_ne!(first, second, "owner generations must never be reused");
+        assert!(matches!(
+            task.finish_cpu_handoff_exact(second),
+            CpuHandoffCompletion::Cleared
+        ));
+    }
+
+    #[cfg(feature = "smp")]
+    #[test]
+    fn cpu_owner_generation_budget_is_wide_and_checked_at_the_boundary() {
+        let task = TaskInner::new_init("owner-generation-budget".into())
+            .unwrap()
+            .into_arc()
+            .unwrap();
+        let initial = task.cpu_owner_token().expect("init owner token");
+        assert!(matches!(
+            task.finish_cpu_handoff_exact(initial),
+            CpuHandoffCompletion::Cleared
+        ));
+
+        // One wake marker bit and a 16-bit x86_64 CPU tag leave 47 bits for a
+        // monotonic owner generation. Seed the private counter immediately
+        // before its limit to exercise both the final valid claim and the
+        // explicit non-wrapping rejection without billions of context switches.
+        assert_eq!(CPU_OWNER_CPU_BITS, 16);
+        assert_eq!(CPU_OWNER_GENERATION_MASK, (1_u64 << 47) - 1);
+        task.cpu_handoff_generation
+            .store(CPU_OWNER_GENERATION_MASK - 1, Ordering::Release);
+        let cpu = CPU_OWNER_CPU_MASK as u32;
+        let final_owner = task
+            .try_mark_running_on_cpu(cpu)
+            .expect("the maximum representable owner generation is valid");
+        assert_eq!(final_owner >> CPU_OWNER_CPU_BITS, CPU_OWNER_GENERATION_MASK);
+        assert_eq!(final_owner & CPU_OWNER_CPU_MASK, cpu as u64);
+        assert!(matches!(
+            task.finish_cpu_handoff_exact(final_owner),
+            CpuHandoffCompletion::Cleared
+        ));
+
+        assert!(
+            task.try_mark_running_on_cpu(0).is_none(),
+            "owner generation exhaustion must fail without wrapping"
+        );
+        assert!(
+            task.try_mark_running_on_cpu((CPU_OWNER_CPU_MASK + 1) as u32)
+                .is_none(),
+            "CPU tags outside the fixed token field must be rejected"
+        );
+    }
+
+    #[cfg(feature = "smp")]
+    #[test]
+    fn stale_owner_clear_cannot_clear_a_newer_cpu_owner() {
+        let task = TaskInner::new_init("stale-owner-clear".into())
+            .unwrap()
+            .into_arc()
+            .unwrap();
+        let old = task.cpu_owner_token().expect("old owner token");
+        assert!(matches!(
+            task.finish_cpu_handoff_exact(old),
+            CpuHandoffCompletion::Cleared
+        ));
+        let new = task.try_mark_running_on_cpu(1).expect("new owner token");
+        assert!(matches!(
+            task.finish_cpu_handoff_exact(old),
+            CpuHandoffCompletion::Stale
+        ));
+        assert_eq!(task.cpu_owner_token(), Some(new));
+        assert!(matches!(
+            task.finish_cpu_handoff_exact(new),
+            CpuHandoffCompletion::Cleared
+        ));
+    }
+
+    #[cfg(feature = "smp")]
+    #[test]
+    fn stack_reclamation_waits_for_cpu_owner_release() {
+        let mut task =
+            TaskInner::new(|| {}, "stack-owner-gate".into(), MIN_KERNEL_STACK_SIZE).unwrap();
+        let owner = task.try_mark_running_on_cpu(0).expect("test owner token");
+        assert!(!task.can_reclaim_stack());
+        assert!(matches!(
+            task.finish_cpu_handoff_exact(owner),
+            CpuHandoffCompletion::Cleared
+        ));
+        assert!(task.can_reclaim_stack());
+        assert!(task.take_kernel_stack().is_some());
     }
 }

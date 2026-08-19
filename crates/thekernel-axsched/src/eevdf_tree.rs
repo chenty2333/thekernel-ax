@@ -213,6 +213,8 @@ pub(crate) struct EevdfInsertError<K, T> {
     node: Arc<EevdfNode<K, T>>,
 }
 
+type BoundedScanResult<K, T> = (Option<(Arc<EevdfNode<K, T>>, usize)>, Option<K>);
+
 impl<K, T> EevdfInsertError<K, T> {
     /// Returns the typed cause without exposing the retained node.
     pub(crate) fn kind(&self) -> EevdfTreeError {
@@ -395,6 +397,116 @@ impl<K: Ord + Copy, T> EevdfTree<K, T> {
         None
     }
 
+    /// Visit nodes in key order, starting at the minimum key, until the
+    /// predicate accepts one or `limit` nodes have been inspected.
+    ///
+    /// This is the read-only half of a bounded ready-task handoff.  It uses
+    /// parent links to walk each successor without a recursion stack or a
+    /// temporary allocation, and it clones the tree's Arc ownership unit only
+    /// for the accepted node.  `visited` counts predicate calls, including
+    /// the accepted node, so a caller can account for the complete bounded
+    /// scan.  In particular, RT-prefix nodes are not skipped: their key rank
+    /// puts them first and they consume the same bound as fair nodes.
+    pub(crate) fn find_bounded<P>(
+        &self,
+        limit: usize,
+        mut predicate: P,
+    ) -> Option<(Arc<EevdfNode<K, T>>, usize)>
+    where
+        P: FnMut(&EevdfNode<K, T>) -> bool,
+    {
+        if limit == 0 || self.root.is_null() {
+            return None;
+        }
+
+        let mut cursor = unsafe { self.minimum(self.root) };
+        let mut visited = 0;
+        while !cursor.is_null() && visited < limit {
+            visited += 1;
+            // SAFETY: `cursor` is a live node reachable from this tree.  The
+            // shared tree borrow excludes removal for the duration of the
+            // predicate and the Arc clone below.
+            let accepted = unsafe { predicate(&*cursor) };
+            if accepted {
+                // SAFETY: the tree owns one strong count for every linked
+                // node.  Retain one additional count before constructing the
+                // returned Arc, while the shared tree borrow keeps the node
+                // linked and alive.
+                unsafe { Arc::increment_strong_count(cursor) };
+                // SAFETY: the increment above created exactly the ownership
+                // unit consumed by `from_raw`.
+                return Some((unsafe { Arc::from_raw(cursor) }, visited));
+            }
+            cursor = unsafe { self.successor(cursor) };
+        }
+        None
+    }
+
+    /// Visit at most `limit` nodes in key order, beginning strictly after
+    /// `after` when a continuation key is supplied.
+    ///
+    /// The returned key is the last node inspected, not merely the key of an
+    /// accepted node.  A caller can therefore retain progress across bounded
+    /// attempts even when every node in the current window is rejected.  When
+    /// the continuation is already at the end of the tree, the returned key is
+    /// `None`; the next call naturally wraps to the minimum node.
+    pub(crate) fn find_bounded_after<P>(
+        &self,
+        after: Option<K>,
+        limit: usize,
+        mut predicate: P,
+    ) -> BoundedScanResult<K, T>
+    where
+        P: FnMut(&EevdfNode<K, T>) -> bool,
+    {
+        if limit == 0 || self.root.is_null() {
+            return (None, None);
+        }
+
+        // Find the first node with key strictly greater than the saved
+        // continuation.  This is the same lower-bound walk used by an
+        // ordered-map iterator and costs O(log n) before the bounded scan.
+        let mut cursor = if let Some(after) = after {
+            let mut current = self.root;
+            let mut successor = ptr::null_mut();
+            while !current.is_null() {
+                let key = unsafe { (*(*current).state.get()).key };
+                if key > after {
+                    successor = current;
+                    current = unsafe { (*(*current).state.get()).left };
+                } else {
+                    current = unsafe { (*(*current).state.get()).right };
+                }
+            }
+            successor
+        } else {
+            // SAFETY: a non-empty tree has a non-null root.
+            unsafe { self.minimum(self.root) }
+        };
+
+        let mut visited = 0;
+        let mut last_key = None;
+        while !cursor.is_null() && visited < limit {
+            visited += 1;
+            // SAFETY: `cursor` is a live node reachable from this tree.  The
+            // shared tree borrow excludes removal for the duration of the
+            // predicate and the Arc clone below.
+            let node = unsafe { &*cursor };
+            let key = unsafe { (*node.state.get()).key };
+            last_key = Some(key);
+            if predicate(node) {
+                // SAFETY: the tree owns one strong count for every linked
+                // node.  Retain one additional count before constructing the
+                // returned Arc, while the shared tree borrow keeps the node
+                // linked and alive.
+                unsafe { Arc::increment_strong_count(cursor) };
+                return (Some((unsafe { Arc::from_raw(cursor) }, visited)), last_key);
+            }
+            cursor = unsafe { self.successor(cursor) };
+        }
+        (None, last_key)
+    }
+
     /// Removes exactly `node` from this tree and returns the same Arc unit.
     ///
     /// Key equality alone is insufficient: a same-key node from another tree
@@ -483,6 +595,25 @@ impl<K: Ord + Copy, T> EevdfTree<K, T> {
             }
         }
         false
+    }
+
+    /// Return the in-order successor of a linked node.
+    ///
+    /// The caller must provide a node belonging to this tree.  Parent links
+    /// make the upward walk allocation-free and bounded by tree height.
+    unsafe fn successor(&self, node: *mut EevdfNode<K, T>) -> *mut EevdfNode<K, T> {
+        let right = (*(*node).state.get()).right;
+        if !right.is_null() {
+            return self.minimum(right);
+        }
+
+        let mut child = node;
+        let mut parent = (*(*child).state.get()).parent;
+        while !parent.is_null() && (*(*parent).state.get()).right == child {
+            child = parent;
+            parent = (*(*child).state.get()).parent;
+        }
+        parent
     }
 
     unsafe fn remove_raw(&mut self, z: *mut EevdfNode<K, T>) -> *mut EevdfNode<K, T> {
@@ -1106,6 +1237,94 @@ mod tests {
         ));
         verify(&tree);
         assert!(tree.is_empty());
+    }
+
+    #[test]
+    fn bounded_successor_scan_is_key_ordered_and_non_mutating() {
+        let mut tree = EevdfTree::new();
+        let nodes: Vec<_> = [4, 1, 3, 2]
+            .into_iter()
+            .map(|key| node(key, key as u128))
+            .collect();
+        for current in &nodes {
+            tree.insert(current.clone()).unwrap();
+        }
+        let len = tree.len();
+        let mut seen = Vec::new();
+        let (selected, visited) = tree
+            .find_bounded(3, |current| {
+                let current_key = unsafe { current.key() };
+                seen.push(current_key);
+                current_key == 3
+            })
+            .unwrap();
+        assert_eq!(seen, [1, 2, 3]);
+        assert_eq!(visited, 3);
+        assert!(Arc::ptr_eq(&selected, &nodes[2]));
+        assert_eq!(tree.len(), len);
+        assert!(nodes.iter().all(linked));
+        verify(&tree);
+
+        let mut calls = 0;
+        assert!(tree
+            .find_bounded(0, |_| {
+                calls += 1;
+                true
+            })
+            .is_none());
+        assert_eq!(calls, 0);
+        assert_eq!(tree.len(), len);
+        verify(&tree);
+    }
+
+    #[test]
+    fn bounded_successor_scan_stops_at_limit_without_match() {
+        let mut tree = EevdfTree::new();
+        let nodes: Vec<_> = (0..8).map(|key| node(key, key as u128)).collect();
+        for current in &nodes {
+            tree.insert(current.clone()).unwrap();
+        }
+        let mut calls = 0;
+        assert!(tree
+            .find_bounded(4, |_| {
+                calls += 1;
+                false
+            })
+            .is_none());
+        assert_eq!(calls, 4);
+        assert_eq!(tree.len(), nodes.len());
+        verify(&tree);
+    }
+
+    #[test]
+    fn bounded_continuation_advances_past_rejected_window_and_wraps() {
+        let mut tree = EevdfTree::new();
+        let nodes: Vec<_> = (0..5).map(|key| node(key, key as u128)).collect();
+        for current in &nodes {
+            tree.insert(current.clone()).unwrap();
+        }
+
+        let (first, cursor) = tree.find_bounded_after(None, 2, |_| false);
+        assert!(first.is_none());
+        assert_eq!(cursor, Some(1));
+
+        let (second, cursor) = tree.find_bounded_after(cursor, 2, |_| false);
+        assert!(second.is_none());
+        assert_eq!(cursor, Some(3));
+
+        // There is no successor after key 3 within the bound, so the caller
+        // receives key 4 and the next invocation can wrap to key 0.
+        let (third, cursor) = tree.find_bounded_after(cursor, 2, |_| false);
+        assert!(third.is_none());
+        assert_eq!(cursor, Some(4));
+        let (wrapped, cursor) = tree.find_bounded_after(cursor, 2, |_| false);
+        assert!(wrapped.is_none());
+        assert_eq!(cursor, None);
+        let (wrapped, cursor) =
+            tree.find_bounded_after(cursor, 2, |current| unsafe { current.key() == 0 });
+        assert_eq!(wrapped.as_ref().map(|(node, _)| *node.value()), Some(0));
+        assert_eq!(cursor, Some(0));
+        verify(&tree);
     }
 
     #[test]

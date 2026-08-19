@@ -1,9 +1,19 @@
 #![cfg_attr(not(test), no_std)]
 #![doc = include_str!("../README.md")]
 
+#[cfg(any(
+    all(feature = "eevdf-balanced", feature = "eevdf-latency"),
+    all(feature = "eevdf-balanced", feature = "eevdf-throughput"),
+    all(feature = "eevdf-latency", feature = "eevdf-throughput"),
+))]
+compile_error!(
+    "select at most one EEVDF profile: eevdf-balanced, eevdf-latency, or eevdf-throughput"
+);
+
 mod cfs;
 mod eevdf;
 mod eevdf_model;
+mod eevdf_profile;
 mod eevdf_tree;
 mod fifo;
 mod round_robin;
@@ -21,11 +31,63 @@ pub use cfs::{
 };
 pub use eevdf::{
     EEVDFScheduler, EEVDFTask, EevdfForkSeed, EevdfMigration, EevdfMigrationCommitError,
-    EevdfMigrationOrigin, EevdfParamUpdate, EevdfReservationCommitError, EevdfTaskClass,
-    EevdfTaskParams, EevdfTaskReservation,
+    EevdfMigrationOrigin, EevdfParamUpdate, EevdfReadyCandidate, EevdfReadyCursor,
+    EevdfReservationCommitError, EevdfTaskClass, EevdfTaskParams, EevdfTaskReservation,
 };
+pub use eevdf_profile::{eevdf_profile, EevdfProfile, EEVDF_PROFILE};
 pub use fifo::{FifoScheduler, FifoTask};
 pub use round_robin::{RRScheduler, RRTask};
+
+/// A scheduler-owned runtime sample supplied by the task layer.
+///
+/// The scheduler must never read a platform clock while mutating a run queue:
+/// a task layer owns the clock domain and publishes one explicit delta at every
+/// ownership boundary. `period_ns` is the configured scheduler tick period and
+/// lets schedulers retain sub-tick runtime without rounding each boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RuntimeDelta {
+    elapsed_ns: u64,
+    period_ns: u64,
+}
+
+impl RuntimeDelta {
+    /// Constructs a runtime delta. A zero period is invalid and is represented
+    /// as a zero delta so a corrupt platform configuration cannot divide by
+    /// zero inside a scheduler hot path.
+    pub const fn new(elapsed_ns: u64, period_ns: u64) -> Self {
+        if period_ns == 0 {
+            Self {
+                elapsed_ns: 0,
+                period_ns: 1,
+            }
+        } else {
+            Self {
+                elapsed_ns,
+                period_ns,
+            }
+        }
+    }
+
+    /// Returns the elapsed wall-clock duration captured by the task layer.
+    pub const fn elapsed_ns(self) -> u64 {
+        self.elapsed_ns
+    }
+
+    /// Returns the configured scheduler period used for sub-tick carry.
+    pub const fn period_ns(self) -> u64 {
+        self.period_ns
+    }
+
+    /// Returns the number of complete scheduler periods in this sample.
+    pub const fn whole_periods(self) -> u64 {
+        self.elapsed_ns / self.period_ns
+    }
+
+    /// Whether this sample contains no elapsed runtime.
+    pub const fn is_zero(self) -> bool {
+        self.elapsed_ns == 0
+    }
+}
 
 const UNOWNED: usize = 0;
 const CONFIGURING: usize = usize::MAX;
@@ -230,6 +292,21 @@ pub trait BaseScheduler {
     ///
     /// `current` is the current running task.
     fn task_tick(&mut self, current: &Self::SchedItem) -> bool;
+
+    /// Accounts one explicit wall-clock runtime sample for `current`.
+    ///
+    /// Implementations with finer-grained accounting should override this
+    /// method. The default preserves legacy tick schedulers while avoiding a
+    /// synthetic tick for a sub-period boundary.
+    fn account_runtime(&mut self, current: &Self::SchedItem, delta: RuntimeDelta) -> bool {
+        let mut periods = delta.whole_periods();
+        let mut reschedule = false;
+        while periods != 0 {
+            reschedule |= self.task_tick(current);
+            periods -= 1;
+        }
+        reschedule
+    }
 
     /// Sets the scheduler-specific priority of a task.
     ///

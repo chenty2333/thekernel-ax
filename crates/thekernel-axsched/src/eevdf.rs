@@ -14,9 +14,10 @@ use core::{
 use crate::{
     allocate_scheduler_id,
     cfs::{RR_TIMESLICE_TICKS, RT_PRIORITY_MAX, RT_PRIORITY_MIN},
-    eevdf_model::{bias_i128, credit_cap, Clock, Entity, MigrationSnapshot, ModelError},
+    eevdf_model::{bias_i128, credit_cap, Clock, Entity, MigrationSnapshot, ModelError, ONE},
     eevdf_tree::{EevdfNode, EevdfTree, EevdfTreeError},
-    BaseScheduler, DeactivateReason, EnqueueReason, SchedulerError, CONFIGURING, UNOWNED,
+    BaseScheduler, DeactivateReason, EnqueueReason, RuntimeDelta, SchedulerError, CONFIGURING,
+    UNOWNED,
 };
 
 use alloc::sync::Arc;
@@ -231,6 +232,67 @@ pub struct EevdfReadyKey {
     sequence: i128,
 }
 
+/// Opaque continuation state for a bounded ready-tree query.
+///
+/// Idle stealing keeps one value per source CPU.  Keeping the structural key
+/// inside the scheduler crate means the task layer cannot accidentally build a
+/// cursor that does not obey the tree's total ordering, while still allowing
+/// it to retain progress between bounded, try-lock-only attempts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub struct EevdfReadyCursor(Option<EevdfReadyKey>);
+
+impl EevdfReadyCursor {
+    /// Construct a cursor positioned before the first key.
+    pub const fn new() -> Self {
+        Self(None)
+    }
+
+    /// Forget continuation state and restart at the first ready key.
+    pub const fn reset(&mut self) {
+        self.0 = None;
+    }
+}
+
+/// A ready task selected by a bounded, read-only run-queue query.
+///
+/// The task remains linked in its source scheduler.  The candidate owns an
+/// additional Arc reference so the caller can, while retaining the same
+/// run-queue lock, pass [`Self::task`] to [`EEVDFScheduler::begin_ready_migration`]
+/// or discard it and leave the queue untouched.
+pub struct EevdfReadyCandidate<T> {
+    task: Arc<EEVDFTask<T>>,
+    key: EevdfReadyKey,
+    class: EevdfTaskClass,
+    visited: usize,
+}
+
+impl<T> EevdfReadyCandidate<T> {
+    /// Return the selected task without detaching it from the source queue.
+    pub fn task(&self) -> &Arc<EEVDFTask<T>> {
+        &self.task
+    }
+
+    /// Consume the candidate and return its retained task reference.
+    pub fn into_task(self) -> Arc<EEVDFTask<T>> {
+        self.task
+    }
+
+    /// Number of key-ordered nodes whose predicate was evaluated.
+    pub const fn visited(&self) -> usize {
+        self.visited
+    }
+
+    /// Structural key observed while the source run queue was excluded.
+    pub const fn key(&self) -> EevdfReadyKey {
+        self.key
+    }
+
+    /// Scheduling class observed at the same query boundary.
+    pub const fn class(&self) -> EevdfTaskClass {
+        self.class
+    }
+}
+
 /// Opaque fair-state seed for a newly forked task.
 ///
 /// A seed contains only a bounded, materialized lag.  It never contains the
@@ -313,6 +375,16 @@ struct MigrationState {
     source_key: EevdfReadyKey,
     source_eligible_at: u128,
     rr_remaining: usize,
+    /// Runtime below one scheduler period retained across CPU migration.
+    runtime_remainder_ns: u64,
+    /// Conversion residue from Q32 fractional service settlement.  It is
+    /// bounded by `runtime_fraction_period_ns` and is not a deferred wall
+    /// runtime token or a scheduler clock snapshot.
+    runtime_fraction_remainder_ns: u64,
+    runtime_fraction_period_ns: u64,
+    runtime_fraction_class: EevdfTaskClass,
+    runtime_fraction_weight: u128,
+    rr_fraction_q: u64,
     dormant_fair: Option<Entity>,
     origin: EevdfMigrationOrigin,
 }
@@ -322,6 +394,18 @@ struct MigrationState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct EevdfOwnedState {
     pub(crate) entity: Option<Entity>,
+    /// Runtime below one scheduler period retained for the current task.
+    ///
+    /// The task layer supplies elapsed nanoseconds at every ownership
+    /// boundary. Keeping this remainder with the task, rather than with a
+    /// run queue, prevents a yield or migration at half a period from losing
+    /// service or charging the next task.
+    pub(crate) runtime_remainder_ns: u64,
+    pub(crate) runtime_fraction_remainder_ns: u64,
+    pub(crate) runtime_fraction_period_ns: u64,
+    pub(crate) runtime_fraction_class: EevdfTaskClass,
+    pub(crate) runtime_fraction_weight: u128,
+    pub(crate) rr_fraction_q: u64,
     /// A task has either no migration or exactly one complete migration
     /// record.  `Some` is also the lifecycle marker while owner is UNOWNED.
     migration: Option<MigrationState>,
@@ -353,6 +437,12 @@ impl<T> EevdfTaskPayload<T> {
             rr_remaining: AtomicUsize::new(0),
             state: UnsafeCell::new(EevdfOwnedState {
                 entity: None,
+                runtime_remainder_ns: 0,
+                runtime_fraction_remainder_ns: 0,
+                runtime_fraction_period_ns: 0,
+                runtime_fraction_class: EevdfTaskClass::Normal,
+                runtime_fraction_weight: 0,
+                rr_fraction_q: 0,
                 migration: None,
                 dormant_fair: None,
                 rt_sleeping: false,
@@ -876,6 +966,19 @@ fn fair_class(class: EevdfTaskClass) -> Option<crate::eevdf_model::RequestClass>
     }
 }
 
+/// Rebound a fork seed at the child's admission class.
+///
+/// The parent and child may have different fair classes while the child is
+/// still virgin.  A seed is only a lag hint, so it must not carry a larger
+/// sleeper-credit cap from the parent's class into the child's request.
+fn fork_lag_for_class(
+    seed: Option<EevdfForkSeed>,
+    child_class: crate::eevdf_model::RequestClass,
+) -> i128 {
+    let cap = credit_cap(child_class);
+    seed.map_or(0, |seed| seed.lag.clamp(-cap, cap))
+}
+
 fn model_error(error: ModelError) -> SchedulerError {
     match error {
         ModelError::ArithmeticExhausted => SchedulerError::ArithmeticExhausted,
@@ -938,6 +1041,80 @@ impl<T> EEVDFScheduler<T> {
     /// Returns the number of ready tasks.  The running task is not linked.
     pub const fn ready_len(&self) -> usize {
         self.ready_tree.len()
+    }
+
+    /// Return whether `task` is the current owner of this run queue.
+    ///
+    /// The task layer uses this under the scheduler lock to account a pending
+    /// wall-clock sample before applying a remote scheduling-parameter
+    /// transaction.  Looking at task state alone is insufficient because a
+    /// migration or switch can leave that publication briefly stale.
+    pub fn is_running_task(&self, task: &Arc<EEVDFTask<T>>) -> bool {
+        self.running
+            .as_ref()
+            .is_some_and(|running| Arc::ptr_eq(running, task))
+    }
+
+    /// Select the first ready task accepted by `predicate` in structural key
+    /// order, inspecting at most `limit` tasks.
+    ///
+    /// This is intentionally a read-only candidate query.  The returned task
+    /// is still linked and owned by this scheduler; callers that hold the
+    /// scheduler's run-queue exclusion may use the retained Arc immediately
+    /// with [`Self::begin_ready_migration`], or drop it without changing the
+    /// queue.  The bound includes the complete RT prefix because RT keys sort
+    /// before fair keys.  `limit == 0` and an empty queue perform no predicate
+    /// access and return `None`.
+    pub fn bounded_ready_candidate<P>(
+        &self,
+        limit: usize,
+        mut predicate: P,
+    ) -> Option<EevdfReadyCandidate<T>>
+    where
+        P: FnMut(&EEVDFTask<T>) -> bool,
+    {
+        let (task, visited) = self
+            .ready_tree
+            .find_bounded(limit, |node| predicate(node))?;
+        let key = unsafe { task.key() };
+        let class = task.sched_params().class;
+        Some(EevdfReadyCandidate {
+            task,
+            key,
+            class,
+            visited,
+        })
+    }
+
+    /// Select one ready task after a caller-owned continuation key.
+    ///
+    /// The cursor advances through every inspected structural node, including
+    /// rejected nodes.  Once the end is reached it wraps on the next call.
+    /// This makes an idle puller fair to later tree entries without allowing a
+    /// single attempt to exceed the same bounded predicate work as the normal
+    /// query.
+    pub fn bounded_ready_candidate_from<P>(
+        &self,
+        cursor: &mut EevdfReadyCursor,
+        limit: usize,
+        mut predicate: P,
+    ) -> Option<EevdfReadyCandidate<T>>
+    where
+        P: FnMut(&EEVDFTask<T>) -> bool,
+    {
+        let (candidate, last_key) = self
+            .ready_tree
+            .find_bounded_after(cursor.0, limit, |node| predicate(node));
+        cursor.0 = last_key;
+        let (task, visited) = candidate?;
+        let key = unsafe { task.key() };
+        let class = task.sched_params().class;
+        Some(EevdfReadyCandidate {
+            task,
+            key,
+            class,
+            visited,
+        })
     }
 
     /// Produce a bounded fair fork seed while holding the scheduler's
@@ -1046,6 +1223,81 @@ impl<T> EEVDFScheduler<T> {
         eevdf_weight_for(params).ok_or(SchedulerError::InvalidParameters)
     }
 
+    /// Return the tuple component which owns a wall-to-Q32 conversion residue.
+    /// RT classes do not use a fair weight, but retaining a zero value keeps
+    /// the ownership check explicit for every class.
+    fn runtime_fraction_weight(params: EevdfTaskParams) -> Result<u128, SchedulerError> {
+        if is_rt_class(params.class) {
+            Ok(0)
+        } else {
+            Self::fair_weight(params)
+        }
+    }
+
+    /// A non-zero conversion residue is valid only while the published class
+    /// and effective weight still match the tuple which produced it. The
+    /// residue is below one Q32 service unit; it is not safe to feed it to a
+    /// different tuple merely because the task's packed parameters changed.
+    fn validate_runtime_fraction_owner(
+        task: &Arc<EEVDFTask<T>>,
+        state: EevdfOwnedState,
+    ) -> Result<(), SchedulerError> {
+        if state.runtime_remainder_ns == 0 && state.runtime_fraction_remainder_ns == 0 {
+            return Ok(());
+        }
+        let params = task.sched_params();
+        let weight = Self::runtime_fraction_weight(params)?;
+        if state.runtime_fraction_class != params.class
+            || state.runtime_fraction_weight != weight
+            || state.runtime_fraction_period_ns == 0
+        {
+            return Err(SchedulerError::InconsistentState);
+        }
+        Ok(())
+    }
+
+    /// Clear a conversion residue at an explicit scheduling-tuple boundary.
+    /// The preceding settlement has already materialized every representable
+    /// whole/Q32 service unit under the old class and weight. What remains is
+    /// strictly below one Q32 unit (`remainder < period`), which this model
+    /// cannot represent exactly; dropping it here prevents charging that
+    /// old-tuple precision token under the new class or weight.
+    fn clear_runtime_fraction(state: &mut EevdfOwnedState) {
+        state.runtime_fraction_remainder_ns = 0;
+        state.runtime_fraction_period_ns = 0;
+        state.runtime_fraction_class = EevdfTaskClass::Normal;
+        state.runtime_fraction_weight = 0;
+    }
+
+    fn publish_runtime_fraction_owner(
+        state: &mut EevdfOwnedState,
+        params: EevdfTaskParams,
+        weight: u128,
+        remainder: u64,
+        period_ns: u64,
+    ) {
+        if remainder == 0 {
+            state.runtime_fraction_remainder_ns = 0;
+            state.runtime_fraction_period_ns = if state.runtime_remainder_ns == 0 {
+                0
+            } else {
+                period_ns
+            };
+            if state.runtime_remainder_ns == 0 {
+                state.runtime_fraction_class = EevdfTaskClass::Normal;
+                state.runtime_fraction_weight = 0;
+            } else {
+                state.runtime_fraction_class = params.class;
+                state.runtime_fraction_weight = weight;
+            }
+        } else {
+            state.runtime_fraction_remainder_ns = remainder;
+            state.runtime_fraction_period_ns = period_ns;
+            state.runtime_fraction_class = params.class;
+            state.runtime_fraction_weight = weight;
+        }
+    }
+
     fn fair_key(entity: &Entity, sequence: i128) -> Result<(EevdfReadyKey, u128), SchedulerError> {
         let deadline = entity.request.deadline;
         let eligible_at = entity.eligible_at().map_err(model_error)?;
@@ -1057,6 +1309,15 @@ impl<T> EEVDFScheduler<T> {
 
     fn rt_key(params: EevdfTaskParams, sequence: i128) -> EevdfReadyKey {
         EevdfReadyKey::new(RT_CLASS_RANK, rt_order(params.rt_priority), sequence)
+    }
+
+    /// Renew the integer and Q32 portions of an RR slice as one scheduler
+    /// state transition.  A slice boundary must never leave fractional
+    /// progress from the previous slice attached to the new budget.
+    fn reset_rr_slice(task: &Arc<EEVDFTask<T>>) {
+        task.set_rr_remaining(RR_TIMESLICE_TICKS);
+        // SAFETY: every caller owns the task under the scheduler exclusion.
+        unsafe { task.owned_state_mut().rr_fraction_q = 0 };
     }
 
     fn release_claim(&self, task: &Arc<EEVDFTask<T>>) {
@@ -1075,11 +1336,18 @@ impl<T> EEVDFScheduler<T> {
         source_key: EevdfReadyKey,
         source_eligible_at: u128,
         rr_remaining: usize,
+        runtime_remainder_ns: u64,
+        runtime_fraction_remainder_ns: u64,
+        runtime_fraction_period_ns: u64,
+        runtime_fraction_class: EevdfTaskClass,
+        runtime_fraction_weight: u128,
+        rr_fraction_q: u64,
         dormant_fair: Option<Entity>,
         origin: EevdfMigrationOrigin,
     ) {
         let state = task.owned_state_mut();
         state.entity = None;
+        state.runtime_remainder_ns = 0;
         state.migration = Some(MigrationState {
             source_scheduler_id,
             params,
@@ -1090,6 +1358,12 @@ impl<T> EEVDFScheduler<T> {
             source_key,
             source_eligible_at,
             rr_remaining,
+            runtime_remainder_ns,
+            runtime_fraction_remainder_ns,
+            runtime_fraction_period_ns,
+            runtime_fraction_class,
+            runtime_fraction_weight,
+            rr_fraction_q,
             dormant_fair,
             origin,
         });
@@ -1172,7 +1446,7 @@ impl<T> EEVDFScheduler<T> {
                 weight,
                 next_clock.total_weight,
                 next_clock.v,
-                fork_seed.map_or(0, |seed| seed.lag),
+                fork_lag_for_class(fork_seed, class),
             )
             .map_err(model_error)
             {
@@ -1212,6 +1486,12 @@ impl<T> EEVDFScheduler<T> {
         // runqueue exclusion while its entity is published.
         unsafe {
             task.owned_state_mut().entity = entity;
+            task.owned_state_mut().runtime_remainder_ns = 0;
+            task.owned_state_mut().runtime_fraction_remainder_ns = 0;
+            task.owned_state_mut().runtime_fraction_period_ns = 0;
+            task.owned_state_mut().runtime_fraction_class = EevdfTaskClass::Normal;
+            task.owned_state_mut().runtime_fraction_weight = 0;
+            task.owned_state_mut().rr_fraction_q = 0;
             task.owned_state_mut().migration = None;
             task.owned_state_mut().dormant_fair = None;
             task.owned_state_mut().rt_sleeping = false;
@@ -1219,7 +1499,7 @@ impl<T> EEVDFScheduler<T> {
             task.owned_state_mut().sleep_v = None;
         }
         if matches!(params.class, EevdfTaskClass::RoundRobin) {
-            task.set_rr_remaining(RR_TIMESLICE_TICKS);
+            Self::reset_rr_slice(&task);
         }
         self.clock = next_clock;
         Ok(())
@@ -1308,7 +1588,10 @@ impl<T> EEVDFScheduler<T> {
                 weight,
                 next_clock.total_weight,
                 next_clock.v,
-                fork_seed.map_or(0, |seed| seed.lag),
+                fork_lag_for_class(
+                    fork_seed,
+                    fair_class(params.class).expect("fair class conversion failed"),
+                ),
             )
             .map_err(model_error)
             {
@@ -1326,13 +1609,19 @@ impl<T> EEVDFScheduler<T> {
             return Err(EevdfReservationCommitError { kind, reservation });
         }
         if matches!(params.class, EevdfTaskClass::RoundRobin) {
-            task.set_rr_remaining(RR_TIMESLICE_TICKS);
+            Self::reset_rr_slice(&task);
         }
         // SAFETY: the reservation's CONFIGURING claim excludes all state
         // access until this publication completes.
         unsafe {
             let state = task.owned_state_mut();
             state.entity = entity;
+            state.runtime_remainder_ns = 0;
+            state.runtime_fraction_remainder_ns = 0;
+            state.runtime_fraction_period_ns = 0;
+            state.runtime_fraction_class = EevdfTaskClass::Normal;
+            state.runtime_fraction_weight = 0;
+            state.rr_fraction_q = 0;
             state.migration = None;
             state.dormant_fair = None;
             state.rt_sleeping = false;
@@ -1422,6 +1711,12 @@ impl<T> EEVDFScheduler<T> {
                 source_key,
                 source_eligible_at,
                 removed.rr_remaining(),
+                old_state.runtime_remainder_ns,
+                old_state.runtime_fraction_remainder_ns,
+                old_state.runtime_fraction_period_ns,
+                old_state.runtime_fraction_class,
+                old_state.runtime_fraction_weight,
+                old_state.rr_fraction_q,
                 old_state.dormant_fair,
                 EevdfMigrationOrigin::Ready,
             );
@@ -1438,6 +1733,7 @@ impl<T> EEVDFScheduler<T> {
         task: &Arc<EEVDFTask<T>>,
     ) -> Result<EevdfMigration<T>, SchedulerError> {
         self.ensure_running(task)?;
+        self.settle_before_lifecycle(task)?;
         let source_clock = self.clock;
         let params = task.sched_params();
         let old_state = unsafe { *task.owned_state() };
@@ -1472,6 +1768,12 @@ impl<T> EEVDFScheduler<T> {
                 source_key,
                 source_eligible_at,
                 task.rr_remaining(),
+                old_state.runtime_remainder_ns,
+                old_state.runtime_fraction_remainder_ns,
+                old_state.runtime_fraction_period_ns,
+                old_state.runtime_fraction_class,
+                old_state.runtime_fraction_weight,
+                old_state.rr_fraction_q,
                 old_state.dormant_fair,
                 EevdfMigrationOrigin::Running,
             );
@@ -1596,16 +1898,25 @@ impl<T> EEVDFScheduler<T> {
         ) {
             return Err(Self::migration_error(kind, migration));
         }
-        if matches!(metadata.params.class, EevdfTaskClass::RoundRobin) && metadata.rr_remaining == 0
-        {
-            task.set_rr_remaining(RR_TIMESLICE_TICKS);
+        let renew_rr = matches!(metadata.params.class, EevdfTaskClass::RoundRobin)
+            && metadata.rr_remaining == 0;
+        if renew_rr {
+            Self::reset_rr_slice(&task);
         } else {
             task.set_rr_remaining(metadata.rr_remaining);
+            // SAFETY: CONFIGURING excludes all task-state access.
+            unsafe { task.owned_state_mut().rr_fraction_q = metadata.rr_fraction_q };
         }
         // SAFETY: the task remains behind CONFIGURING until publication.
         unsafe {
             let state = task.owned_state_mut();
             state.entity = entity;
+            state.runtime_remainder_ns = metadata.runtime_remainder_ns;
+            state.runtime_fraction_remainder_ns = metadata.runtime_fraction_remainder_ns;
+            state.runtime_fraction_period_ns = metadata.runtime_fraction_period_ns;
+            state.runtime_fraction_class = metadata.runtime_fraction_class;
+            state.runtime_fraction_weight = metadata.runtime_fraction_weight;
+            state.rr_fraction_q = if renew_rr { 0 } else { metadata.rr_fraction_q };
             state.dormant_fair = metadata.dormant_fair;
             state.migration = None;
             state.rt_sleeping = false;
@@ -1725,19 +2036,24 @@ impl<T> EEVDFScheduler<T> {
         ) {
             return Err(Self::migration_error(kind, migration));
         }
-        let rr_remaining = if matches!(metadata.params.class, EevdfTaskClass::RoundRobin)
+        let renew_rr = matches!(metadata.params.class, EevdfTaskClass::RoundRobin)
             && matches!(metadata.origin, EevdfMigrationOrigin::Running)
-            && metadata.rr_remaining == 0
-        {
+            && metadata.rr_remaining == 0;
+        task.set_rr_remaining(if renew_rr {
             RR_TIMESLICE_TICKS
         } else {
             metadata.rr_remaining
-        };
-        task.set_rr_remaining(rr_remaining);
+        });
         // SAFETY: CONFIGURING excludes all task-state access.
         unsafe {
             let state = task.owned_state_mut();
             state.entity = entity;
+            state.runtime_remainder_ns = metadata.runtime_remainder_ns;
+            state.runtime_fraction_remainder_ns = metadata.runtime_fraction_remainder_ns;
+            state.runtime_fraction_period_ns = metadata.runtime_fraction_period_ns;
+            state.runtime_fraction_class = metadata.runtime_fraction_class;
+            state.runtime_fraction_weight = metadata.runtime_fraction_weight;
+            state.rr_fraction_q = if renew_rr { 0 } else { metadata.rr_fraction_q };
             state.dormant_fair = metadata.dormant_fair;
             state.migration = None;
             state.rt_sleeping = false;
@@ -1917,6 +2233,19 @@ impl<T> EEVDFScheduler<T> {
         task: &Arc<EEVDFTask<T>>,
         params: EevdfTaskParams,
     ) -> Result<EevdfParamUpdate<T>, SchedulerError> {
+        self.set_task_params_impl(task, params, false)
+    }
+
+    fn set_task_params_impl(
+        &mut self,
+        task: &Arc<EEVDFTask<T>>,
+        params: EevdfTaskParams,
+        // A runtime-aware boundary has already settled all wall-clock service
+        // under the old tuple. Any remaining conversion residue belongs to
+        // that old class/weight and is cleared at a changed tuple boundary;
+        // it must never be reinterpreted by the new publication.
+        allow_settled_fraction: bool,
+    ) -> Result<EevdfParamUpdate<T>, SchedulerError> {
         let params = params
             .validated()
             .ok_or(SchedulerError::InvalidParameters)?;
@@ -1932,7 +2261,19 @@ impl<T> EEVDFScheduler<T> {
                     drop(claim);
                     return Err(SchedulerError::TaskBusy);
                 }
+                if state.runtime_remainder_ns != 0
+                    || (!allow_settled_fraction && state.runtime_fraction_remainder_ns != 0)
+                {
+                    drop(claim);
+                    return Err(SchedulerError::InconsistentState);
+                }
                 let old_params = task.sched_params();
+                Self::validate_runtime_fraction_owner(task, state)?;
+                let old_fraction_weight = Self::runtime_fraction_weight(old_params)?;
+                let new_fraction_weight = Self::runtime_fraction_weight(params)?;
+                let clear_fraction = state.runtime_fraction_remainder_ns != 0
+                    && (old_params.class != params.class
+                        || old_fraction_weight != new_fraction_weight);
                 if state.entity.is_none() && !state.rt_sleeping && state.dormant_fair.is_none() {
                     // A fork seed is fair-only metadata.  Reconfiguration is
                     // allowed before admission, so moving a seeded child to
@@ -1941,6 +2282,9 @@ impl<T> EEVDFScheduler<T> {
                         let next = task.owned_state_mut();
                         if is_rt_class(params.class) {
                             next.fork_seed = None;
+                        }
+                        if clear_fraction {
+                            Self::clear_runtime_fraction(next);
                         }
                     }
                     task.value().apply_validated(params);
@@ -1952,9 +2296,19 @@ impl<T> EEVDFScheduler<T> {
                 unsafe {
                     let next = task.owned_state_mut();
                     next.entity = entity;
+                    next.rr_fraction_q = if matches!(old_params.class, EevdfTaskClass::RoundRobin)
+                        && matches!(params.class, EevdfTaskClass::RoundRobin)
+                    {
+                        state.rr_fraction_q
+                    } else {
+                        0
+                    };
                     next.dormant_fair = dormant;
                     next.rt_sleeping = rt_sleeping;
                     next.sleep_v = state.sleep_v;
+                    if clear_fraction {
+                        Self::clear_runtime_fraction(next);
+                    }
                     task.value().publish_validated(
                         params,
                         Self::next_rr_budget(old_params, params, task.rr_remaining()),
@@ -1966,6 +2320,17 @@ impl<T> EEVDFScheduler<T> {
             _ => {
                 let old_params = task.sched_params();
                 let old_state = unsafe { *task.owned_state() };
+                if old_state.runtime_remainder_ns != 0
+                    || (!allow_settled_fraction && old_state.runtime_fraction_remainder_ns != 0)
+                {
+                    return Err(SchedulerError::InconsistentState);
+                }
+                Self::validate_runtime_fraction_owner(task, old_state)?;
+                let old_fraction_weight = Self::runtime_fraction_weight(old_params)?;
+                let new_fraction_weight = Self::runtime_fraction_weight(params)?;
+                let clear_fraction = old_state.runtime_fraction_remainder_ns != 0
+                    && (old_params.class != params.class
+                        || old_fraction_weight != new_fraction_weight);
                 let running = self
                     .running
                     .as_ref()
@@ -2071,10 +2436,20 @@ impl<T> EEVDFScheduler<T> {
                 unsafe {
                     let next = task.owned_state_mut();
                     next.entity = entity;
+                    next.rr_fraction_q = if matches!(old_params.class, EevdfTaskClass::RoundRobin)
+                        && matches!(params.class, EevdfTaskClass::RoundRobin)
+                    {
+                        old_state.rr_fraction_q
+                    } else {
+                        0
+                    };
                     next.dormant_fair = dormant;
                     next.rt_sleeping = false;
                     next.migration = None;
                     next.sleep_v = None;
+                    if clear_fraction {
+                        Self::clear_runtime_fraction(next);
+                    }
                 }
                 task.value().publish_validated(params, next_rr);
                 self.clock = next_clock;
@@ -2084,10 +2459,59 @@ impl<T> EEVDFScheduler<T> {
         }
     }
 
+    /// Set parameters after materializing the current owner's pending
+    /// sub-period service under the old tuple.  This boundary is intentionally
+    /// separate from the legacy no-runtime API so model-only callers can keep
+    /// their existing transaction shape.
+    pub fn set_task_params_with_runtime(
+        &mut self,
+        task: &Arc<EEVDFTask<T>>,
+        params: EevdfTaskParams,
+        period_ns: u64,
+    ) -> Result<EevdfParamUpdate<T>, SchedulerError> {
+        if params.validated().is_none() {
+            return Err(SchedulerError::InvalidParameters);
+        }
+        let running = self
+            .running
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, task));
+        if running {
+            let before_clock = self.clock;
+            let before_state = unsafe { *task.owned_state() };
+            let before_rr = task.rr_remaining();
+            self.settle_runtime_remainder(task, period_ns)?;
+            let result = self.set_task_params_impl(task, params, true);
+            if result.is_err() {
+                // Runtime settlement and parameter publication form one
+                // boundary transaction. A failed replacement key/weight
+                // calculation must not leave old-tuple service committed
+                // while the old tuple remains published.
+                self.clock = before_clock;
+                unsafe { *task.owned_state_mut() = before_state };
+                task.set_rr_remaining(before_rr);
+            }
+            return result;
+        }
+        // Non-running tasks are validated and claimed by the ordinary
+        // parameter transaction below.  Never inspect their UnsafeCell state
+        // through an UNOWNED/CONFIGURING race here.
+        self.set_task_params_impl(task, params, true)
+    }
+
     pub fn set_priority(
         &mut self,
         task: &Arc<EEVDFTask<T>>,
         prio: isize,
+    ) -> Result<EevdfParamUpdate<T>, SchedulerError> {
+        self.set_priority_impl(task, prio, false)
+    }
+
+    fn set_priority_impl(
+        &mut self,
+        task: &Arc<EEVDFTask<T>>,
+        prio: isize,
+        allow_settled_fraction: bool,
     ) -> Result<EevdfParamUpdate<T>, SchedulerError> {
         if !(-20..=19).contains(&prio) {
             return Err(SchedulerError::InvalidParameters);
@@ -2095,7 +2519,7 @@ impl<T> EEVDFScheduler<T> {
         match task.owner() {
             CONFIGURING => return Err(SchedulerError::TaskBusy),
             owner if owner != UNOWNED && (self.id == UNOWNED || owner != self.id) => {
-                return Err(SchedulerError::ForeignQueue)
+                return Err(SchedulerError::ForeignQueue);
             }
             _ => {}
         }
@@ -2103,14 +2527,44 @@ impl<T> EEVDFScheduler<T> {
         if is_rt_class(current.class) {
             return Err(SchedulerError::IncompatibleClass);
         }
-        self.set_task_params(
+        self.set_task_params_impl(
             task,
             EevdfTaskParams {
                 class: current.class,
                 nice: prio as i8,
                 rt_priority: 0,
             },
+            allow_settled_fraction,
         )
+    }
+
+    pub fn set_priority_with_runtime(
+        &mut self,
+        task: &Arc<EEVDFTask<T>>,
+        prio: isize,
+        period_ns: u64,
+    ) -> Result<EevdfParamUpdate<T>, SchedulerError> {
+        if !(-20..=19).contains(&prio) {
+            return Err(SchedulerError::InvalidParameters);
+        }
+        let running = self
+            .running
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, task));
+        if running {
+            let before_clock = self.clock;
+            let before_state = unsafe { *task.owned_state() };
+            let before_rr = task.rr_remaining();
+            self.settle_runtime_remainder(task, period_ns)?;
+            let result = self.set_priority_impl(task, prio, true);
+            if result.is_err() {
+                self.clock = before_clock;
+                unsafe { *task.owned_state_mut() = before_state };
+                task.set_rr_remaining(before_rr);
+            }
+            return result;
+        }
+        self.set_priority_impl(task, prio, true)
     }
 
     fn enqueue_wakeup(&mut self, task: Arc<EEVDFTask<T>>) -> Result<(), SchedulerError> {
@@ -2253,7 +2707,7 @@ impl<T> EEVDFScheduler<T> {
             return Err(error);
         }
         if reset_rr {
-            task.set_rr_remaining(RR_TIMESLICE_TICKS);
+            Self::reset_rr_slice(&task);
         }
         // SAFETY: owner and tree exclusion are held for the complete state
         // publication.
@@ -2264,7 +2718,7 @@ impl<T> EEVDFScheduler<T> {
             task.owned_state_mut().sleep_v = None;
         }
         if matches!(params.class, EevdfTaskClass::RoundRobin) {
-            task.set_rr_remaining(RR_TIMESLICE_TICKS);
+            Self::reset_rr_slice(&task);
         }
         self.clock = next_clock;
         Ok(())
@@ -2331,7 +2785,10 @@ impl<T> EEVDFScheduler<T> {
                 weight,
                 next_clock.total_weight,
                 next_clock.v,
-                fork_seed.map_or(0, |seed| seed.lag),
+                fork_lag_for_class(
+                    fork_seed,
+                    fair_class(params.class).expect("fair class conversion failed"),
+                ),
             )
             .map_err(model_error)
             {
@@ -2354,7 +2811,7 @@ impl<T> EEVDFScheduler<T> {
             task.owned_state_mut().sleep_v = None;
         }
         if matches!(params.class, EevdfTaskClass::RoundRobin) {
-            task.set_rr_remaining(RR_TIMESLICE_TICKS);
+            Self::reset_rr_slice(task);
         }
         self.clock = next_clock;
         self.running = Some(Arc::clone(task));
@@ -2369,6 +2826,11 @@ impl<T> EEVDFScheduler<T> {
         // The first current task in axtask may be virgin and never have gone
         // through New.  Adopt it before applying Yield/Preempt semantics.
         self.ensure_running(&prev)?;
+        // A direct scheduler caller may hand the current task back without
+        // first going through the task-layer runtime hook.  Materialize that
+        // token at the ownership boundary so Yield/Preempt cannot defer old
+        // service into the next request or RR slice.
+        self.settle_before_lifecycle(&prev)?;
         let params = prev.sched_params();
         let old_key = unsafe { prev.key() };
         let old_eligible_at = unsafe { prev.eligible_at() };
@@ -2414,7 +2876,7 @@ impl<T> EEVDFScheduler<T> {
             return Err(error);
         }
         if reset_rr {
-            prev.set_rr_remaining(RR_TIMESLICE_TICKS);
+            Self::reset_rr_slice(&prev);
         }
         // SAFETY: the task is still owned by this scheduler and is now
         // linked in its one ready tree.
@@ -2467,6 +2929,12 @@ impl<T> EEVDFScheduler<T> {
         // by this scheduler until the owner word is released below.
         unsafe {
             removed.owned_state_mut().entity = None;
+            removed.owned_state_mut().runtime_remainder_ns = 0;
+            removed.owned_state_mut().runtime_fraction_remainder_ns = 0;
+            removed.owned_state_mut().runtime_fraction_period_ns = 0;
+            removed.owned_state_mut().runtime_fraction_class = EevdfTaskClass::Normal;
+            removed.owned_state_mut().runtime_fraction_weight = 0;
+            removed.owned_state_mut().rr_fraction_q = 0;
             removed.owned_state_mut().migration = None;
             removed.owned_state_mut().dormant_fair = None;
             removed.owned_state_mut().rt_sleeping = false;
@@ -2573,80 +3041,348 @@ impl<T> EEVDFScheduler<T> {
             .pop_earliest_eligible(bias_i128(self.clock.v))
     }
 
-    fn tick_fair(&mut self, current: &Arc<EEVDFTask<T>>) -> bool {
-        let entity =
-            unsafe { current.owned_state().entity }.expect("EEVDF fair current has no entity");
-        if entity.request.remaining() == 0 {
-            if !self.ready_tree.is_empty() {
-                return true;
-            }
-            let mut renewed = entity;
-            renewed
-                .renew(self.clock.total_weight, self.clock.v)
-                .expect("EEVDF infallible tick renewal exhausted arithmetic");
-            // No ready competitor exists, so renewal is committed in place.
-            unsafe { current.owned_state_mut().entity = Some(renewed) };
-        }
+    fn tick_fair_bulk(&mut self, current: &Arc<EEVDFTask<T>>, ticks: u128) -> bool {
+        self.fair_service_transaction(current, ticks, 0)
+            .expect("EEVDF infallible bulk service exhausted arithmetic")
+    }
 
+    fn tick_fair(&mut self, current: &Arc<EEVDFTask<T>>) -> bool {
+        self.tick_fair_bulk(current, 1)
+    }
+
+    /// Apply one staged fair-service sample.  The entity and queue clock are
+    /// copied first, including any request renewal required at an ownership
+    /// boundary; only the final checked state is published.
+    fn fair_service_transaction(
+        &mut self,
+        current: &Arc<EEVDFTask<T>>,
+        ticks: u128,
+        fraction_q: u64,
+    ) -> Result<bool, SchedulerError> {
+        if ticks == 0 && fraction_q == 0 {
+            return Ok(false);
+        }
+        let entity = unsafe {
+            current
+                .owned_state()
+                .entity
+                .ok_or(SchedulerError::InconsistentState)?
+        };
         let mut next_clock = self.clock;
-        let mut next_entity =
-            unsafe { current.owned_state().entity }.expect("EEVDF fair current entity disappeared");
-        next_entity
-            .tick_service(&mut next_clock, 1)
-            .expect("EEVDF infallible tick service exhausted arithmetic");
-        self.clock = next_clock;
-        unsafe { current.owned_state_mut().entity = Some(next_entity) };
+        let mut next_entity = entity;
+        let mut reschedule = false;
+        if next_entity.request.is_exhausted() && !self.ready_tree.is_empty() {
+            next_entity
+                .service(&mut next_clock, ticks, u128::from(fraction_q))
+                .map_err(model_error)?;
+            reschedule = true;
+        } else {
+            if next_entity.request.is_exhausted() {
+                next_entity
+                    .renew(next_clock.total_weight, next_clock.v)
+                    .map_err(model_error)?;
+            }
+            next_entity
+                .service(&mut next_clock, ticks, u128::from(fraction_q))
+                .map_err(model_error)?;
+        }
 
         if self.has_ready_rt() {
-            return true;
-        }
-        let current_eligible = next_entity
-            .is_eligible(self.clock.v)
-            .expect("EEVDF infallible tick eligibility check exhausted arithmetic");
-        if current_eligible {
-            let deadline = next_entity.request.deadline;
-            if self.has_earlier_eligible_fair(deadline) {
-                return true;
+            reschedule = true;
+        } else {
+            let current_eligible = next_entity.is_eligible(next_clock.v).map_err(model_error)?;
+            if current_eligible {
+                if self.has_earlier_eligible_fair(next_entity.request.deadline) {
+                    reschedule = true;
+                }
+            } else if self
+                .ready_tree
+                .peek_earliest_eligible(bias_i128(next_clock.v))
+                .is_some()
+            {
+                reschedule = true;
             }
-        } else if self
-            .ready_tree
-            .peek_earliest_eligible(bias_i128(self.clock.v))
-            .is_some()
-        {
-            return true;
         }
-        if next_entity.request.remaining() == 0 {
+        if next_entity.request.is_exhausted() {
             if !self.ready_tree.is_empty() {
-                return true;
+                reschedule = true;
+            } else {
+                next_entity
+                    .renew(next_clock.total_weight, next_clock.v)
+                    .map_err(model_error)?;
             }
-            let mut renewed = next_entity;
-            renewed
-                .renew(self.clock.total_weight, self.clock.v)
-                .expect("EEVDF infallible tick renewal exhausted arithmetic");
-            unsafe { current.owned_state_mut().entity = Some(renewed) };
         }
-        false
+
+        self.clock = next_clock;
+        unsafe { current.owned_state_mut().entity = Some(next_entity) };
+        Ok(reschedule)
+    }
+
+    /// Apply whole and Q32 service to a round-robin budget as one staged
+    /// transaction.  `rr_fraction_q` is progress within the current integer
+    /// tick; combining it with a later whole-tick sample is necessary to
+    /// avoid either losing the fractional service or charging a renewed slice
+    /// twice.
+    fn rr_service_transaction(
+        &mut self,
+        current: &Arc<EEVDFTask<T>>,
+        ticks: u128,
+        fraction_q: u64,
+    ) -> Result<bool, SchedulerError> {
+        if ticks == 0 && fraction_q == 0 {
+            return Ok(false);
+        }
+        let params = current.sched_params();
+        if !matches!(params.class, EevdfTaskClass::RoundRobin) {
+            return Ok(self.has_higher_rt(params.rt_priority));
+        }
+        let state = unsafe { *current.owned_state() };
+        let old_fraction = u128::from(state.rr_fraction_q);
+        if old_fraction >= ONE {
+            return Err(SchedulerError::InconsistentState);
+        }
+        let fraction_total = old_fraction
+            .checked_add(u128::from(fraction_q))
+            .ok_or(SchedulerError::ArithmeticExhausted)?;
+        let carried_ticks = fraction_total / ONE;
+        let next_fraction = (fraction_total % ONE) as u64;
+        let service_ticks = ticks
+            .checked_add(carried_ticks)
+            .ok_or(SchedulerError::ArithmeticExhausted)?;
+        let before = current.rr_remaining() as u128;
+        let higher = self.has_higher_rt(params.rt_priority);
+        let same = self.has_same_rt(params.rt_priority);
+        let mut reschedule = higher;
+
+        let (next_remaining, next_rr_fraction) = if higher {
+            // Higher-priority RT work preempts the current owner, but service
+            // already observed by this boundary is still accounted.  Keep a
+            // non-exhausted budget for the eventual resume and discard only
+            // the exhausted boundary below.
+            if before == 0 || service_ticks >= before {
+                reschedule = true;
+                (0, 0)
+            } else {
+                ((before - service_ticks) as usize, next_fraction)
+            }
+        } else if before == 0 {
+            // A zero budget is the published exhausted marker after a peer
+            // boundary.  The first subsequent sample renews the slice; its
+            // first whole tick is the renewal event itself, matching the
+            // existing RR handoff semantics.
+            if same {
+                reschedule = true;
+                (0, 0)
+            } else {
+                let consumed_after_renewal = service_ticks.saturating_sub(1);
+                let slice = RR_TIMESLICE_TICKS as u128;
+                let within = consumed_after_renewal % slice;
+                let remaining = if within == 0 { slice } else { slice - within };
+                (remaining as usize, next_fraction)
+            }
+        } else if service_ticks < before {
+            ((before - service_ticks) as usize, next_fraction)
+        } else if same {
+            // Equal-priority work must observe an exhausted budget at the
+            // boundary, including a boundary reached solely by Q32 service.
+            reschedule = true;
+            (0, 0)
+        } else {
+            // No peer is waiting.  Carry any overshoot into a fresh slice in
+            // constant time; the fractional part belongs to that fresh slice
+            // and is not stale progress from the exhausted one.
+            let after_boundary = service_ticks - before;
+            let slice = RR_TIMESLICE_TICKS as u128;
+            let within = after_boundary % slice;
+            let remaining = if within == 0 { slice } else { slice - within };
+            (remaining as usize, next_fraction)
+        };
+
+        current.set_rr_remaining(next_remaining);
+        unsafe { current.owned_state_mut().rr_fraction_q = next_rr_fraction };
+        Ok(reschedule)
+    }
+
+    fn tick_rt_bulk(&mut self, current: &Arc<EEVDFTask<T>>, ticks: u128) -> bool {
+        self.rr_service_transaction(current, ticks, 0)
+            .expect("EEVDF RT bulk service exhausted arithmetic")
     }
 
     fn tick_rt(&mut self, current: &Arc<EEVDFTask<T>>) -> bool {
-        let params = current.sched_params();
-        if self.has_higher_rt(params.rt_priority) {
-            return true;
+        self.tick_rt_bulk(current, 1)
+    }
+
+    /// Materialize a current task's sub-period token using the parameters
+    /// that are still published.  This is deliberately local to the owner
+    /// transaction: no absolute clock/entity snapshot crosses yield, sleep,
+    /// or migration.
+    pub fn settle_runtime_remainder(
+        &mut self,
+        current: &Arc<EEVDFTask<T>>,
+        period_ns: u64,
+    ) -> Result<bool, SchedulerError> {
+        self.ensure_running(current)?;
+        if period_ns == 0 {
+            return Err(SchedulerError::InconsistentState);
         }
-        if matches!(params.class, EevdfTaskClass::Fifo) {
-            return false;
+        let state = unsafe { *current.owned_state() };
+        if state.runtime_remainder_ns >= period_ns
+            || (state.runtime_remainder_ns != 0
+                && state.runtime_fraction_period_ns != 0
+                && state.runtime_fraction_period_ns != period_ns)
+            || (state.runtime_fraction_remainder_ns != 0
+                && (state.runtime_fraction_period_ns == 0
+                    || state.runtime_fraction_remainder_ns >= state.runtime_fraction_period_ns))
+        {
+            return Err(SchedulerError::InconsistentState);
         }
-        let remaining = current.rr_remaining();
-        if remaining <= 1 {
-            current.set_rr_remaining(0);
-            if self.has_same_rt(params.rt_priority) {
-                return true;
-            }
-            current.set_rr_remaining(RR_TIMESLICE_TICKS);
+        Self::validate_runtime_fraction_owner(current, state)?;
+        if state.runtime_fraction_remainder_ns != 0 && state.runtime_fraction_period_ns != period_ns
+        {
+            // A conversion residue is still runtime in the old tuple.  Do not
+            // silently reinterpret it under a new period/class context.
+            return Err(SchedulerError::InconsistentState);
+        }
+        let old_remainder = if state.runtime_fraction_period_ns == period_ns {
+            state.runtime_fraction_remainder_ns
         } else {
-            current.set_rr_remaining(remaining - 1);
+            0
+        };
+        let numerator = u128::from(state.runtime_remainder_ns)
+            .checked_mul(ONE)
+            .and_then(|value| value.checked_add(u128::from(old_remainder)))
+            .ok_or(SchedulerError::ArithmeticExhausted)?;
+        let fraction_ticks = numerator / u128::from(period_ns);
+        if fraction_ticks > ONE {
+            return Err(SchedulerError::InconsistentState);
         }
-        false
+        let conversion_remainder = (numerator % u128::from(period_ns)) as u64;
+        let whole = (fraction_ticks / ONE) as u128;
+        let fraction_q = (fraction_ticks % ONE) as u64;
+        let params = current.sched_params();
+        let fraction_weight = Self::runtime_fraction_weight(params)?;
+        let reschedule = if is_rt_class(params.class) {
+            if matches!(params.class, EevdfTaskClass::RoundRobin) {
+                self.rr_service_transaction(current, whole, fraction_q)?
+            } else {
+                self.has_higher_rt(params.rt_priority)
+            }
+        } else {
+            // `fair_service_transaction` stages the whole and fractional
+            // portions together; no clock/entity mutation can precede a later
+            // arithmetic failure in the same boundary.
+            self.fair_service_transaction(current, whole, fraction_q)?
+        };
+        unsafe {
+            let state = current.owned_state_mut();
+            state.runtime_remainder_ns = 0;
+            Self::publish_runtime_fraction_owner(
+                state,
+                params,
+                fraction_weight,
+                conversion_remainder,
+                period_ns,
+            );
+        }
+        Ok(reschedule)
+    }
+
+    /// Account an explicit wall-clock sample without consulting a platform
+    /// clock.  Sub-period runtime is retained in the task-owned state slot so
+    /// yielding twice at half a period is equivalent to one full period of
+    /// service.  Bulk service is a single model transaction; a missed timer
+    /// boundary therefore cannot turn into an unbounded per-tick operation.
+    fn account_runtime_delta(&mut self, current: &Arc<EEVDFTask<T>>, delta: RuntimeDelta) -> bool {
+        self.account_runtime_transaction(current, delta)
+            .expect("EEVDF runtime accounting exhausted arithmetic")
+    }
+
+    fn account_runtime_transaction(
+        &mut self,
+        current: &Arc<EEVDFTask<T>>,
+        delta: RuntimeDelta,
+    ) -> Result<bool, SchedulerError> {
+        let period = delta.period_ns();
+        if period == 0 {
+            return Err(SchedulerError::InconsistentState);
+        }
+        let state = unsafe { *current.owned_state() };
+        if state.runtime_remainder_ns >= period
+            || (state.runtime_remainder_ns != 0
+                && state.runtime_fraction_period_ns != 0
+                && state.runtime_fraction_period_ns != period)
+            || (state.runtime_fraction_remainder_ns != 0
+                && (state.runtime_fraction_period_ns == 0
+                    || state.runtime_fraction_remainder_ns >= state.runtime_fraction_period_ns))
+            || (state.runtime_fraction_remainder_ns != 0
+                && state.runtime_fraction_period_ns != period)
+        {
+            return Err(SchedulerError::InconsistentState);
+        }
+        Self::validate_runtime_fraction_owner(current, state)?;
+        let params = current.sched_params();
+        let fraction_weight = Self::runtime_fraction_weight(params)?;
+        let total = u128::from(state.runtime_remainder_ns)
+            .checked_add(u128::from(delta.elapsed_ns()))
+            .ok_or(SchedulerError::ArithmeticExhausted)?;
+        let mut periods = total / u128::from(period);
+        let remainder = (total % u128::from(period)) as u64;
+        let old_remainder = if state.runtime_fraction_period_ns == period {
+            state.runtime_fraction_remainder_ns
+        } else {
+            0
+        };
+        let numerator = u128::from(remainder)
+            .checked_mul(ONE)
+            .and_then(|value| value.checked_add(u128::from(old_remainder)))
+            .ok_or(SchedulerError::ArithmeticExhausted)?;
+        let extra_q = numerator / u128::from(period);
+        let conversion_remainder = (numerator % u128::from(period)) as u64;
+        if extra_q >= ONE {
+            periods = periods
+                .checked_add(extra_q / ONE)
+                .ok_or(SchedulerError::ArithmeticExhausted)?;
+        }
+        let next_remainder = if extra_q >= ONE { 0 } else { remainder };
+        let reschedule = if periods == 0 {
+            false
+        } else if is_rt_class(params.class) {
+            // `extra_q < ONE` is backed by `next_remainder` and remains
+            // deferred until the explicit settlement boundary; only the
+            // whole periods are materialized here.
+            self.rr_service_transaction(current, periods, 0)?
+        } else {
+            self.fair_service_transaction(current, periods, 0)?
+        };
+
+        // The model transaction above is the only fallible state transition.
+        // Publishing this bounded conversion token cannot fail, so a retry
+        // after an arithmetic error observes the original bytes exactly.
+        unsafe {
+            let state = current.owned_state_mut();
+            state.runtime_remainder_ns = next_remainder;
+            // Keep the new fixed-point conversion residue even when it did
+            // not yet produce a whole scheduler tick.  Reusing
+            // `old_remainder` here drops the low bits of a second fragment;
+            // repeated sub-period samples then slowly lose service.
+            Self::publish_runtime_fraction_owner(
+                state,
+                params,
+                fraction_weight,
+                conversion_remainder,
+                period,
+            );
+        }
+        Ok(reschedule)
+    }
+
+    fn settle_before_lifecycle(&mut self, task: &Arc<EEVDFTask<T>>) -> Result<(), SchedulerError> {
+        let state = unsafe { *task.owned_state() };
+        if state.runtime_remainder_ns != 0 || state.runtime_fraction_remainder_ns != 0 {
+            let period = state.runtime_fraction_period_ns;
+            self.settle_runtime_remainder(task, period)?;
+        }
+        Ok(())
     }
 }
 
@@ -2676,6 +3412,10 @@ impl<T> BaseScheduler for EEVDFScheduler<T> {
 
     fn deactivate_task(&mut self, task: &Self::SchedItem, reason: DeactivateReason) {
         if matches!(reason, DeactivateReason::Migrate) {
+            self.ensure_running(task)
+                .expect("EEVDF deactivate current validation failed");
+            self.settle_before_lifecycle(task)
+                .expect("EEVDF lifecycle boundary retained invalid runtime state");
             let migration = self
                 .begin_running_migration(task)
                 .expect("EEVDF running migration preparation failed");
@@ -2686,6 +3426,12 @@ impl<T> BaseScheduler for EEVDFScheduler<T> {
         }
         self.ensure_running(task)
             .expect("EEVDF deactivate current validation failed");
+        // The scheduler trait is infallible at lifecycle edges, so the task
+        // state carries the period captured by the last runtime sample. This
+        // closes direct scheduler callers as well as the axtask integration;
+        // no pending wall time can silently cross Sleep/Exit/Migrate.
+        self.settle_before_lifecycle(task)
+            .expect("EEVDF lifecycle boundary retained invalid runtime state");
         match reason {
             DeactivateReason::Sleep => {
                 let params = task.sched_params();
@@ -2738,6 +3484,12 @@ impl<T> BaseScheduler for EEVDFScheduler<T> {
                 };
                 unsafe {
                     task.owned_state_mut().entity = None;
+                    task.owned_state_mut().runtime_remainder_ns = 0;
+                    task.owned_state_mut().runtime_fraction_remainder_ns = 0;
+                    task.owned_state_mut().runtime_fraction_period_ns = 0;
+                    task.owned_state_mut().runtime_fraction_class = EevdfTaskClass::Normal;
+                    task.owned_state_mut().runtime_fraction_weight = 0;
+                    task.owned_state_mut().rr_fraction_q = 0;
                     task.owned_state_mut().migration = None;
                     task.owned_state_mut().dormant_fair = None;
                     task.owned_state_mut().rt_sleeping = false;
@@ -2803,6 +3555,12 @@ impl<T> BaseScheduler for EEVDFScheduler<T> {
         }
     }
 
+    fn account_runtime(&mut self, current: &Self::SchedItem, delta: RuntimeDelta) -> bool {
+        self.ensure_running(current)
+            .expect("EEVDF runtime accounting current validation failed");
+        self.account_runtime_delta(current, delta)
+    }
+
     fn set_priority(&mut self, task: &Self::SchedItem, prio: isize) -> Result<(), SchedulerError> {
         EEVDFScheduler::set_priority(self, task, prio).map(|_| ())
     }
@@ -2830,6 +3588,12 @@ impl<T> Drop for EEVDFScheduler<T> {
             // re-admittable after this scheduler is dropped.
             unsafe {
                 task.owned_state_mut().entity = None;
+                task.owned_state_mut().runtime_remainder_ns = 0;
+                task.owned_state_mut().runtime_fraction_remainder_ns = 0;
+                task.owned_state_mut().runtime_fraction_period_ns = 0;
+                task.owned_state_mut().runtime_fraction_class = EevdfTaskClass::Normal;
+                task.owned_state_mut().runtime_fraction_weight = 0;
+                task.owned_state_mut().rr_fraction_q = 0;
                 task.owned_state_mut().migration = None;
                 task.owned_state_mut().dormant_fair = None;
                 task.owned_state_mut().rt_sleeping = false;
@@ -2845,6 +3609,12 @@ impl<T> Drop for EEVDFScheduler<T> {
             // claim is released below.
             unsafe {
                 task.owned_state_mut().entity = None;
+                task.owned_state_mut().runtime_remainder_ns = 0;
+                task.owned_state_mut().runtime_fraction_remainder_ns = 0;
+                task.owned_state_mut().runtime_fraction_period_ns = 0;
+                task.owned_state_mut().runtime_fraction_class = EevdfTaskClass::Normal;
+                task.owned_state_mut().runtime_fraction_weight = 0;
+                task.owned_state_mut().rr_fraction_q = 0;
                 task.owned_state_mut().migration = None;
                 task.owned_state_mut().dormant_fair = None;
                 task.owned_state_mut().rt_sleeping = false;
@@ -2865,6 +3635,609 @@ mod tests {
     fn assert_send<T: Send>() {}
     fn assert_sync<T: Sync>() {}
     fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn runtime_accounting_carries_subperiod_and_is_idempotent_at_same_boundary() {
+        let mut scheduler = EEVDFScheduler::new();
+        let task = Arc::new(EEVDFTask::new(1usize));
+        scheduler.add_task(task).unwrap();
+        let current = scheduler.pick_next_task().unwrap();
+        let before = scheduler.clock();
+        let half = RuntimeDelta::new(5_000_000, 10_000_000);
+
+        assert!(!scheduler.account_runtime(&current, half));
+        assert_eq!(scheduler.clock(), before);
+        assert_eq!(
+            unsafe { current.owned_state().runtime_remainder_ns },
+            5_000_000
+        );
+
+        // A second half-period completes exactly one scheduler period.
+        assert!(!scheduler.account_runtime(&current, half));
+        assert_eq!(scheduler.clock().accounted_ticks, 1);
+        assert_eq!(unsafe { current.owned_state().runtime_remainder_ns }, 0);
+
+        // Replaying the same timestamp produces a zero token and cannot
+        // double-charge the current entity.
+        let after = scheduler.clock();
+        assert!(!scheduler.account_runtime(&current, RuntimeDelta::new(0, 10_000_000)));
+        assert_eq!(scheduler.clock(), after);
+        assert_eq!(unsafe { current.owned_state().runtime_remainder_ns }, 0);
+    }
+
+    #[test]
+    fn running_migration_settles_before_detach_and_keeps_new_remainder() {
+        let mut source = EEVDFScheduler::new();
+        let task = Arc::new(EEVDFTask::new(2usize));
+        source.add_task(task).unwrap();
+        let current = source.pick_next_task().unwrap();
+        assert!(!source.account_runtime(&current, RuntimeDelta::new(5_000_000, 10_000_000)));
+        let migration = source.begin_running_migration(&current).unwrap();
+
+        let mut destination = EEVDFScheduler::new();
+        let parked = destination.commit_migration(migration).unwrap();
+        let current = destination.pick_next_task().unwrap();
+        assert!(Arc::ptr_eq(&parked, &current));
+        assert!(!destination.account_runtime(&current, RuntimeDelta::new(5_000_000, 10_000_000)));
+        assert_eq!(destination.clock().accounted_ticks, 0);
+        assert_eq!(
+            unsafe { current.owned_state().runtime_remainder_ns },
+            5_000_000
+        );
+        destination
+            .settle_runtime_remainder(&current, 10_000_000)
+            .unwrap();
+        assert_eq!(unsafe { current.owned_state().runtime_remainder_ns }, 0);
+    }
+
+    #[test]
+    fn runtime_remainder_parameter_update_replays_old_fair_weight() {
+        let mut actual = EEVDFScheduler::new();
+        let actual_task = Arc::new(EEVDFTask::new(10usize));
+        let actual_peer = Arc::new(EEVDFTask::new(11usize));
+        actual.add_task(actual_task.clone()).unwrap();
+        actual.add_task(actual_peer).unwrap();
+        let actual_current = actual.pick_next_task().unwrap();
+
+        let mut reference = EEVDFScheduler::new();
+        let reference_task = Arc::new(EEVDFTask::new(10usize));
+        let reference_peer = Arc::new(EEVDFTask::new(11usize));
+        reference.add_task(reference_task.clone()).unwrap();
+        reference.add_task(reference_peer).unwrap();
+        let reference_current = reference.pick_next_task().unwrap();
+
+        let half = RuntimeDelta::new(5_000_000, 10_000_000);
+        let _ = actual.account_runtime(&actual_current, half);
+        let _ = reference.account_runtime(&reference_current, half);
+
+        let new_params = EevdfTaskParams {
+            class: EevdfTaskClass::Normal,
+            nice: 10,
+            rt_priority: 0,
+        };
+        let _ = actual
+            .set_task_params_with_runtime(&actual_current, new_params, 10_000_000)
+            .unwrap();
+        let _ = reference
+            .set_task_params_with_runtime(&reference_current, new_params, 10_000_000)
+            .unwrap();
+        let _ = actual.account_runtime(&actual_current, half);
+        let _ = reference.account_runtime(&reference_current, half);
+        let _ = actual
+            .settle_runtime_remainder(&actual_current, 10_000_000)
+            .unwrap();
+        let _ = reference
+            .settle_runtime_remainder(&reference_current, 10_000_000)
+            .unwrap();
+
+        assert_eq!(actual.clock(), reference.clock());
+        assert_eq!(unsafe { actual_current.owned_state().entity }, unsafe {
+            reference_current.owned_state().entity
+        });
+        assert_eq!(
+            unsafe { actual_current.owned_state().runtime_remainder_ns },
+            0
+        );
+    }
+
+    #[test]
+    fn runtime_settlement_keeps_sleeping_fair_reconfigure_model_valid() {
+        let mut scheduler = EEVDFScheduler::new();
+        let task = Arc::new(EEVDFTask::new(12usize));
+        scheduler.add_task(task.clone()).unwrap();
+        let current = scheduler.pick_next_task().unwrap();
+        let half = RuntimeDelta::new(5_000_000, 10_000_000);
+        assert!(!scheduler.account_runtime(&current, half));
+
+        // Materialize the old fair tuple before the lifecycle edge.  No
+        // absolute clock/entity replay is allowed to follow the task into
+        // sleeping state.
+        let _ = scheduler
+            .set_task_params_with_runtime(
+                &current,
+                EevdfTaskParams {
+                    class: EevdfTaskClass::Normal,
+                    nice: 5,
+                    rt_priority: 0,
+                },
+                10_000_000,
+            )
+            .unwrap();
+        assert_eq!(unsafe { current.owned_state().runtime_remainder_ns }, 0);
+        scheduler.deactivate_task(&current, DeactivateReason::Sleep);
+
+        let _ = scheduler
+            .set_task_params(
+                &current,
+                EevdfTaskParams {
+                    class: EevdfTaskClass::Batch,
+                    nice: 5,
+                    rt_priority: 0,
+                },
+            )
+            .unwrap();
+        assert_eq!(current.sched_params().class, EevdfTaskClass::Batch);
+    }
+
+    #[test]
+    fn legacy_parameter_update_cannot_bypass_pending_runtime_settlement() {
+        let mut scheduler = EEVDFScheduler::new();
+        let task = Arc::new(EEVDFTask::new(13usize));
+        scheduler.add_task(task.clone()).unwrap();
+        let current = scheduler.pick_next_task().unwrap();
+        assert!(!scheduler.account_runtime(&current, RuntimeDelta::new(5_000_000, 10_000_000)));
+
+        assert_eq!(
+            scheduler.set_task_params(&current, EevdfTaskParams::default()),
+            Err(SchedulerError::InconsistentState)
+        );
+        assert_eq!(
+            unsafe { current.owned_state().runtime_remainder_ns },
+            5_000_000
+        );
+        let _ = scheduler
+            .set_task_params_with_runtime(&current, EevdfTaskParams::default(), 10_000_000)
+            .unwrap();
+        assert_eq!(unsafe { current.owned_state().runtime_remainder_ns }, 0);
+    }
+
+    #[test]
+    fn runtime_parameter_wrappers_report_claim_and_foreign_races() {
+        let mut scheduler = EEVDFScheduler::new();
+        let configuring = Arc::new(EEVDFTask::new(14usize));
+        let claim = configuring.value().claim_reconfiguration().unwrap();
+        assert_eq!(
+            scheduler.set_task_params_with_runtime(
+                &configuring,
+                EevdfTaskParams::default(),
+                10_000_000,
+            ),
+            Err(SchedulerError::TaskBusy)
+        );
+        assert_eq!(
+            scheduler.set_priority_with_runtime(&configuring, 0, 10_000_000),
+            Err(SchedulerError::TaskBusy)
+        );
+        drop(claim);
+
+        let mut owner = EEVDFScheduler::new();
+        let task = Arc::new(EEVDFTask::new(15usize));
+        owner.add_task(task.clone()).unwrap();
+        assert_eq!(
+            scheduler.set_priority_with_runtime(&task, 0, 10_000_000),
+            Err(SchedulerError::ForeignQueue)
+        );
+
+        let migration = owner.begin_ready_migration(&task).unwrap();
+        assert_eq!(
+            scheduler.set_task_params_with_runtime(&task, EevdfTaskParams::default(), 10_000_000,),
+            Err(SchedulerError::TaskBusy)
+        );
+        owner.rollback_migration(migration).unwrap();
+    }
+
+    #[test]
+    fn runtime_remainder_class_transition_charges_old_class_first() {
+        let mut fair_to_rt = EEVDFScheduler::new();
+        let fair_task = Arc::new(EEVDFTask::new(20usize));
+        fair_to_rt.add_task(fair_task).unwrap();
+        let fair_current = fair_to_rt.pick_next_task().unwrap();
+        let half = RuntimeDelta::new(5_000_000, 10_000_000);
+        assert!(!fair_to_rt.account_runtime(&fair_current, half));
+        let _ = fair_to_rt
+            .set_task_params_with_runtime(
+                &fair_current,
+                rt(EevdfTaskClass::RoundRobin, 20),
+                10_000_000,
+            )
+            .unwrap();
+        assert!(!fair_to_rt.account_runtime(&fair_current, half));
+        assert_eq!(fair_to_rt.clock().accounted_ticks, 0);
+        assert_eq!(fair_current.rr_remaining(), RR_TIMESLICE_TICKS);
+        fair_to_rt
+            .settle_runtime_remainder(&fair_current, 10_000_000)
+            .unwrap();
+        assert_eq!(fair_current.rr_remaining(), RR_TIMESLICE_TICKS);
+        assert!(!fair_to_rt.account_runtime(&fair_current, half));
+        fair_to_rt
+            .settle_runtime_remainder(&fair_current, 10_000_000)
+            .unwrap();
+        assert_eq!(fair_current.rr_remaining(), RR_TIMESLICE_TICKS - 1);
+
+        let mut rt_to_fair = EEVDFScheduler::new();
+        let rt_task = Arc::new(EEVDFTask::new(21usize));
+        rt_task
+            .configure(rt(EevdfTaskClass::RoundRobin, 20))
+            .unwrap();
+        rt_to_fair.add_task(rt_task).unwrap();
+        let rt_current = rt_to_fair.pick_next_task().unwrap();
+        assert!(!rt_to_fair.account_runtime(&rt_current, half));
+        let _ = rt_to_fair
+            .set_task_params_with_runtime(&rt_current, EevdfTaskParams::default(), 10_000_000)
+            .unwrap();
+        assert!(!rt_to_fair.account_runtime(&rt_current, half));
+        let _ = rt_to_fair
+            .settle_runtime_remainder(&rt_current, 10_000_000)
+            .unwrap();
+        assert_eq!(rt_to_fair.clock().accounted_ticks, 0);
+
+        let mut fifo_to_rr = EEVDFScheduler::new();
+        let fifo_task = Arc::new(EEVDFTask::new(22usize));
+        fifo_task.configure(rt(EevdfTaskClass::Fifo, 20)).unwrap();
+        fifo_to_rr.add_task(fifo_task).unwrap();
+        let fifo_current = fifo_to_rr.pick_next_task().unwrap();
+        assert!(!fifo_to_rr.account_runtime(&fifo_current, half));
+        let _ = fifo_to_rr
+            .set_task_params_with_runtime(
+                &fifo_current,
+                rt(EevdfTaskClass::RoundRobin, 20),
+                10_000_000,
+            )
+            .unwrap();
+        assert_eq!(fifo_current.rr_remaining(), RR_TIMESLICE_TICKS);
+        assert_eq!(
+            unsafe { fifo_current.owned_state().runtime_remainder_ns },
+            0
+        );
+    }
+
+    #[test]
+    fn runtime_settlement_stages_whole_fraction_and_remainder_atomically() {
+        let mut scheduler = EEVDFScheduler::new();
+        let task = Arc::new(EEVDFTask::new(23usize));
+        let peer = Arc::new(EEVDFTask::new(24usize));
+        scheduler.add_task(task).unwrap();
+        scheduler.add_task(peer).unwrap();
+        let current = scheduler.pick_next_task().unwrap();
+        let delta = RuntimeDelta::new(5_000_000, 10_000_000);
+        assert!(!scheduler.account_runtime(&current, delta));
+        let before_clock = scheduler.clock;
+        let before_entity = unsafe { current.owned_state().entity.unwrap() };
+        let before_state = unsafe { *current.owned_state() };
+
+        scheduler.clock.v = i128::MAX;
+        assert_eq!(
+            scheduler.settle_runtime_remainder(&current, delta.period_ns()),
+            Err(SchedulerError::ArithmeticExhausted)
+        );
+        assert_eq!(scheduler.clock.v, i128::MAX);
+        assert_eq!(
+            unsafe { current.owned_state().entity.unwrap() },
+            before_entity
+        );
+        assert_eq!(
+            unsafe { current.owned_state().runtime_remainder_ns },
+            before_state.runtime_remainder_ns
+        );
+        assert_eq!(unsafe { *current.owned_state() }, before_state);
+
+        scheduler.clock = before_clock;
+        let _ = scheduler
+            .settle_runtime_remainder(&current, delta.period_ns())
+            .unwrap();
+        assert_eq!(unsafe { current.owned_state().runtime_remainder_ns }, 0);
+    }
+
+    #[test]
+    fn runtime_fraction_conversion_residue_conserves_irregular_period_fragments() {
+        let mut fragmented = EEVDFScheduler::new();
+        let fragmented_task = Arc::new(EEVDFTask::new(230usize));
+        fragmented.add_task(fragmented_task).unwrap();
+        let fragmented_current = fragmented.pick_next_task().unwrap();
+
+        for _ in 0..3 {
+            assert!(!fragmented.account_runtime(&fragmented_current, RuntimeDelta::new(1, 3)));
+            let _ = fragmented
+                .settle_runtime_remainder(&fragmented_current, 3)
+                .unwrap();
+        }
+
+        let mut contiguous = EEVDFScheduler::new();
+        let contiguous_task = Arc::new(EEVDFTask::new(231usize));
+        contiguous.add_task(contiguous_task).unwrap();
+        let contiguous_current = contiguous.pick_next_task().unwrap();
+        assert!(!contiguous.account_runtime(&contiguous_current, RuntimeDelta::new(3, 3)));
+
+        let fragmented_clock = fragmented.clock();
+        let contiguous_clock = contiguous.clock();
+        assert_eq!(fragmented_clock.v, contiguous_clock.v);
+        assert_eq!(fragmented_clock.remainder, contiguous_clock.remainder);
+        assert_eq!(fragmented_clock.total_weight, contiguous_clock.total_weight);
+        assert_eq!(unsafe { fragmented_current.owned_state().entity }, unsafe {
+            contiguous_current.owned_state().entity
+        });
+        let state = unsafe { fragmented_current.owned_state() };
+        assert_eq!(state.runtime_remainder_ns, 0);
+        assert_eq!(state.runtime_fraction_remainder_ns, 0);
+    }
+
+    #[test]
+    fn settled_conversion_residue_is_cleared_at_class_change_after_old_context_accounted() {
+        let mut scheduler = EEVDFScheduler::new();
+        let task = Arc::new(EEVDFTask::new(232usize));
+        scheduler.add_task(task).unwrap();
+        let current = scheduler.pick_next_task().unwrap();
+
+        assert!(!scheduler.account_runtime(&current, RuntimeDelta::new(1, 3)));
+        let _ = scheduler.settle_runtime_remainder(&current, 3).unwrap();
+        assert_eq!(unsafe { current.owned_state().runtime_remainder_ns }, 0);
+        assert_ne!(
+            unsafe { current.owned_state().runtime_fraction_remainder_ns },
+            0
+        );
+
+        assert_eq!(
+            scheduler.set_task_params(
+                &current,
+                EevdfTaskParams {
+                    class: EevdfTaskClass::Batch,
+                    nice: 0,
+                    rt_priority: 0,
+                },
+            ),
+            Err(SchedulerError::InconsistentState)
+        );
+
+        let result = scheduler.set_task_params_with_runtime(
+            &current,
+            EevdfTaskParams {
+                class: EevdfTaskClass::Batch,
+                nice: 0,
+                rt_priority: 0,
+            },
+            3,
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            unsafe { current.owned_state().runtime_fraction_remainder_ns },
+            0
+        );
+        assert_eq!(
+            unsafe { current.owned_state().runtime_fraction_period_ns },
+            0
+        );
+    }
+
+    #[test]
+    fn fifo_to_fair_does_not_reinterpret_fifo_conversion_residue() {
+        let mut fifo_scheduler = EEVDFScheduler::new();
+        let fifo = Arc::new(EEVDFTask::new(233usize));
+        fifo.configure(rt(EevdfTaskClass::Fifo, 20)).unwrap();
+        fifo_scheduler.add_task(fifo).unwrap();
+        let fifo_current = fifo_scheduler.pick_next_task().unwrap();
+        assert!(!fifo_scheduler.account_runtime(&fifo_current, RuntimeDelta::new(1, 3)));
+
+        let _ = fifo_scheduler
+            .set_task_params_with_runtime(&fifo_current, EevdfTaskParams::default(), 3)
+            .unwrap();
+        assert_eq!(fifo_scheduler.clock().accounted_ticks, 0);
+        assert_eq!(
+            unsafe { fifo_current.owned_state().runtime_remainder_ns },
+            0
+        );
+        assert_eq!(
+            unsafe { fifo_current.owned_state().runtime_fraction_remainder_ns },
+            0
+        );
+
+        // Only service observed after the fair publication may affect the
+        // fair entity. Compare it with a fresh fair task receiving the same
+        // two-nanosecond fragment, not with the old FIFO fragment.
+        assert!(!fifo_scheduler.account_runtime(&fifo_current, RuntimeDelta::new(2, 3)));
+        fifo_scheduler
+            .settle_runtime_remainder(&fifo_current, 3)
+            .unwrap();
+
+        let mut reference = EEVDFScheduler::new();
+        let reference_task = Arc::new(EEVDFTask::new(234usize));
+        reference.add_task(reference_task).unwrap();
+        let reference_current = reference.pick_next_task().unwrap();
+        assert!(!reference.account_runtime(&reference_current, RuntimeDelta::new(2, 3)));
+        reference
+            .settle_runtime_remainder(&reference_current, 3)
+            .unwrap();
+
+        assert_eq!(fifo_scheduler.clock(), reference.clock());
+        assert_eq!(unsafe { fifo_current.owned_state().entity }, unsafe {
+            reference_current.owned_state().entity
+        });
+    }
+
+    #[test]
+    fn fair_reweight_and_rr_fifo_transitions_clear_old_residue_atomically() {
+        let mut fair_scheduler = EEVDFScheduler::new();
+        let fair = Arc::new(EEVDFTask::new(235usize));
+        fair_scheduler.add_task(fair).unwrap();
+        let fair_current = fair_scheduler.pick_next_task().unwrap();
+        assert!(!fair_scheduler.account_runtime(&fair_current, RuntimeDelta::new(1, 3)));
+        let _ = fair_scheduler
+            .set_task_params_with_runtime(
+                &fair_current,
+                EevdfTaskParams {
+                    class: EevdfTaskClass::Normal,
+                    nice: 5,
+                    rt_priority: 0,
+                },
+                3,
+            )
+            .unwrap();
+        assert_eq!(
+            unsafe { fair_current.owned_state().runtime_fraction_remainder_ns },
+            0
+        );
+        assert_eq!(
+            unsafe { fair_current.owned_state().runtime_fraction_period_ns },
+            0
+        );
+
+        let mut rr_fifo = EEVDFScheduler::new();
+        let rr = Arc::new(EEVDFTask::new(236usize));
+        rr.configure(rt(EevdfTaskClass::RoundRobin, 10)).unwrap();
+        rr_fifo.add_task(rr).unwrap();
+        let rr_current = rr_fifo.pick_next_task().unwrap();
+        assert!(!rr_fifo.account_runtime(&rr_current, RuntimeDelta::new(1, 3)));
+        let _ = rr_fifo
+            .set_task_params_with_runtime(&rr_current, rt(EevdfTaskClass::Fifo, 10), 3)
+            .unwrap();
+        assert_eq!(unsafe { rr_current.owned_state().rr_fraction_q }, 0);
+        assert_eq!(
+            unsafe { rr_current.owned_state().runtime_fraction_remainder_ns },
+            0
+        );
+
+        let _ = rr_fifo
+            .set_task_params_with_runtime(&rr_current, rt(EevdfTaskClass::RoundRobin, 10), 3)
+            .unwrap();
+        assert_eq!(rr_current.rr_remaining(), RR_TIMESLICE_TICKS);
+        assert_eq!(unsafe { rr_current.owned_state().rr_fraction_q }, 0);
+    }
+
+    #[test]
+    fn runtime_parameter_failure_rolls_back_old_tuple_settlement() {
+        let mut scheduler = EEVDFScheduler::new();
+        let task = Arc::new(EEVDFTask::new(237usize));
+        task.configure(rt(EevdfTaskClass::Fifo, 20)).unwrap();
+        scheduler.add_task(task).unwrap();
+        let current = scheduler.pick_next_task().unwrap();
+        assert!(!scheduler.account_runtime(&current, RuntimeDelta::new(1, 3)));
+
+        let before_state = unsafe { *current.owned_state() };
+        let before_rr = current.rr_remaining();
+        let mut failed_clock = scheduler.clock;
+        failed_clock.total_weight = u128::MAX;
+        scheduler.clock = failed_clock;
+
+        // FIFO has no fair weight to add.  The attempted FIFO -> fair
+        // publication therefore fails after the old FIFO runtime boundary
+        // has been settled, exercising the wrapper's rollback path.
+        assert_eq!(
+            scheduler.set_task_params_with_runtime(&current, EevdfTaskParams::default(), 3,),
+            Err(SchedulerError::ArithmeticExhausted)
+        );
+        assert_eq!(scheduler.clock, failed_clock);
+        assert_eq!(unsafe { *current.owned_state() }, before_state);
+        assert_eq!(current.rr_remaining(), before_rr);
+        assert_eq!(current.sched_params().class, EevdfTaskClass::Fifo);
+    }
+
+    #[test]
+    fn fractional_rr_exhaustion_requests_equal_priority_peer() {
+        let mut scheduler = EEVDFScheduler::new();
+        let first = Arc::new(EEVDFTask::new(25usize));
+        let second = Arc::new(EEVDFTask::new(26usize));
+        first.configure(rt(EevdfTaskClass::RoundRobin, 10)).unwrap();
+        second
+            .configure(rt(EevdfTaskClass::RoundRobin, 10))
+            .unwrap();
+        scheduler.add_task(first).unwrap();
+        scheduler.add_task(second).unwrap();
+        let current = scheduler.pick_next_task().unwrap();
+        current.set_rr_remaining(1);
+        assert!(!scheduler.account_runtime(&current, RuntimeDelta::new(5, 10)));
+        assert!(!scheduler.settle_runtime_remainder(&current, 10).unwrap());
+        assert_eq!(current.rr_remaining(), 1);
+        assert_eq!(
+            unsafe { current.owned_state().rr_fraction_q },
+            (ONE / 2) as u64
+        );
+
+        assert!(!scheduler.account_runtime(&current, RuntimeDelta::new(5, 10)));
+        assert!(scheduler.settle_runtime_remainder(&current, 10).unwrap());
+        assert_eq!(current.rr_remaining(), 0);
+        assert_eq!(unsafe { current.owned_state().rr_fraction_q }, 0);
+    }
+
+    #[test]
+    fn rr_yield_and_exhausted_preempt_reset_fractional_budget() {
+        let mut scheduler = EEVDFScheduler::new();
+        let first = Arc::new(EEVDFTask::new(27usize));
+        let second = Arc::new(EEVDFTask::new(28usize));
+        first.configure(rt(EevdfTaskClass::RoundRobin, 10)).unwrap();
+        second
+            .configure(rt(EevdfTaskClass::RoundRobin, 10))
+            .unwrap();
+        scheduler.add_task(first).unwrap();
+        scheduler.add_task(second).unwrap();
+        let current = scheduler.pick_next_task().unwrap();
+        unsafe { current.owned_state_mut().rr_fraction_q = (ONE / 2) as u64 };
+        scheduler.put_prev_task(current.clone(), false).unwrap();
+        assert_eq!(current.rr_remaining(), RR_TIMESLICE_TICKS);
+        assert_eq!(unsafe { current.owned_state().rr_fraction_q }, 0);
+
+        let current = scheduler.pick_next_task().unwrap();
+        unsafe { current.owned_state_mut().rr_fraction_q = (ONE / 2) as u64 };
+        current.set_rr_remaining(0);
+        scheduler.put_prev_task(current.clone(), true).unwrap();
+        assert_eq!(current.rr_remaining(), RR_TIMESLICE_TICKS);
+        assert_eq!(unsafe { current.owned_state().rr_fraction_q }, 0);
+    }
+
+    #[test]
+    fn rr_whole_service_after_fractional_progress_carries_new_slice_progress() {
+        let mut scheduler = EEVDFScheduler::new();
+        let task = Arc::new(EEVDFTask::new(280usize));
+        task.configure(rt(EevdfTaskClass::RoundRobin, 10)).unwrap();
+        scheduler.add_task(task).unwrap();
+        let current = scheduler.pick_next_task().unwrap();
+        current.set_rr_remaining(1);
+
+        assert!(!scheduler.account_runtime(&current, RuntimeDelta::new(5, 10)));
+        assert!(!scheduler.settle_runtime_remainder(&current, 10).unwrap());
+        assert_eq!(
+            unsafe { current.owned_state().rr_fraction_q },
+            (ONE / 2) as u64
+        );
+
+        assert!(!scheduler.account_runtime(&current, RuntimeDelta::new(15, 10)));
+        assert_eq!(current.rr_remaining(), RR_TIMESLICE_TICKS);
+        assert_eq!(
+            unsafe { current.owned_state().rr_fraction_q },
+            (ONE / 2) as u64
+        );
+        assert!(!scheduler.settle_runtime_remainder(&current, 10).unwrap());
+        assert_eq!(current.rr_remaining(), RR_TIMESLICE_TICKS - 1);
+        assert_eq!(unsafe { current.owned_state().rr_fraction_q }, 0);
+    }
+
+    #[test]
+    fn direct_sleep_boundary_settles_pending_runtime_before_wakeup() {
+        let mut scheduler = EEVDFScheduler::new();
+        let task = Arc::new(EEVDFTask::new(29usize));
+        scheduler.add_task(task.clone()).unwrap();
+        let current = scheduler.pick_next_task().unwrap();
+        assert!(!scheduler.account_runtime(&current, RuntimeDelta::new(5, 10)));
+        scheduler.deactivate_task(&current, DeactivateReason::Sleep);
+        assert_eq!(unsafe { task.owned_state().runtime_remainder_ns }, 0);
+        assert_eq!(scheduler.clock().accounted_ticks, 0);
+        scheduler
+            .enqueue_task(task.clone(), EnqueueReason::Wakeup)
+            .unwrap();
+        assert_eq!(unsafe { task.owned_state().runtime_remainder_ns }, 0);
+        assert_eq!(
+            unsafe { task.owned_state().runtime_fraction_remainder_ns },
+            0
+        );
+    }
 
     #[test]
     fn params_validation_and_packed_round_trip_match_cfs_shape() {
@@ -3061,6 +4434,85 @@ mod tests {
     }
 
     #[test]
+    fn runtime_boundary_preserves_remote_preempt_request_after_full_accounting() {
+        let mut scheduler = EEVDFScheduler::new();
+        let current = Arc::new(EEVDFTask::new(1));
+        let later = Arc::new(EEVDFTask::new(2));
+        later
+            .configure(EevdfTaskParams {
+                class: EevdfTaskClass::Batch,
+                ..Default::default()
+            })
+            .unwrap();
+        scheduler.add_task(current.clone()).unwrap();
+        scheduler.add_task(later).unwrap();
+        let running = scheduler.pick_next_task().unwrap();
+        assert!(Arc::ptr_eq(&running, &current));
+
+        // A remote wake/preempt publication only asks the owner CPU to
+        // re-evaluate. The owner must first consume the complete elapsed
+        // sample, then return the exact scheduler decision.
+        assert!(scheduler.account_runtime(&running, RuntimeDelta::new(10_000_000, 10_000_000)));
+        assert_eq!(scheduler.clock().accounted_ticks, 1);
+        assert_eq!(unsafe { running.owned_state().runtime_remainder_ns }, 0);
+    }
+
+    #[test]
+    fn runtime_accounting_bulk_fair_handles_maximum_delta_once() {
+        let mut scheduler = EEVDFScheduler::new();
+        let current = Arc::new(EEVDFTask::new(4usize));
+        let ready = Arc::new(EEVDFTask::new(5usize));
+        scheduler.add_task(current).unwrap();
+        scheduler.add_task(ready).unwrap();
+        let running = scheduler.pick_next_task().unwrap();
+        let ticks = u64::MAX as u128;
+
+        assert!(scheduler.account_runtime(&running, RuntimeDelta::new(u64::MAX, 1)));
+        assert_eq!(scheduler.clock().accounted_ticks, ticks);
+        assert_eq!(
+            unsafe { running.owned_state().entity.unwrap().request.remaining() },
+            0
+        );
+    }
+
+    #[test]
+    fn runtime_accounting_bulk_round_robin_uses_constant_time_modulo() {
+        let mut scheduler = EEVDFScheduler::new();
+        let task = Arc::new(EEVDFTask::new(6usize));
+        task.configure(rt(EevdfTaskClass::RoundRobin, 20)).unwrap();
+        scheduler.add_task(task).unwrap();
+        let running = scheduler.pick_next_task().unwrap();
+        let ticks = u64::MAX as u128;
+        let slice = RR_TIMESLICE_TICKS as u128;
+        let after_first = (ticks - slice) % slice;
+        let expected = if after_first == 0 {
+            slice
+        } else {
+            slice - after_first
+        };
+
+        assert!(!scheduler.account_runtime(&running, RuntimeDelta::new(u64::MAX, 1)));
+        assert_eq!(running.rr_remaining(), expected as usize);
+    }
+
+    #[test]
+    fn runtime_accounting_bulk_round_robin_keeps_exhausted_budget_for_peer() {
+        let mut scheduler = EEVDFScheduler::new();
+        let first = Arc::new(EEVDFTask::new(7usize));
+        let second = Arc::new(EEVDFTask::new(8usize));
+        first.configure(rt(EevdfTaskClass::RoundRobin, 20)).unwrap();
+        second
+            .configure(rt(EevdfTaskClass::RoundRobin, 20))
+            .unwrap();
+        scheduler.add_task(first).unwrap();
+        scheduler.add_task(second).unwrap();
+        let running = scheduler.pick_next_task().unwrap();
+
+        assert!(scheduler.account_runtime(&running, RuntimeDelta::new(u64::MAX, 1)));
+        assert_eq!(running.rr_remaining(), 0);
+    }
+
+    #[test]
     fn scheduler_realtime_priority_fifo_and_rr_rotation() {
         let mut fifo = EEVDFScheduler::new();
         let low = Arc::new(EEVDFTask::new(1));
@@ -3214,7 +4666,12 @@ mod tests {
         .unwrap();
         let peer = Arc::new(EEVDFTask::new(6));
         peer.configure(EevdfTaskParams {
-            nice: 5,
+            // Keep the target task's initial deadline strictly earlier for
+            // every compile-time EEVDF target, including the longer
+            // throughput request.  The old nice=5 pairing ties/reverses once
+            // the target doubles, making this accounting test depend on the
+            // selected profile rather than the sleep/reconfigure contract.
+            nice: 9,
             ..EevdfTaskParams::default()
         })
         .unwrap();
@@ -3238,9 +4695,8 @@ mod tests {
         let _ = scheduler.set_task_params(&task, new_params).unwrap();
         let weight = eevdf_weight_for_nice(new_params.nice).unwrap();
         let eventual_total = scheduler.clock.total_weight + weight;
-        let expected_q =
-            (crate::eevdf_model::TARGET_TICKS_BATCH * weight + eventual_total - 1) / eventual_total;
-        let expected_remaining = (before.remaining_ticks * expected_q + before.q - 1) / before.q;
+        let expected_q = (crate::eevdf_model::TARGET_TICKS_BATCH * weight).div_ceil(eventual_total);
+        let expected_remaining = (before.remaining_ticks * expected_q).div_ceil(before.q);
         let converted = unsafe { task.owned_state().entity.unwrap().request };
         assert_eq!(converted.q, expected_q);
         assert_eq!(converted.remaining_ticks, expected_remaining);
@@ -3455,6 +4911,84 @@ mod tests {
     }
 
     #[test]
+    fn bounded_ready_query_accounts_rt_prefix_and_preserves_migration_choice() {
+        let mut source = EEVDFScheduler::new();
+        let rt_task = Arc::new(EEVDFTask::new(1));
+        rt_task.configure(rt(EevdfTaskClass::Fifo, 20)).unwrap();
+        let fair_task = Arc::new(EEVDFTask::new(2));
+        source.add_task(rt_task.clone()).unwrap();
+        source.add_task(fair_task.clone()).unwrap();
+
+        let before_len = source.ready_len();
+        let mut predicate_calls = 0;
+        assert!(source
+            .bounded_ready_candidate(1, |task| {
+                predicate_calls += 1;
+                *task.inner() == 2
+            })
+            .is_none());
+        assert_eq!(predicate_calls, 1);
+        assert_eq!(source.ready_len(), before_len);
+        assert!(rt_task.is_linked());
+        assert!(fair_task.is_linked());
+
+        let candidate = source
+            .bounded_ready_candidate(2, |task| *task.inner() == 2)
+            .expect("fair task follows the RT prefix");
+        assert_eq!(candidate.visited(), 2);
+        assert_eq!(candidate.class(), EevdfTaskClass::Normal);
+        assert_eq!(candidate.key().class_rank(), FAIR_CLASS_RANK);
+        assert_eq!(source.ready_len(), before_len);
+        assert!(fair_task.is_linked());
+
+        let migration = source.begin_ready_migration(candidate.task()).unwrap();
+        let mut destination = EEVDFScheduler::new();
+        let committed = destination.commit_migration(migration).unwrap();
+        assert!(Arc::ptr_eq(&committed, &fair_task));
+        assert_eq!(source.ready_len(), 1);
+        assert_eq!(destination.ready_len(), 1);
+        assert!(fair_task.is_linked());
+
+        let rollback_task = Arc::new(EEVDFTask::new(3));
+        source.add_task(rollback_task.clone()).unwrap();
+        let candidate = source
+            .bounded_ready_candidate(2, |task| *task.inner() == 3)
+            .expect("rollback task follows the RT prefix");
+        assert_eq!(candidate.visited(), 2);
+        let migration = source.begin_ready_migration(candidate.task()).unwrap();
+        let restored = source.rollback_migration(migration).unwrap();
+        assert!(Arc::ptr_eq(&restored, &rollback_task));
+        assert_eq!(source.ready_len(), 2);
+        assert!(rollback_task.is_linked());
+    }
+
+    #[test]
+    fn bounded_ready_query_continuation_reaches_later_candidates() {
+        let mut scheduler = EEVDFScheduler::new();
+        for id in 0..5 {
+            scheduler.add_task(Arc::new(EEVDFTask::new(id))).unwrap();
+        }
+        let mut cursor = EevdfReadyCursor::new();
+        assert!(scheduler
+            .bounded_ready_candidate_from(&mut cursor, 2, |_| false)
+            .is_none());
+
+        let mut candidate = None;
+        let max_attempts = scheduler.ready_len().saturating_add(1);
+        for _ in 0..max_attempts {
+            if let Some(found) =
+                scheduler.bounded_ready_candidate_from(&mut cursor, 2, |task| *task.inner() == 2)
+            {
+                candidate = Some(found);
+                break;
+            }
+        }
+        let candidate = candidate.expect("continuation must eventually reach the target");
+        assert_eq!(*candidate.task().inner(), 2);
+        assert!(candidate.visited() <= 2);
+    }
+
+    #[test]
     fn eevdf_ready_rollback_without_intervention_restores_exact_source_state() {
         let mut source = EEVDFScheduler::new();
         let task = Arc::new(EEVDFTask::new(1));
@@ -3620,6 +5154,33 @@ mod tests {
         scheduler.commit_reserved_task(reservation).unwrap();
         let child_entity = unsafe { child.owned_state().entity.unwrap() };
         assert_eq!(child_entity.request.remaining(), child_entity.request.q);
+    }
+
+    #[test]
+    fn eevdf_fork_seed_is_rebounded_for_a_lower_credit_child_class() {
+        let mut scheduler = EEVDFScheduler::new();
+        let parent = Arc::new(EEVDFTask::new(1));
+        parent
+            .configure(EevdfTaskParams {
+                class: EevdfTaskClass::Batch,
+                ..Default::default()
+            })
+            .unwrap();
+        scheduler.add_task(parent.clone()).unwrap();
+        let mut seed = scheduler.fork_seed(&parent).unwrap();
+        // Simulate a parent carrying the largest fair-class credit.  The
+        // child remains Normal, whose cap is deliberately smaller.
+        seed.lag = credit_cap(crate::eevdf_model::RequestClass::Batch);
+
+        let child = Arc::new(EEVDFTask::new(2));
+        child.install_fork_seed(seed).unwrap();
+        scheduler.add_task(child.clone()).unwrap();
+        let child_entity = unsafe { child.owned_state().entity.unwrap() };
+        assert_eq!(child_entity.class, crate::eevdf_model::RequestClass::Normal);
+        assert_eq!(
+            child_entity.lag,
+            credit_cap(crate::eevdf_model::RequestClass::Normal)
+        );
     }
 
     #[test]

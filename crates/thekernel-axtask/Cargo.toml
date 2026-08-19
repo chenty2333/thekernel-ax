@@ -34,6 +34,10 @@ multitask = [
 ]
 task-ext = ["dep:extern-trait"]
 irq = ["axhal/irq"]
+# Remote wakeups publish the target run queue first, then use the maintained
+# axhal reason broker to kick the target CPU.  The broker itself is initialized
+# by the consumer after all scheduler run queues are online.
+remote-resched = ["axhal/ipi"]
 # Compatibility sentinel for downstream feature-forwarding manifests. Enabling
 # it is rejected explicitly in lib.rs until axhal exposes fallible TLS setup.
 tls = []
@@ -53,6 +57,15 @@ irq-continuation-diagnostics = ["multitask", "preempt", "smp"]
 sched-fifo = ["multitask"]
 sched-rr = ["multitask", "preempt"]
 sched-eevdf = ["multitask", "preempt"]
+# Pull-only idle stealing is an independent EEVDF/SMP policy.  Expressing its
+# prerequisites here makes an invalid feature combination unrepresentable to
+# Cargo and keeps ordinary EEVDF+SMP builds free of the stealing path.
+idle-steal = ["smp", "sched-eevdf"]
+# EEVDF profiles are compile-time selections. `sched-eevdf` without one of
+# these features is the balanced profile for a reproducible default build.
+eevdf-balanced = ["sched-eevdf", "axsched/eevdf-balanced"]
+eevdf-latency = ["sched-eevdf", "axsched/eevdf-latency"]
+eevdf-throughput = ["sched-eevdf", "axsched/eevdf-throughput"]
 test = ["percpu?/sp-naive"]
 
 [dependencies]

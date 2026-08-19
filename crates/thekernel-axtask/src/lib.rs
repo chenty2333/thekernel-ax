@@ -22,6 +22,9 @@
 //!   the `multitask` and `preempt` features if it is enabled.
 //! - `sched-eevdf`: Use the [EEVDF scheduler][3]. It also enables the
 //!   `multitask` and `preempt` features if it is enabled.
+//! - `idle-steal`: Enable the bounded pull-only idle-stealing path. This
+//!   feature is only available for x86_64 and automatically enables `smp` and
+//!   `sched-eevdf`.
 //!
 //! [1]: axsched::FifoScheduler
 //! [2]: axsched::RRScheduler
@@ -39,6 +42,9 @@ compile_error!(
 #[cfg(all(feature = "legacy-fxsave", not(target_arch = "x86_64")))]
 compile_error!("the legacy FXSAVE task API is x86_64-only");
 
+#[cfg(all(feature = "idle-steal", not(target_arch = "x86_64")))]
+compile_error!("the idle-steal task path is x86_64-only");
+
 #[cfg(all(test, feature = "multitask"))]
 mod tests;
 
@@ -48,6 +54,15 @@ mod tests;
     all(feature = "sched-rr", feature = "sched-eevdf"),
 ))]
 compile_error!("select at most one of sched-fifo, sched-rr, or sched-eevdf");
+
+#[cfg(any(
+    all(feature = "eevdf-balanced", feature = "eevdf-latency"),
+    all(feature = "eevdf-balanced", feature = "eevdf-throughput"),
+    all(feature = "eevdf-latency", feature = "eevdf-throughput"),
+))]
+compile_error!(
+    "select at most one EEVDF profile: eevdf-balanced, eevdf-latency, or eevdf-throughput"
+);
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "multitask")] {

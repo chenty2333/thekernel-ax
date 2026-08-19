@@ -103,9 +103,15 @@ or missing handoff owner is fail-stop rather than leaving
 `scheduler_load_snapshot` exposes the lock-free per-CPU ready/running
 observation used by placement. It is advisory and may straddle a concurrent
 context switch; queue ownership, task state, and affinity remain authoritative.
-Idle stealing is intentionally absent: safe stealing still needs a bounded
-remote-ready transfer policy, cache-hotness/imbalance thresholds, and stress
-coverage for affinity and context-switch handoff races.
+EEVDF SMP builds with the `idle-steal` feature use an independent pull-only
+idle-stealing path immediately before architectural idle. Each edge scans
+bounded victim and candidate sets,
+protects recently cache-hot tasks unless imbalance is severe, claims one exact
+ready-task mutation, and commits through the scheduler migration token. A
+failed destination commit rolls the task and load accounting back while both
+run queues remain locked; the steal never dispatches while holding two queues.
+Its limits and diagnostics remain separate from EEVDF profile parameters so a
+stealing gain cannot be misreported as scheduler-policy tuning.
 
 `WaitQueue::wait_timeout_until_interruptible` uses one complete deadline rather
 than hidden short-slice polling. It returns condition versus timeout explicitly

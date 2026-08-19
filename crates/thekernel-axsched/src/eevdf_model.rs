@@ -4,17 +4,27 @@
 //! real-time class, or task-layer state.  It is deliberately a small value
 //! layer which a scheduler can embed in its own allocation-free entity.
 
+use crate::eevdf_profile::EEVDF_PROFILE;
+
 pub const FP_SHIFT: u32 = 32;
 pub const ONE: u128 = 1u128 << FP_SHIFT;
 pub const NICE_0: u128 = 1024;
 /// Work represented by one real tick at nice zero.
 pub const WORK: u128 = NICE_0 * ONE;
 
-pub const TARGET_TICKS_NORMAL: u128 = 8;
-pub const TARGET_TICKS_BATCH: u128 = 32;
-pub const TARGET_TICKS_IDLE: u128 = 8;
-pub const GRACE: i128 = (8 * ONE) as i128;
-pub const DECAY_WINDOW: i128 = (64 * ONE) as i128;
+/// Profile-selected normal-class request target.  The balanced value remains
+/// eight ticks, matching the pre-profile model.
+pub const TARGET_TICKS_NORMAL: u128 = EEVDF_PROFILE.normal_target_ticks;
+/// Profile-selected batch-class request target.  The balanced value remains
+/// thirty-two ticks, matching the pre-profile model.
+pub const TARGET_TICKS_BATCH: u128 = EEVDF_PROFILE.batch_target_ticks;
+/// Profile-selected idle-class request target.  The balanced value remains
+/// eight ticks, matching the pre-profile model.
+pub const TARGET_TICKS_IDLE: u128 = EEVDF_PROFILE.idle_target_ticks;
+/// Profile-selected sleeper grace in fixed-point virtual-time units.
+pub const GRACE: i128 = (EEVDF_PROFILE.sleeper_grace_ticks * ONE) as i128;
+/// Profile-selected sleeper decay window in fixed-point virtual-time units.
+pub const DECAY_WINDOW: i128 = (EEVDF_PROFILE.sleeper_decay_ticks * ONE) as i128;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -202,6 +212,260 @@ fn checked_mul_div_ceil(a: u128, b: u128, denominator: u128) -> Result<u128, Mod
     }
 }
 
+/// Greatest common divisor over the fixed-width integer domain.  The loop is
+/// bounded by the width of `u128`, so a malformed scheduler value cannot turn
+/// a model operation into a value-proportional walk.
+fn gcd_u128(mut left: u128, mut right: u128) -> u128 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
+}
+
+/// A fixed-width 256-bit unsigned value used only when a rational operation
+/// has to stage an intermediate wider than the scheduler's public u128
+/// representation.  The final quotient is still required to fit in u128;
+/// this type prevents a reducible intermediate from being mistaken for real
+/// arithmetic exhaustion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Wide {
+    limbs: [u64; 4],
+}
+
+impl Wide {
+    const ZERO: Self = Self { limbs: [0; 4] };
+
+    fn cmp(self, other: Self) -> core::cmp::Ordering {
+        for index in (0..4).rev() {
+            match self.limbs[index].cmp(&other.limbs[index]) {
+                core::cmp::Ordering::Equal => {}
+                ordering => return ordering,
+            }
+        }
+        core::cmp::Ordering::Equal
+    }
+
+    fn ge(self, other: Self) -> bool {
+        self.cmp(other) != core::cmp::Ordering::Less
+    }
+
+    fn bit(self, position: usize) -> bool {
+        (self.limbs[position / 64] >> (position % 64)) & 1 != 0
+    }
+
+    fn shl1(self) -> (bool, Self) {
+        let mut limbs = [0u64; 4];
+        let mut carry = false;
+        for index in 0..4 {
+            let value = self.limbs[index];
+            limbs[index] = (value << 1) | u64::from(carry);
+            carry = value >> 63 != 0;
+        }
+        (carry, Self { limbs })
+    }
+
+    fn wrapping_sub(self, other: Self) -> Self {
+        let mut limbs = [0u64; 4];
+        let mut borrow = false;
+        for index in 0..4 {
+            let (value, first_borrow) = self.limbs[index].overflowing_sub(other.limbs[index]);
+            let (value, second_borrow) = value.overflowing_sub(u64::from(borrow));
+            limbs[index] = value;
+            borrow = first_borrow || second_borrow;
+        }
+        Self { limbs }
+    }
+
+    fn checked_add_one(self) -> Option<Self> {
+        let mut next = self;
+        for limb in &mut next.limbs {
+            let (value, carry) = limb.overflowing_add(1);
+            *limb = value;
+            if !carry {
+                return Some(next);
+            }
+        }
+        None
+    }
+
+    fn set_low_bit(&mut self, bit: bool) {
+        self.limbs[0] = (self.limbs[0] & !1) | u64::from(bit);
+    }
+
+    fn mul_u128(left: u128, right: u128) -> Option<Self> {
+        let left = [left as u64, (left >> 64) as u64];
+        let right = [right as u64, (right >> 64) as u64];
+        let mut limbs = [0u64; 4];
+
+        for left_index in 0..2 {
+            let mut carry = 0u128;
+            for right_index in 0..2 {
+                let index = left_index + right_index;
+                let value = (left[left_index] as u128)
+                    .checked_mul(right[right_index] as u128)?
+                    .checked_add(limbs[index] as u128)?
+                    .checked_add(carry)?;
+                limbs[index] = value as u64;
+                carry = value >> 64;
+            }
+            let mut index = left_index + 2;
+            while carry != 0 {
+                if index == limbs.len() {
+                    return None;
+                }
+                let (value, overflow) = limbs[index].overflowing_add(carry as u64);
+                limbs[index] = value;
+                carry = (carry >> 64) + u128::from(overflow);
+                index += 1;
+            }
+        }
+        Some(Self { limbs })
+    }
+
+    fn mul(self, right: u128) -> Option<Self> {
+        let mut result = Self::ZERO;
+        for index in 0..4 {
+            let product = (self.limbs[index] as u128)
+                .checked_mul(right as u64 as u128)?
+                .checked_add(result.limbs[index] as u128)?;
+            result.limbs[index] = product as u64;
+            let mut carry = product >> 64;
+            let high_product = (self.limbs[index] as u128).checked_mul((right >> 64) as u128)?;
+            // This helper is intentionally limited to multiplying a value
+            // which is already known to fit in 256 bits by a scheduler-sized
+            // factor.  Fold the high half at the next limb and reject any
+            // carry past the fixed width.
+            if index + 1 >= 4 && (high_product != 0 || carry != 0) {
+                return None;
+            }
+            if index + 1 < 4 {
+                let next = high_product
+                    .checked_add(result.limbs[index + 1] as u128)?
+                    .checked_add(carry)?;
+                result.limbs[index + 1] = next as u64;
+                carry = next >> 64;
+                let mut carry_index = index + 2;
+                while carry != 0 {
+                    if carry_index == 4 {
+                        return None;
+                    }
+                    let (value, overflow) = result.limbs[carry_index].overflowing_add(carry as u64);
+                    result.limbs[carry_index] = value;
+                    carry = (carry >> 64) + u128::from(overflow);
+                    carry_index += 1;
+                }
+            }
+        }
+        Some(result)
+    }
+
+    fn div_exact_u128(self, divisor: u128) -> Result<Self, ModelError> {
+        if divisor == 0 {
+            return Err(ModelError::InvalidWeight);
+        }
+        let mut quotient = Self::ZERO;
+        let mut remainder = 0u128;
+        for position in (0..256).rev() {
+            let (quotient_bit, next_remainder) = checked_div_129(
+                remainder >> 127 != 0,
+                (remainder << 1) | u128::from(self.bit(position)),
+                divisor,
+            )?;
+            if quotient_bit > 1 {
+                return Err(ModelError::InvalidState);
+            }
+            quotient = quotient.shl1().1;
+            quotient.set_low_bit(quotient_bit != 0);
+            remainder = next_remainder;
+        }
+        if remainder == 0 {
+            Ok(quotient)
+        } else {
+            Err(ModelError::InvalidState)
+        }
+    }
+
+    fn rem_u128(self, divisor: u128) -> Result<u128, ModelError> {
+        if divisor == 0 {
+            return Err(ModelError::InvalidWeight);
+        }
+        let mut remainder = 0u128;
+        for position in (0..256).rev() {
+            let (_, next_remainder) = checked_div_129(
+                remainder >> 127 != 0,
+                (remainder << 1) | u128::from(self.bit(position)),
+                divisor,
+            )?;
+            remainder = next_remainder;
+        }
+        Ok(remainder)
+    }
+
+    fn low_u128(self) -> Result<u128, ModelError> {
+        if self.limbs[2] != 0 || self.limbs[3] != 0 {
+            return Err(ModelError::ArithmeticExhausted);
+        }
+        Ok((self.limbs[1] as u128) << 64 | self.limbs[0] as u128)
+    }
+}
+
+fn checked_ratio_ceil(
+    mut numerator_factors: [u128; 3],
+    mut denominator_factors: [u128; 2],
+) -> Result<u128, ModelError> {
+    for numerator in &mut numerator_factors {
+        for denominator in &mut denominator_factors {
+            let gcd = gcd_u128(*numerator, *denominator);
+            *numerator /= gcd;
+            *denominator /= gcd;
+        }
+    }
+    let numerator = numerator_factors
+        .into_iter()
+        .try_fold(1u128, |value, factor| value.checked_mul(factor));
+    let denominator = denominator_factors
+        .into_iter()
+        .try_fold(1u128, |value, factor| value.checked_mul(factor));
+    if let (Some(numerator), Some(denominator)) = (numerator, denominator) {
+        return checked_ceil_div(numerator, denominator);
+    }
+
+    let numerator = Wide::mul_u128(numerator_factors[0], numerator_factors[1])
+        .and_then(|value| value.mul(numerator_factors[2]))
+        .ok_or(ModelError::ArithmeticExhausted)?;
+    let denominator = Wide::mul_u128(denominator_factors[0], denominator_factors[1])
+        .ok_or(ModelError::ArithmeticExhausted)?;
+    let mut quotient = Wide::ZERO;
+    let mut remainder = Wide::ZERO;
+    for position in (0..256).rev() {
+        let (carry, shifted) = remainder.shl1();
+        let shifted = Wide {
+            limbs: [
+                shifted.limbs[0] | u64::from(numerator.bit(position)),
+                shifted.limbs[1],
+                shifted.limbs[2],
+                shifted.limbs[3],
+            ],
+        };
+        let bit = carry || shifted.ge(denominator);
+        remainder = if bit {
+            shifted.wrapping_sub(denominator)
+        } else {
+            shifted
+        };
+        quotient = quotient.shl1().1;
+        quotient.set_low_bit(bit);
+    }
+    if remainder != Wide::ZERO {
+        quotient = quotient
+            .checked_add_one()
+            .ok_or(ModelError::ArithmeticExhausted)?;
+    }
+    quotient.low_u128()
+}
+
 /// Round `a*b/denominator` to the nearest integer, using ties-to-even.  The
 /// product is deliberately evaluated through the checked fixed-width helper
 /// so reweight and clock-denominator changes retain their overflow fallback.
@@ -337,19 +601,195 @@ pub fn request_start(v: i128, materialized_lag: i128, weight: u128) -> Result<i1
     v.checked_add(offset).ok_or(ModelError::ArithmeticExhausted)
 }
 
-/// A current EEVDF request.  `q` is the admitted target and
-/// `remaining_ticks` is explicit state, never inferred through saturation.
+/// A current EEVDF request. `q` is the admitted target and
+/// `remaining_fraction_num/den` is the exact bounded rational fraction of the
+/// current request which remains. `remaining_work` and `remaining_ticks` are
+/// ceil projections used by integer scheduler paths. Keeping the fraction
+/// independent of `q` means A -> B -> A reconfiguration does not repeatedly
+/// ceil the same request boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Request {
     pub class: RequestClass,
     pub q: u128,
     pub remaining_ticks: u128,
+    /// Ceil projection of the exact remaining service in fixed work units.
+    pub remaining_work: u128,
+    /// Exact remaining-request fraction numerator.
+    pub remaining_fraction_num: u128,
+    /// Exact remaining-request fraction denominator.
+    pub remaining_fraction_den: u128,
     pub virtual_length: i128,
     pub start: i128,
     pub deadline: i128,
 }
 
 impl Request {
+    fn projection(
+        q: u128,
+        fraction_num: u128,
+        fraction_den: u128,
+    ) -> Result<(u128, u128), ModelError> {
+        if q == 0 || fraction_den == 0 || fraction_num > fraction_den {
+            return Err(ModelError::InvalidState);
+        }
+        let (whole_ticks, fractional_ticks) = checked_mul_div_rem(fraction_num, q, fraction_den)?;
+        let fractional_work = if fractional_ticks == 0 {
+            0
+        } else {
+            checked_mul_div_ceil(fractional_ticks, WORK, fraction_den)?
+        };
+        let whole_work = whole_ticks
+            .checked_mul(WORK)
+            .ok_or(ModelError::ArithmeticExhausted)?;
+        let remaining_work = whole_work
+            .checked_add(fractional_work)
+            .ok_or(ModelError::ArithmeticExhausted)?;
+        let remaining_ticks = checked_ceil_div(remaining_work, WORK)?;
+        Ok((remaining_work, remaining_ticks))
+    }
+
+    fn exact_valid(&self) -> Result<(), ModelError> {
+        let (remaining_work, remaining_ticks) = Self::projection(
+            self.q,
+            self.remaining_fraction_num,
+            self.remaining_fraction_den,
+        )?;
+        if remaining_work != self.remaining_work || remaining_ticks != self.remaining_ticks {
+            return Err(ModelError::InvalidState);
+        }
+        Ok(())
+    }
+
+    /// Calculate the remaining virtual length directly from the exact
+    /// bounded fraction instead of from its ceil projection.  The projected
+    /// `remaining_work` is intentionally retained for integer-facing state,
+    /// but using it to re-anchor a request would make A -> B -> A updates
+    /// accumulate a rounding unit on every round trip.
+    fn remaining_virtual_length(&self, weight: u128) -> Result<i128, ModelError> {
+        if weight == 0 {
+            return Err(ModelError::InvalidWeight);
+        }
+        self.exact_valid()?;
+        checked_i128(checked_ratio_ceil(
+            [self.remaining_fraction_num, self.q, WORK],
+            [self.remaining_fraction_den, weight],
+        )?)
+    }
+
+    fn set_fraction(&mut self, fraction_num: u128, fraction_den: u128) -> Result<(), ModelError> {
+        let gcd = gcd_u128(fraction_num, fraction_den);
+        let (fraction_num, fraction_den) = if gcd == 0 {
+            (0, 1)
+        } else {
+            (fraction_num / gcd, fraction_den / gcd)
+        };
+        let (remaining_work, remaining_ticks) =
+            Self::projection(self.q, fraction_num, fraction_den)?;
+        self.remaining_fraction_num = fraction_num;
+        self.remaining_fraction_den = fraction_den;
+        self.remaining_work = remaining_work;
+        self.remaining_ticks = remaining_ticks;
+        Ok(())
+    }
+
+    fn next_after_service(&self, work: u128, saturating: bool) -> Result<Self, ModelError> {
+        self.exact_valid()?;
+        if work % NICE_0 != 0 {
+            return Err(ModelError::InvalidState);
+        }
+        let service_ticks = work / NICE_0;
+        let service_den = self
+            .q
+            .checked_mul(ONE)
+            .ok_or(ModelError::ArithmeticExhausted)?;
+
+        // Compare the requested service with the exact remaining fraction
+        // before constructing a common denominator.  Besides making explicit
+        // exhaustion cheap, this avoids multiplying a long-running bulk
+        // sample by a potentially large rational denominator merely to learn
+        // that the request is already complete.
+        let (remaining_service, remaining_remainder) = checked_mul_div_rem(
+            self.remaining_fraction_num,
+            service_den,
+            self.remaining_fraction_den,
+        )?;
+        if service_ticks > remaining_service {
+            if !saturating {
+                return Err(ModelError::InvalidState);
+            }
+            let mut next = *self;
+            next.set_fraction(0, 1)?;
+            return Ok(next);
+        }
+        if service_ticks == remaining_service && remaining_remainder == 0 {
+            let mut next = *self;
+            next.set_fraction(0, 1)?;
+            return Ok(next);
+        }
+        if service_ticks == 0 {
+            return Ok(*self);
+        }
+
+        // Reduce the service fraction before taking the common denominator.
+        // Without this step, repeated whole-tick samples retain factors that
+        // are already present in the numerator and make the stored LCM grow
+        // needlessly across reconfiguration/wakeup cycles.
+        let service_gcd = gcd_u128(service_ticks, service_den);
+        let service_num = service_ticks / service_gcd;
+        let service_den = service_den / service_gcd;
+        let denominator_gcd = gcd_u128(self.remaining_fraction_den, service_den);
+        let left_den = self.remaining_fraction_den / denominator_gcd;
+        let right_den = service_den / denominator_gcd;
+
+        // After both input fractions are reduced, the numerator of
+        //
+        //     n * right_den - service_num * left_den
+        //
+        // is coprime to `left_den` and `right_den`.  Any remaining common
+        // factor of the result and its common denominator must therefore be
+        // a factor of `denominator_gcd`.  Find that factor modulo the small
+        // gcd before constructing the denominator, so a reducible LCM never
+        // has to fit in u128 merely to be cancelled afterwards.
+        let mut next = *self;
+        let (numerator, reduced_gcd) = match (
+            self.remaining_fraction_num.checked_mul(right_den),
+            service_num.checked_mul(left_den),
+        ) {
+            (Some(left), Some(right)) => {
+                let numerator = left.checked_sub(right).ok_or(ModelError::InvalidState)?;
+                let reduced_gcd = gcd_u128(numerator, denominator_gcd);
+                (numerator / reduced_gcd, reduced_gcd)
+            }
+            _ => {
+                let left = Wide::mul_u128(self.remaining_fraction_num, right_den)
+                    .ok_or(ModelError::ArithmeticExhausted)?;
+                let right =
+                    Wide::mul_u128(service_num, left_den).ok_or(ModelError::ArithmeticExhausted)?;
+                if left.cmp(right) == core::cmp::Ordering::Less {
+                    return Err(ModelError::InvalidState);
+                }
+                let numerator = left.wrapping_sub(right);
+                let reduced_gcd = if denominator_gcd == 1 {
+                    1
+                } else {
+                    let left_mod = numerator.rem_u128(denominator_gcd)?;
+                    // `right_mod` is not needed separately: the wide
+                    // difference already contains both products.  Taking the
+                    // remainder after subtraction avoids any u128 product.
+                    gcd_u128(left_mod, denominator_gcd)
+                };
+                let numerator = numerator.div_exact_u128(reduced_gcd)?.low_u128()?;
+                (numerator, reduced_gcd)
+            }
+        };
+        let denominator = left_den
+            .checked_mul(denominator_gcd / reduced_gcd)
+            .and_then(|value| value.checked_mul(right_den))
+            .ok_or(ModelError::ArithmeticExhausted)?;
+        next.set_fraction(numerator, denominator)?;
+        Ok(next)
+    }
+
     pub fn new(
         class: RequestClass,
         weight: u128,
@@ -361,14 +801,19 @@ impl Request {
         let virtual_length = checked_virtual_length(q, weight)?;
         let start = request_start(v, materialized_lag, weight)?;
         let deadline = checked_deadline(start, virtual_length)?;
-        Ok(Self {
+        let mut request = Self {
             class,
             q,
             remaining_ticks: q,
+            remaining_work: 0,
+            remaining_fraction_num: 1,
+            remaining_fraction_den: 1,
             virtual_length,
             start,
             deadline,
-        })
+        };
+        request.set_fraction(1, 1)?;
+        Ok(request)
     }
 
     pub fn admit(
@@ -385,14 +830,44 @@ impl Request {
         self.remaining_ticks
     }
 
+    pub const fn is_exhausted(&self) -> bool {
+        self.remaining_fraction_num == 0
+    }
+
     pub fn consume(&mut self, ticks: u128) -> Result<(), ModelError> {
         if ticks > self.remaining_ticks {
             return Err(ModelError::InvalidState);
         }
-        self.remaining_ticks = self
-            .remaining_ticks
-            .checked_sub(ticks)
-            .ok_or(ModelError::ArithmeticExhausted)?;
+        self.consume_work_up_to(checked_work(ticks)? as u128)
+    }
+
+    /// Consume an exact fixed-width amount of service, saturating only at the
+    /// request boundary.  This is used by fractional runtime settlement and
+    /// keeps the integer `remaining_ticks` projection synchronized.
+    pub fn consume_work(&mut self, work: u128) -> Result<(), ModelError> {
+        *self = self.next_after_service(work, false)?;
+        Ok(())
+    }
+
+    /// Consume service up to the exact request boundary.  A timer sample can
+    /// legitimately overshoot a request; the entity records that overservice
+    /// in lag while the request itself saturates at zero.
+    pub fn consume_work_up_to(&mut self, work: u128) -> Result<(), ModelError> {
+        *self = self.next_after_service(work, true)?;
+        Ok(())
+    }
+
+    /// Rebind the request quantum without changing the exact remaining
+    /// fraction.  This is the key operation used by class/weight updates.
+    fn set_quantum(&mut self, q: u128) -> Result<(), ModelError> {
+        if q == 0 {
+            return Err(ModelError::InvalidState);
+        }
+        let (remaining_work, remaining_ticks) =
+            Self::projection(q, self.remaining_fraction_num, self.remaining_fraction_den)?;
+        self.q = q;
+        self.remaining_work = remaining_work;
+        self.remaining_ticks = remaining_ticks;
         Ok(())
     }
 
@@ -486,18 +961,75 @@ impl Clock {
         }
     }
 
-    pub fn preview_advance(&self, ticks: u128) -> Result<ClockAdvance, ModelError> {
-        if ticks == 0 {
+    fn preview_work_with_ticks(
+        &self,
+        work: u128,
+        accounted_tick_delta: u128,
+    ) -> Result<ClockAdvance, ModelError> {
+        if work == 0 {
+            let accounted_ticks = self
+                .accounted_ticks
+                .checked_add(accounted_tick_delta)
+                .ok_or(ModelError::ArithmeticExhausted)?;
             return Ok(ClockAdvance {
                 v: self.v,
                 remainder: self.remainder,
-                accounted_ticks: self.accounted_ticks,
+                accounted_ticks,
                 delta_v: 0,
             });
         }
         if self.total_weight == 0 {
             return Err(ModelError::InvalidWeight);
         }
+        if self.remainder >= self.total_weight {
+            return Err(ModelError::InvalidState);
+        }
+        let (mut delta_v_u128, product_remainder) =
+            checked_mul_div_rem(work, 1, self.total_weight)?;
+        let (remainder_low, remainder_high) = product_remainder.overflowing_add(self.remainder);
+        let (remainder_quotient, remainder) =
+            checked_div_129(remainder_high, remainder_low, self.total_weight)?;
+        delta_v_u128 = delta_v_u128
+            .checked_add(remainder_quotient)
+            .ok_or(ModelError::ArithmeticExhausted)?;
+        let delta_v = checked_i128(delta_v_u128)?;
+        let v = self
+            .v
+            .checked_add(delta_v)
+            .ok_or(ModelError::ArithmeticExhausted)?;
+        let accounted_ticks = self
+            .accounted_ticks
+            .checked_add(accounted_tick_delta)
+            .ok_or(ModelError::ArithmeticExhausted)?;
+        Ok(ClockAdvance {
+            v,
+            remainder,
+            accounted_ticks,
+            delta_v,
+        })
+    }
+
+    /// Preview advancing virtual time by an exact fixed-point work amount.
+    /// Unlike `preview_advance`, this does not increment the integer tick
+    /// counter; fractional runtime settlement is observable through work
+    /// balance and must not manufacture a scheduler tick.
+    pub fn preview_work(&self, work: u128) -> Result<ClockAdvance, ModelError> {
+        self.preview_work_with_ticks(work, 0)
+    }
+
+    pub fn preview_advance(&self, ticks: u128) -> Result<ClockAdvance, ModelError> {
+        if ticks == 0 {
+            return self.preview_work_with_ticks(0, 0);
+        }
+        if self.total_weight == 0 {
+            return Err(ModelError::InvalidWeight);
+        }
+        if self.remainder >= self.total_weight {
+            return Err(ModelError::InvalidState);
+        }
+        // Keep the tick-to-work multiplication inside the checked fixed-width
+        // quotient helper.  A long VM pause may make `ticks * WORK` exceed
+        // u128 even though the resulting virtual-time delta is representable.
         let (mut delta_v_u128, product_remainder) =
             checked_mul_div_rem(ticks, WORK, self.total_weight)?;
         let (remainder_low, remainder_high) = product_remainder.overflowing_add(self.remainder);
@@ -530,6 +1062,19 @@ impl Clock {
             remainder: next.remainder,
             total_weight: self.total_weight,
             accounted_ticks: next.accounted_ticks,
+        };
+        Ok(next.delta_v)
+    }
+
+    /// Advance virtual time by exact fixed-point work without incrementing
+    /// `accounted_ticks`.
+    pub fn advance_work(&mut self, work: u128) -> Result<i128, ModelError> {
+        let next = self.preview_work(work)?;
+        *self = Self {
+            v: next.v,
+            remainder: next.remainder,
+            total_weight: self.total_weight,
+            accounted_ticks: self.accounted_ticks,
         };
         Ok(next.delta_v)
     }
@@ -822,8 +1367,20 @@ impl Entity {
         Ok(self.lag_at(v)? >= 0)
     }
 
-    pub fn tick_service(&mut self, clock: &mut Clock, ticks: u128) -> Result<i128, ModelError> {
-        if ticks == 0 {
+    /// Account one transaction containing whole and fractional service.
+    /// Every checked operation is staged through local copies before either
+    /// the queue clock or entity is changed.  This is the atomicity boundary
+    /// used by both timer accounting and lifecycle settlement.
+    pub fn service(
+        &mut self,
+        clock: &mut Clock,
+        ticks: u128,
+        fraction_q: u128,
+    ) -> Result<i128, ModelError> {
+        if fraction_q >= ONE {
+            return Err(ModelError::InvalidState);
+        }
+        if ticks == 0 && fraction_q == 0 {
             return Ok(0);
         }
         if self.weight == 0 {
@@ -832,12 +1389,21 @@ impl Entity {
         if self.sleeper_v.is_some() {
             return Err(ModelError::InvalidState);
         }
-        let next_clock = clock.preview_advance(ticks)?;
+        let whole_work = checked_work(ticks)? as u128;
+        let fractional_work = fraction_q
+            .checked_mul(NICE_0)
+            .ok_or(ModelError::ArithmeticExhausted)?;
+        let service_work = whole_work
+            .checked_add(fractional_work)
+            .ok_or(ModelError::ArithmeticExhausted)?;
+        let next_clock = clock.preview_work_with_ticks(service_work, ticks)?;
         let next_lag = checked_lag_at(self.lag, self.lag_stamp, self.weight, next_clock.v)?
-            .checked_sub(checked_work(ticks)?)
+            .checked_sub(checked_i128(service_work)?)
             .ok_or(ModelError::ArithmeticExhausted)?;
         let mut next_request = self.request;
-        next_request.consume(ticks)?;
+        next_request.consume_work_up_to(service_work)?;
+
+        // Commit only after clock, lag, and request arithmetic all succeeds.
         clock.v = next_clock.v;
         clock.remainder = next_clock.remainder;
         clock.accounted_ticks = next_clock.accounted_ticks;
@@ -845,6 +1411,54 @@ impl Entity {
         self.lag_stamp = next_clock.v;
         self.request = next_request;
         Ok(next_clock.delta_v)
+    }
+
+    pub fn tick_service(&mut self, clock: &mut Clock, ticks: u128) -> Result<i128, ModelError> {
+        self.service(clock, ticks, 0)
+    }
+
+    /// Account a contiguous run of service in one model transaction.
+    ///
+    /// Unlike [`Self::tick_service`], this method deliberately accepts more
+    /// service than the active request has left.  A missed timer boundary is
+    /// still real service: the clock and lag advance for every tick and the
+    /// request is consumed only up to zero.  The resulting lag therefore
+    /// retains the task's overservice debt for the scheduler's next renewal.
+    /// All arithmetic is fixed-width and independent of the numerical size of
+    /// `ticks`; callers can safely use this at a wall-clock ownership boundary
+    /// after a long VM pause.
+    pub fn bulk_service(&mut self, clock: &mut Clock, ticks: u128) -> Result<i128, ModelError> {
+        self.service(clock, ticks, 0)
+    }
+
+    /// Account a bounded sub-tick service amount in Q32 tick units. The
+    /// operation advances the fair clock and lag by exact fixed work while
+    /// leaving the integer scheduler tick counter unchanged.
+    pub fn fractional_service(
+        &mut self,
+        clock: &mut Clock,
+        fraction_q: u64,
+    ) -> Result<i128, ModelError> {
+        self.service(clock, 0, u128::from(fraction_q))
+    }
+
+    /// Convert a wall-clock sub-period into Q32 service and materialize it.
+    /// The returned division remainder is bounded by `period_ns`; callers may
+    /// retain it in a fixed-width boundary token when they need conservation
+    /// across multiple samples.
+    pub fn fractional_service_ns(
+        &mut self,
+        clock: &mut Clock,
+        elapsed_ns: u64,
+        period_ns: u64,
+    ) -> Result<u64, ModelError> {
+        if period_ns == 0 || elapsed_ns >= period_ns {
+            return Err(ModelError::InvalidState);
+        }
+        let (fraction_q, remainder) =
+            checked_mul_div_rem(u128::from(elapsed_ns), ONE, u128::from(period_ns))?;
+        self.fractional_service(clock, fraction_q as u64)?;
+        Ok(remainder as u64)
     }
 
     pub fn tick(&mut self, clock: &mut Clock) -> Result<i128, ModelError> {
@@ -955,13 +1569,13 @@ impl Entity {
         let elapsed = v
             .checked_sub(slept_at)
             .ok_or(ModelError::ArithmeticExhausted)?;
-        if self.weight == 0 || self.request.q == 0 || self.request.remaining_ticks > self.request.q
-        {
+        if self.weight == 0 || self.request.q == 0 {
             return Err(ModelError::InvalidState);
         }
+        self.request.exact_valid()?;
         let lag = bounded_sleeper_decay_inner(self.class, self.lag, elapsed)?;
         let start = request_start(v, lag, self.weight)?;
-        let remaining_r = checked_virtual_length(self.request.remaining_ticks, self.weight)?;
+        let remaining_r = self.request.remaining_virtual_length(self.weight)?;
         let deadline = checked_deadline(start, remaining_r)?;
         let mut request = self.request;
         request.start = start;
@@ -988,12 +1602,13 @@ impl Entity {
         if self.weight == 0 {
             return Err(ModelError::InvalidWeight);
         }
-        if self.request.q == 0 || self.request.remaining_ticks > self.request.q {
+        if self.request.q == 0 {
             return Err(ModelError::InvalidState);
         }
+        self.request.exact_valid()?;
         let lag = self.lag_at(v)?;
         let start = request_start(v, lag, self.weight)?;
-        let remaining_r = checked_virtual_length(self.request.remaining_ticks, self.weight)?;
+        let remaining_r = self.request.remaining_virtual_length(self.weight)?;
         let deadline = checked_deadline(start, remaining_r)?;
         let mut request = self.request;
         request.start = start;
@@ -1006,6 +1621,28 @@ impl Entity {
 
     pub fn wake_at(&mut self, v: i128) -> Result<(), ModelError> {
         self.wake(v)
+    }
+
+    fn reconfigured_request(
+        &self,
+        new_class: RequestClass,
+        new_q: u128,
+        new_weight: u128,
+        anchor: i128,
+        lag: i128,
+    ) -> Result<Request, ModelError> {
+        self.request.exact_valid()?;
+        let mut request = self.request;
+        request.class = new_class;
+        request.set_quantum(new_q)?;
+        let full_r = checked_virtual_length(new_q, new_weight)?;
+        let remaining_r = request.remaining_virtual_length(new_weight)?;
+        let start = request_start(anchor, lag, new_weight)?;
+        let deadline = checked_deadline(start, remaining_r)?;
+        request.virtual_length = full_r;
+        request.start = start;
+        request.deadline = deadline;
+        Ok(request)
     }
 
     /// Changes class and weight while preserving materialized lag and the
@@ -1027,31 +1664,9 @@ impl Entity {
         if self.sleeper_v.is_some() {
             return Err(ModelError::InvalidState);
         }
-        let old_q = self.request.q;
-        if old_q == 0 || self.request.remaining_ticks > old_q {
-            return Err(ModelError::InvalidState);
-        }
         let lag = self.lag_at(v)?;
         let new_q = request_quantum(new_class, new_weight, new_total_weight)?;
-        let new_remaining = if self.request.remaining_ticks == 0 {
-            0
-        } else {
-            checked_mul_div_ceil(self.request.remaining_ticks, new_q, old_q)?
-        };
-        if new_remaining > new_q {
-            return Err(ModelError::InvalidState);
-        }
-        let full_r = checked_virtual_length(new_q, new_weight)?;
-        let remaining_r = checked_virtual_length(new_remaining, new_weight)?;
-        let start = request_start(v, lag, new_weight)?;
-        let deadline = checked_deadline(start, remaining_r)?;
-        let mut request = self.request;
-        request.q = new_q;
-        request.remaining_ticks = new_remaining;
-        request.class = new_class;
-        request.virtual_length = full_r;
-        request.start = start;
-        request.deadline = deadline;
+        let request = self.reconfigured_request(new_class, new_q, new_weight, v, lag)?;
         let next = Self {
             class: new_class,
             weight: new_weight,
@@ -1080,33 +1695,11 @@ impl Entity {
         if self.sleeper_v.is_some() {
             return Err(ModelError::InvalidState);
         }
-        let old_q = self.request.q;
-        if old_q == 0 || self.request.remaining_ticks > old_q {
-            return Err(ModelError::InvalidState);
-        }
         // `self.lag` is deliberately used directly: `lag_at(v)` would charge
         // all virtual time elapsed while the task was in the RT class.
         let lag = self.lag;
         let new_q = request_quantum(new_class, new_weight, new_total_weight)?;
-        let new_remaining = if self.request.remaining_ticks == 0 {
-            0
-        } else {
-            checked_mul_div_ceil(self.request.remaining_ticks, new_q, old_q)?
-        };
-        if new_remaining > new_q {
-            return Err(ModelError::InvalidState);
-        }
-        let full_r = checked_virtual_length(new_q, new_weight)?;
-        let remaining_r = checked_virtual_length(new_remaining, new_weight)?;
-        let start = request_start(v, lag, new_weight)?;
-        let deadline = checked_deadline(start, remaining_r)?;
-        let mut request = self.request;
-        request.q = new_q;
-        request.remaining_ticks = new_remaining;
-        request.class = new_class;
-        request.virtual_length = full_r;
-        request.start = start;
-        request.deadline = deadline;
+        let request = self.reconfigured_request(new_class, new_q, new_weight, v, lag)?;
         *self = Self {
             class: new_class,
             weight: new_weight,
@@ -1134,31 +1727,9 @@ impl Entity {
         if new_weight == 0 {
             return Err(ModelError::InvalidWeight);
         }
-        let old_q = self.request.q;
-        if old_q == 0 || self.request.remaining_ticks > old_q {
-            return Err(ModelError::InvalidState);
-        }
         let lag = self.lag;
         let new_q = request_quantum(new_class, new_weight, new_total_weight)?;
-        let new_remaining = if self.request.remaining_ticks == 0 {
-            0
-        } else {
-            checked_mul_div_ceil(self.request.remaining_ticks, new_q, old_q)?
-        };
-        if new_remaining > new_q {
-            return Err(ModelError::InvalidState);
-        }
-        let full_r = checked_virtual_length(new_q, new_weight)?;
-        let remaining_r = checked_virtual_length(new_remaining, new_weight)?;
-        let start = request_start(sleeper_v, lag, new_weight)?;
-        let deadline = checked_deadline(start, remaining_r)?;
-        let mut request = self.request;
-        request.q = new_q;
-        request.remaining_ticks = new_remaining;
-        request.class = new_class;
-        request.virtual_length = full_r;
-        request.start = start;
-        request.deadline = deadline;
+        let request = self.reconfigured_request(new_class, new_q, new_weight, sleeper_v, lag)?;
         *self = Self {
             class: new_class,
             weight: new_weight,
@@ -1232,9 +1803,12 @@ impl Entity {
         }
         if snapshot.request.q > snapshot.class.target_ticks()
             || snapshot.request.remaining_ticks > snapshot.request.q
+            || snapshot.request.remaining_fraction_den == 0
+            || snapshot.request.remaining_fraction_num > snapshot.request.remaining_fraction_den
         {
             return Err(ModelError::InvalidState);
         }
+        snapshot.request.exact_valid()?;
         let expected_length = checked_virtual_length(snapshot.request.q, snapshot.weight)?;
         if snapshot.request.virtual_length != expected_length {
             return Err(ModelError::InvalidState);
@@ -1296,6 +1870,28 @@ pub fn min_eligible_at(entities: &[Entity]) -> Result<Option<i128>, ModelError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_constants_drive_request_and_sleeper_model() {
+        assert_eq!(
+            RequestClass::Normal.target_ticks(),
+            EEVDF_PROFILE.normal_target_ticks
+        );
+        assert_eq!(
+            RequestClass::Batch.target_ticks(),
+            EEVDF_PROFILE.batch_target_ticks
+        );
+        assert_eq!(
+            RequestClass::Idle.target_ticks(),
+            EEVDF_PROFILE.idle_target_ticks
+        );
+        assert_eq!(GRACE, (EEVDF_PROFILE.sleeper_grace_ticks * ONE) as i128);
+        assert_eq!(
+            DECAY_WINDOW,
+            (EEVDF_PROFILE.sleeper_decay_ticks * ONE) as i128
+        );
+        assert!(EEVDF_PROFILE.has_power_of_two_parameters());
+    }
 
     #[test]
     fn bias_is_order_preserving_at_boundaries() {
@@ -1376,10 +1972,17 @@ mod tests {
     #[test]
     fn admission_uses_unequal_total_weight_and_every_ceil() {
         let e = Entity::new(RequestClass::Normal, 3, 10, 0).unwrap();
-        assert_eq!(e.request.q, 3); // ceil(8*3/10)
-        assert_eq!(e.request.virtual_length, WORK as i128); // ceil(3*WORK/3)
+        let expected_q = request_quantum(RequestClass::Normal, 3, 10).unwrap();
+        assert_eq!(e.request.q, expected_q);
+        assert_eq!(
+            e.request.virtual_length,
+            checked_virtual_length(expected_q, 3).unwrap()
+        );
         assert_eq!(e.request.start, 0);
-        assert_eq!(e.request.deadline, WORK as i128);
+        assert_eq!(
+            e.request.deadline,
+            checked_virtual_length(expected_q, 3).unwrap()
+        );
 
         let small = Entity::new(RequestClass::Normal, 1, 100, 0).unwrap();
         assert_eq!(small.request.q, 1); // clamp ceil(8/100) to one
@@ -1428,6 +2031,161 @@ mod tests {
         }
         assert_eq!(clock.work_balance().unwrap() - initial, (37 * WORK) as i128);
         assert_eq!(clock.accounted_ticks, 37);
+    }
+
+    #[test]
+    fn fractional_service_complements_to_one_exact_tick() {
+        let mut fractional = Entity::new(RequestClass::Normal, NICE_0, NICE_0, 0).unwrap();
+        let mut fractional_clock = Clock::new(NICE_0);
+        fractional
+            .fractional_service(&mut fractional_clock, (ONE / 2) as u64)
+            .unwrap();
+        fractional
+            .fractional_service(&mut fractional_clock, (ONE - ONE / 2) as u64)
+            .unwrap();
+
+        let mut whole = Entity::new(RequestClass::Normal, NICE_0, NICE_0, 0).unwrap();
+        let mut whole_clock = Clock::new(NICE_0);
+        whole.tick(&mut whole_clock).unwrap();
+
+        assert_eq!(fractional.lag, whole.lag);
+        assert_eq!(fractional.lag_stamp, whole.lag_stamp);
+        assert_eq!(fractional.request, whole.request);
+        assert_eq!(fractional_clock.v, whole_clock.v);
+        assert_eq!(fractional_clock.remainder, whole_clock.remainder);
+        assert_eq!(fractional_clock.accounted_ticks, 0);
+        assert_eq!(whole_clock.accounted_ticks, 1);
+    }
+
+    #[test]
+    fn rational_service_reduces_wide_lcm_before_publishing_fraction() {
+        let mut request = Request::new(RequestClass::Normal, 1, 8, 0, 0).unwrap();
+        // Pin the request quantum to one tick so the cancellation oracle is
+        // independent of the selected EEVDF target profile.
+        request.set_quantum(1).unwrap();
+        // The unreduced common denominator is k * ONE, which is wider than
+        // u128.  The exact result nevertheless reduces to 1/k, so rejecting
+        // the intermediate product would be a false arithmetic exhaustion.
+        let k = (u128::MAX - (ONE - 1)) / ONE;
+        let denominator = k * ONE;
+        request.set_fraction(k + ONE, denominator).unwrap();
+        request.consume_work(NICE_0).unwrap();
+        assert_eq!(
+            (
+                request.remaining_fraction_num,
+                request.remaining_fraction_den
+            ),
+            (1, k)
+        );
+    }
+
+    #[test]
+    fn wide_ratio_ceil_keeps_valid_reconfigure_virtual_length() {
+        // Both denominator factors are individually representable but their
+        // product is not.  The mathematical result is one fixed-point unit,
+        // and the bounded wide division must preserve that result.
+        assert_eq!(
+            checked_ratio_ceil([1, 1, WORK], [u128::MAX, u128::MAX]),
+            Ok(1)
+        );
+    }
+
+    #[test]
+    fn wide_products_match_u128_boundary_limbs() {
+        let product = Wide::mul_u128(u128::MAX, u128::MAX).unwrap();
+        assert_eq!(product.limbs, [1, 0, u64::MAX - 1, u64::MAX]);
+    }
+
+    #[test]
+    fn rational_service_reports_only_true_overservice_as_exhaustion() {
+        let mut request = Request::new(RequestClass::Normal, 1, 8, 0, 0).unwrap();
+        let k = (u128::MAX - (ONE - 1)) / ONE;
+        request.set_fraction(k + ONE, k * ONE).unwrap();
+        let oversized_work = (u128::MAX / NICE_0) * NICE_0;
+        assert_eq!(
+            request.consume_work(oversized_work),
+            Err(ModelError::InvalidState)
+        );
+        request.consume_work_up_to(oversized_work).unwrap();
+        assert!(request.is_exhausted());
+    }
+
+    #[test]
+    fn repeated_coprime_fraction_reconfigure_and_wake_stays_bounded() {
+        let mut entity = Entity::new(RequestClass::Normal, 3, 8, 0).unwrap();
+        let mut clock = Clock::new(8);
+        for _ in 0..64 {
+            entity
+                .fractional_service(&mut clock, (ONE / 3) as u64)
+                .unwrap();
+            entity
+                .reconfigure(RequestClass::Normal, 5, 8, clock.v)
+                .unwrap();
+            entity.begin_sleep(clock.v).unwrap();
+            entity.wake_preserving_progress(clock.v + GRACE).unwrap();
+            entity
+                .reconfigure(RequestClass::Normal, 7, 8, clock.v)
+                .unwrap();
+            entity
+                .reconfigure(RequestClass::Normal, 3, 8, clock.v)
+                .unwrap();
+        }
+        assert!(entity.request.remaining_fraction_den > 0);
+        assert!(entity.request.remaining_fraction_num <= entity.request.remaining_fraction_den);
+    }
+
+    #[test]
+    fn fractional_runtime_conversion_conserves_q32_service() {
+        let period = 10u128;
+        let samples = [3u128, 7, 2, 8, 4, 6];
+        let mut chunked = Entity::new(RequestClass::Normal, NICE_0, NICE_0, 0).unwrap();
+        let mut chunked_clock = Clock::new(NICE_0);
+        let mut conversion_remainder = 0u128;
+        let mut service_q = 0u128;
+        let mut elapsed = 0u128;
+        for sample in samples {
+            elapsed += sample;
+            let numerator = sample * ONE + conversion_remainder;
+            let sample_q = numerator / period;
+            service_q += sample_q;
+            conversion_remainder = numerator % period;
+            let whole_ticks = sample_q / ONE;
+            if whole_ticks != 0 {
+                chunked
+                    .bulk_service(&mut chunked_clock, whole_ticks)
+                    .unwrap();
+            }
+            let fractional_q = (sample_q % ONE) as u64;
+            if fractional_q != 0 {
+                chunked
+                    .fractional_service(&mut chunked_clock, fractional_q)
+                    .unwrap();
+            }
+        }
+        assert_eq!(service_q, (elapsed / period) * ONE);
+        assert_eq!(conversion_remainder, (elapsed % period) * ONE % period);
+
+        // The scheduler-side split is equivalent to one exact fixed-width
+        // division, independent of how ownership boundaries partition the
+        // same elapsed interval.
+        let (whole, remainder) = checked_mul_div_rem(elapsed, ONE, period).unwrap();
+        assert_eq!(service_q, whole);
+        assert_eq!(conversion_remainder, remainder);
+
+        let mut whole_entity = Entity::new(RequestClass::Normal, NICE_0, NICE_0, 0).unwrap();
+        let mut whole_clock = Clock::new(NICE_0);
+        whole_entity
+            .bulk_service(&mut whole_clock, whole / ONE)
+            .unwrap();
+        let whole_fractional = (whole % ONE) as u64;
+        if whole_fractional != 0 {
+            whole_entity
+                .fractional_service(&mut whole_clock, whole_fractional)
+                .unwrap();
+        }
+        assert_eq!(chunked, whole_entity);
+        assert_eq!(chunked_clock.v, whole_clock.v);
+        assert_eq!(chunked_clock.remainder, whole_clock.remainder);
     }
 
     #[test]
@@ -1500,8 +2258,43 @@ mod tests {
         let mut e = Entity::new(RequestClass::Normal, NICE_0, NICE_0, 0).unwrap();
         let mut clock = Clock::new(NICE_0);
         e.tick(&mut clock).unwrap();
-        assert_eq!(e.request.remaining_ticks, 7);
+        assert_eq!(e.request.remaining_ticks, TARGET_TICKS_NORMAL - 1);
         assert_eq!(clock.v, ONE as i128);
+    }
+
+    #[test]
+    fn bulk_service_accounts_maximum_elapsed_ticks_and_preserves_lag_debt() {
+        let ticks = u64::MAX as u128;
+        let weight = NICE_0;
+        let total_weight = 2 * NICE_0;
+        let mut entity = Entity::new(RequestClass::Normal, weight, total_weight, 0).unwrap();
+        let mut clock = Clock::new(total_weight);
+
+        entity.bulk_service(&mut clock, ticks).unwrap();
+
+        assert_eq!(clock.accounted_ticks, ticks);
+        assert_eq!(entity.request.remaining(), 0);
+        assert_eq!(entity.lag_stamp, clock.v);
+        let expected_lag = clock.v * weight as i128 - (ticks * WORK) as i128;
+        assert_eq!(entity.lag, expected_lag);
+        assert!(entity.lag < 0);
+    }
+
+    #[test]
+    fn bulk_service_matches_tick_service_before_request_boundary() {
+        let ticks = 3;
+        let mut bulk = Entity::new(RequestClass::Normal, NICE_0, NICE_0, 0).unwrap();
+        let mut ticked = bulk;
+        let mut bulk_clock = Clock::new(NICE_0);
+        let mut tick_clock = Clock::new(NICE_0);
+
+        bulk.bulk_service(&mut bulk_clock, ticks).unwrap();
+        for _ in 0..ticks {
+            ticked.tick(&mut tick_clock).unwrap();
+        }
+
+        assert_eq!(bulk, ticked);
+        assert_eq!(bulk_clock, tick_clock);
     }
 
     #[test]
@@ -1584,25 +2377,31 @@ mod tests {
     #[test]
     fn reweight_rescales_active_request_position_when_quantum_changes() {
         let mut e = Entity::new(RequestClass::Batch, 1, 8, 0).unwrap();
-        assert_eq!(e.request.q, 4);
-        e.request.consume(2).unwrap();
+        let old_q = e.request.q;
+        let consumed = old_q / 2;
+        let new_q = request_quantum(RequestClass::Batch, 2, 8).unwrap();
+        e.request.consume(consumed).unwrap();
         e.reweight(2, 8, 0).unwrap();
-        assert_eq!(e.request.q, 8);
-        assert_eq!(e.request.remaining_ticks, 4);
+        assert_eq!(e.request.q, new_q);
+        let expected_remaining = checked_mul_div_ceil(old_q - consumed, new_q, old_q).unwrap();
+        assert_eq!(e.request.remaining_ticks, expected_remaining);
         assert_eq!(
             e.request.deadline - e.request.start,
-            checked_virtual_length(4, 2).unwrap()
+            checked_virtual_length(expected_remaining, 2).unwrap()
         );
 
         let mut e = Entity::new(RequestClass::Batch, 2, 8, 0).unwrap();
-        assert_eq!(e.request.q, 8);
-        e.request.consume(4).unwrap();
+        let old_q = e.request.q;
+        let consumed = old_q / 2;
+        let new_q = request_quantum(RequestClass::Batch, 1, 8).unwrap();
+        e.request.consume(consumed).unwrap();
         e.reweight(1, 8, 0).unwrap();
-        assert_eq!(e.request.q, 4);
-        assert_eq!(e.request.remaining_ticks, 2);
+        assert_eq!(e.request.q, new_q);
+        let expected_remaining = checked_mul_div_ceil(old_q - consumed, new_q, old_q).unwrap();
+        assert_eq!(e.request.remaining_ticks, expected_remaining);
         assert_eq!(
             e.request.deadline - e.request.start,
-            checked_virtual_length(2, 1).unwrap()
+            checked_virtual_length(expected_remaining, 1).unwrap()
         );
 
         let mut finished = Entity::new(RequestClass::Batch, 1, 8, 0).unwrap();
@@ -1646,6 +2445,50 @@ mod tests {
             entity.request.deadline - entity.request.start,
             checked_virtual_length(entity.request.remaining_ticks, NICE_0).unwrap()
         );
+    }
+
+    #[test]
+    fn repeated_reconfigure_round_trip_keeps_exact_fractional_progress() {
+        let mut entity = Entity::new(RequestClass::Normal, NICE_0, NICE_0, 0).unwrap();
+        let original_q = entity.request.q;
+        entity.request.consume(1).unwrap();
+        let remaining_fraction = (
+            entity.request.remaining_fraction_num,
+            entity.request.remaining_fraction_den,
+        );
+
+        for _ in 0..32 {
+            entity
+                .reconfigure(RequestClass::Batch, NICE_0, NICE_0, 0)
+                .unwrap();
+            entity
+                .reconfigure(RequestClass::Normal, NICE_0, NICE_0, 0)
+                .unwrap();
+        }
+
+        assert_eq!(entity.request.q, original_q);
+        assert_eq!(
+            (
+                entity.request.remaining_fraction_num,
+                entity.request.remaining_fraction_den
+            ),
+            remaining_fraction
+        );
+        assert_eq!(entity.request.remaining_ticks, original_q - 1);
+    }
+
+    #[test]
+    fn combined_whole_and_fractional_service_is_failure_atomic() {
+        let mut entity = Entity::new(RequestClass::Normal, NICE_0, NICE_0, 0).unwrap();
+        let mut clock = Clock::with_parts(i128::MAX, 0, NICE_0, 9);
+        let before_entity = entity;
+        let before_clock = clock;
+        assert_eq!(
+            entity.service(&mut clock, 1, (ONE / 2) as u128),
+            Err(ModelError::ArithmeticExhausted)
+        );
+        assert_eq!(entity, before_entity);
+        assert_eq!(clock, before_clock);
     }
 
     #[test]

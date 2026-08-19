@@ -12,7 +12,7 @@ use core::{
     task::Waker,
 };
 
-use axpoll::{PollSet, RegisterError, RegistrationToken, UpdateError};
+use axpoll::{PollSet, PreparedRegistration, RegisterError, RegistrationToken, UpdateError};
 use kspin::SpinNoIrq;
 
 /// Maximum number of distinct IRQ sources admitted for the process lifetime.
@@ -89,17 +89,30 @@ impl fmt::Display for IrqWakerUpdateError {
 impl core::error::Error for IrqWakerUpdateError {}
 
 struct IrqWakerRegistry {
-    // Source bindings are never recycled. That makes a source slot stable for
-    // interrupt dispatch without manufacturing another generation domain.
-    sources: SpinNoIrq<[Option<usize>; IRQ_SOURCE_CAPACITY]>,
+    // Source bindings are never recycled after a successful waiter admission.
+    // A new source is reserved while its first waiter is being armed so a
+    // failed admission can return the slot to Empty without consuming one of
+    // the process-lifetime source slots.
+    sources: SpinNoIrq<[IrqSourceState; IRQ_SOURCE_CAPACITY]>,
+    // Serializes source reservation/commit transactions without holding the
+    // source lock while a custom waker is cloned or dropped.
+    registration: SpinNoIrq<()>,
     waiters: [PollSet<IRQ_WAITER_CAPACITY>; IRQ_SOURCE_CAPACITY],
     hook_state: AtomicU8,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum IrqSourceState {
+    Empty,
+    Reserved(usize),
+    Bound(usize),
 }
 
 impl IrqWakerRegistry {
     const fn new() -> Self {
         Self {
-            sources: SpinNoIrq::new([None; IRQ_SOURCE_CAPACITY]),
+            sources: SpinNoIrq::new([const { IrqSourceState::Empty }; IRQ_SOURCE_CAPACITY]),
+            registration: SpinNoIrq::new(()),
             waiters: [const { PollSet::new() }; IRQ_SOURCE_CAPACITY],
             hook_state: AtomicU8::new(HOOK_UNINITIALIZED),
         }
@@ -149,23 +162,11 @@ impl IrqWakerRegistry {
         }
     }
 
-    fn source_slot(&self, irq: usize) -> Result<usize, IrqWakerRegisterError> {
-        let mut sources = self.sources.lock();
-        if let Some(slot) = sources.iter().position(|source| *source == Some(irq)) {
-            return Ok(slot);
-        }
-        let Some(slot) = sources.iter().position(Option::is_none) else {
-            return Err(IrqWakerRegisterError::SourceCapacityExhausted);
-        };
-        sources[slot] = Some(irq);
-        Ok(slot)
-    }
-
     fn source_matches(&self, slot: usize, irq: usize) -> bool {
         self.sources
             .lock()
             .get(slot)
-            .is_some_and(|source| *source == Some(irq))
+            .is_some_and(|source| *source == IrqSourceState::Bound(irq))
     }
 
     fn dispatch(&self, irq: usize) {
@@ -173,7 +174,9 @@ impl IrqWakerRegistry {
             .sources
             .lock()
             .iter()
-            .position(|source| *source == Some(irq));
+            .position(|source| {
+                matches!(source, IrqSourceState::Reserved(source_irq) | IrqSourceState::Bound(source_irq) if *source_irq == irq)
+            });
         if let Some(slot) = slot {
             // PollSet drains under its own short IRQ-safe lock and invokes all
             // wakers after that lock is released.
@@ -199,15 +202,69 @@ pub fn register_irq_waker(
     waker: &Waker,
 ) -> Result<IrqWakerToken, IrqWakerRegisterError> {
     IRQ_WAKERS.ensure_hook()?;
-    let source_slot = IRQ_WAKERS.source_slot(irq)?;
-    let registration = IRQ_WAKERS.waiters[source_slot]
-        .register(waker)
-        .map_err(IrqWakerRegisterError::Waiter)?;
-    Ok(IrqWakerToken {
-        irq,
-        source_slot,
-        registration,
-    })
+
+    // Clone the waker before taking the registry transaction lock. The
+    // prepared value is independent of the destination PollSet and can be
+    // moved into whichever source slot the transaction admits.
+    let prepared = PreparedRegistration::new(waker);
+
+    // Reserve a previously unused source before arming its first waiter, but
+    // publish it as permanently bound only after arm succeeds. This keeps the
+    // source-capacity accounting failure-atomic while the registration lock
+    // prevents competing callers from observing or reusing the reservation.
+    let result = {
+        let _registration = IRQ_WAKERS.registration.lock();
+        let source_slot = {
+            let mut sources = IRQ_WAKERS.sources.lock();
+            if let Some(slot) = sources.iter().position(|source| {
+                matches!(source, IrqSourceState::Reserved(source_irq) | IrqSourceState::Bound(source_irq) if *source_irq == irq)
+            }) {
+                Some(slot)
+            } else if let Some(slot) = sources
+                .iter()
+                .position(|source| *source == IrqSourceState::Empty)
+            {
+                sources[slot] = IrqSourceState::Reserved(irq);
+                Some(slot)
+            } else {
+                None
+            }
+        };
+
+        match source_slot {
+            None => Err((IrqWakerRegisterError::SourceCapacityExhausted, prepared)),
+            Some(source_slot) => match IRQ_WAKERS.waiters[source_slot].arm(prepared) {
+                Ok(registration) => {
+                    let mut sources = IRQ_WAKERS.sources.lock();
+                    if sources.get(source_slot) == Some(&IrqSourceState::Reserved(irq)) {
+                        sources[source_slot] = IrqSourceState::Bound(irq);
+                    }
+                    Ok(IrqWakerToken {
+                        irq,
+                        source_slot,
+                        registration,
+                    })
+                }
+                Err(error) => {
+                    let mut sources = IRQ_WAKERS.sources.lock();
+                    if sources.get(source_slot) == Some(&IrqSourceState::Reserved(irq)) {
+                        sources[source_slot] = IrqSourceState::Empty;
+                    }
+                    let kind = error.kind();
+                    let prepared = error.into_prepared();
+                    Err((IrqWakerRegisterError::Waiter(kind), prepared))
+                }
+            },
+        }
+    };
+
+    match result {
+        Ok(token) => Ok(token),
+        Err((error, prepared)) => {
+            drop(prepared);
+            Err(error)
+        }
+    }
 }
 
 /// Updates the waker owned by a live IRQ registration token.
@@ -231,7 +288,7 @@ pub fn cancel_irq_waker(token: IrqWakerToken) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use alloc::{sync::Arc, task::Wake};
+    use alloc::{sync::Arc, task::Wake, vec::Vec};
     use core::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -289,5 +346,48 @@ mod tests {
         irq_hook(usize::MAX);
         assert_eq!(counter.0.load(Ordering::Acquire), 1);
         assert!(!cancel_irq_waker(token));
+    }
+
+    #[test]
+    fn rejected_first_waiter_does_not_consume_source_capacity() {
+        let _serial = SERIAL.lock().unwrap();
+        let waker = Waker::noop();
+        // Arrange a source which is still in the first-waiter reservation
+        // phase while its PollSet is full. This is the only state in which a
+        // failed arm could accidentally consume a process-lifetime source
+        // slot; the public API normally keeps the reservation and arm under
+        // one short transaction, so the unit test installs the state directly.
+        let (slot, irq) = {
+            let mut sources = IRQ_WAKERS.sources.lock();
+            let slot = sources
+                .iter()
+                .position(|source| *source == IrqSourceState::Empty)
+                .expect("test registry has no empty source slot");
+            let irq = 0x7000_0000usize + slot;
+            sources[slot] = IrqSourceState::Reserved(irq);
+            (slot, irq)
+        };
+        let mut live = Vec::with_capacity(IRQ_WAITER_CAPACITY);
+        for _ in 0..IRQ_WAITER_CAPACITY {
+            live.push(IRQ_WAKERS.waiters[slot].register(waker).unwrap());
+        }
+
+        assert_eq!(
+            register_irq_waker(irq, waker),
+            Err(IrqWakerRegisterError::Waiter(RegisterError::Full))
+        );
+        assert!(matches!(
+            IRQ_WAKERS.sources.lock()[slot],
+            IrqSourceState::Empty
+        ));
+
+        for token in live {
+            assert!(IRQ_WAKERS.waiters[slot].cancel(token));
+        }
+
+        // The failed first admission returned its source slot to Empty, so
+        // the same source can be admitted after waiter pressure is released.
+        let retry = register_irq_waker(irq, waker).unwrap();
+        assert!(cancel_irq_waker(retry));
     }
 }

@@ -19,7 +19,14 @@ exclude = ["Cargo.toml.orig", ".cargo_vcs_info.json"]
 name = "axsched"
 path = "src/lib.rs"
 
+[features]
+default = []
+# EEVDF tuning is selected at compile time.  With no profile feature the
+# balanced profile is selected, preserving the historical constants.
+eevdf-balanced = []
+eevdf-latency = []
+eevdf-throughput = []
+
 [dependencies]
 intrusive-collections = "0.9"
 linked_list_r4l = "0.3"
-
