@@ -70,7 +70,7 @@ jobs:
           cargo +nightly check -p thekernel-axtask --no-default-features --locked
           cargo +nightly test -p thekernel-axtask --all-targets --locked \
             --features "$test_features"
-          cargo +nightly clippy -p thekernel-axtask --all-targets --locked \
+          cargo +nightly clippy -p thekernel-axtask --all-targets --no-deps --locked \
             --features "$test_features" -- -D warnings
           for scheduler in sched-fifo sched-rr sched-eevdf; do
             cargo +nightly check -p thekernel-axtask --locked \
