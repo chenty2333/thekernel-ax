@@ -1,27 +1,25 @@
-name: CI
+name: Release Check
 
 on:
-  pull_request:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 concurrency:
-  group: thekernel-ax-ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: thekernel-ax-release-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
-  quality:
-    name: Rust quality and compatibility
+  release:
+    name: Package and publish dry-run
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 75
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Install nightly Rust
@@ -45,5 +43,5 @@ jobs:
       - name: Cache Cargo outputs
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
-      - name: Run quality gate
-        run: ./scripts/ci.sh quality
+      - name: Run release gate
+        run: ./scripts/ci.sh release

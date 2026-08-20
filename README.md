@@ -1,24 +1,23 @@
 # thekernel-ax
 
 `thekernel-ax` is the independent home of reusable operating-system mechanism
-crates maintained by TheKernel. The workspace contains these crates:
+crates maintained by TheKernel. The workspace contains eight crates:
 
 | Package | Rust crate name | Purpose |
 | --- | --- | --- |
 | `thekernel-axcbpf` | `axcbpf` | verified classic-BPF mechanism with bounded execution |
 | `thekernel-axfault` | `axfault` | bounded generation-safe fault-request broker state |
-| `thekernel-axpmu` | `axpmu` | bounded, opt-in PMU sessions and low-overhead software diagnostics |
-| `thekernel-axtlb` | `axtlb` | bounded allocation-free SMP TLB and instruction-sync shootdown state |
-| `thekernel-axsched` | `axsched` | FIFO, round-robin, fair, and real-time scheduling mechanisms |
+| `thekernel-axrcu` | `axrcu` | bounded epoch publication and task-context reclamation primitives |
+| `thekernel-axpmu` | `axpmu` | bounded opt-in PMU sessions and software diagnostics |
+| `thekernel-axtlb` | `axtlb` | allocation-free SMP TLB and instruction-sync shootdown state |
+| `thekernel-axsched` | `axsched` | FIFO, round-robin, EEVDF, and real-time scheduling mechanisms |
 | `thekernel-axpoll` | `axpoll` | bounded I/O readiness registration and wakeup primitives |
 | `thekernel-axtask` | `axtask` | bounded task, run-queue, wait, timer, and IRQ-wake mechanisms |
 
 The maintained-fork package names are new so releases cannot be confused with
 the upstream `axsched`, `axpoll`, and `axtask` packages. Their Rust library
-names stay unchanged, which lets downstream code continue to use the
-established crate paths after changing only its dependency declaration.
-`thekernel-axcbpf`, `thekernel-axfault`, `thekernel-axpmu`, and
-`thekernel-axtlb` are new
+names stay unchanged, which lets downstream code keep established crate paths
+after changing only dependency declarations. The remaining packages are
 TheKernel-owned mechanisms rather than renamed upstream packages.
 
 ## Scope
@@ -29,54 +28,50 @@ mapping, and Linux `poll(2)` bit translation belong in an ABI adapter outside
 these crates.
 
 The extracted scheduler, readiness, and task sources are maintained forks, not
-claims of upstream authorship. Each of those crates keeps its upstream authors,
-license expression, immutable registry baseline in `VENDOR.md`, and a
-maintained delta in `PATCHES.md`. The fault broker and TLB shootdown state
-machine are original Apache-2.0 code with no vendored baseline. See
-[`docs/PROVENANCE.md`](docs/PROVENANCE.md) for the complete source record.
+claims of upstream authorship. Each keeps its upstream authors, license
+expression, immutable registry baseline in `VENDOR.md`, and maintained delta in
+`PATCHES.md`. See [`docs/PROVENANCE.md`](docs/PROVENANCE.md) for the complete
+source record.
 
 ## Build and test
 
 The workspace is intentionally self-contained and has no root
-`[patch.crates-io]` table.
+`[patch.crates-io]` table. The pull-request front door is:
 
 ```sh
-scripts/test-axsched-msrv.sh
-cargo +1.85.0 test -p thekernel-axcbpf --all-targets --locked
-cargo +1.85.0 test -p thekernel-axcbpf --doc --locked
-cargo +1.85.0 test -p thekernel-axfault --all-targets --locked
-cargo +1.85.0 test -p thekernel-axfault --doc --locked
-cargo +1.85.0 test -p thekernel-axpmu --all-targets --locked
-cargo +1.85.0 test -p thekernel-axpmu --doc --locked
-cargo +1.85.0 test -p thekernel-axtlb --all-targets --locked
-cargo +1.85.0 test -p thekernel-axtlb --doc --locked
-cargo +1.85.0 test -p thekernel-axpoll --all-targets --locked
-cargo +nightly test -p thekernel-axtask --all-targets --locked \
-  --features "test multitask irq preempt smp sched-cfs task-ext irq-continuation-diagnostics irq-exit"
-python3 scripts/check_registry_dependencies.py
-scripts/package-unpack-original.sh
-scripts/publish-dry-run.sh
-scripts/package-unpack.sh
+./scripts/ci.sh quality
 ```
+
+That gate runs formatting, registry-dependency and provenance checks, the
+unpacked Rust-1.76 axsched MSRV test, Rust-1.85 tests and Clippy for the stable
+mechanism crates, and the nightly axtask test/Clippy/feature matrix. It includes
+`thekernel-axrcu`, which was previously a workspace member but absent from both
+the workflow and the old hand-written test list.
+
+Release-only rustdoc, archive, and publish-dry-run checks are separate:
+
+```sh
+./scripts/ci.sh release
+```
+
+`thekernel-axrcu` is quality-tested but is not yet included in the package
+release helpers because it does not yet carry the release documentation and
+provenance asset set required by those helpers. Do not infer release readiness
+from workspace membership alone.
 
 The self-contained registry matrix type-checks and unit-tests `irq-exit` with a
 test-only transport provider. A production consumer must inject its Layer 0
-provider and prove the final link; TheKernel does so unconditionally through
-its coordinated `axruntime`/`axhal` release set. It is not a profile-selected
-optimization.
+provider and prove the final link; TheKernel does so through its coordinated
+`axruntime`/`axhal` integration.
 
-The first unpack command validates the four original mechanism artifacts. The
-last command packages the coordinated three-crate maintained-fork release set,
-unpacks the registry artifacts in a temporary directory, and tests them
-without access to TheKernel's workspace patches.
+The original-package unpack check validates the currently supported original
+mechanism artifacts. The coordinated unpack check packages the three maintained
+fork crates, unpacks their registry artifacts in a temporary directory, and
+tests them without access to TheKernel workspace patches.
 
-The publish dry-run uses Rust 1.85.0 for the independent `thekernel-axcbpf` and
-`thekernel-axpmu` artifacts and the rolling `nightly` for the coordinated
-maintained-fork set. A dry-run does not publish either original artifact: each
-must be published separately from the verified commit and pass its own exact
-registry-version and docs.rs checks. An `axcbpf` release must be visible in
-crates.io before a downstream TheKernel Linux-ABI seccomp adapter is published;
-see [`docs/RELEASE.md`](docs/RELEASE.md) for the exact ordering.
+A publish dry-run never authorizes an upload. See
+[`docs/RELEASE.md`](docs/RELEASE.md) for the dependency order and exact release
+requirements.
 
 ## Project policy
 
