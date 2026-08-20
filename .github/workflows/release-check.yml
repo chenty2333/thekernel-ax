@@ -1,0 +1,85 @@
+name: Release Check
+
+on:
+  workflow_dispatch:
+    inputs:
+      axtask_registry_ready:
+        description: Run the real registry-only thekernel-axtask publish dry-run
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: thekernel-ax-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Documentation, packages, and publish dry-runs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: nightly
+          components: clippy,rustfmt
+
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.85.0
+
+      - name: Cache Cargo outputs
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Build release documentation
+        shell: bash
+        run: |
+          set -euo pipefail
+          stable_packages=(
+            thekernel-axcbpf
+            thekernel-axfault
+            thekernel-axrcu
+            thekernel-axpmu
+            thekernel-axtlb
+            thekernel-axpoll
+          )
+          for package in "${stable_packages[@]}"; do
+            RUSTDOCFLAGS='-D warnings' \
+              cargo +1.85.0 doc -p "$package" --no-deps --locked
+          done
+          features='multitask irq preempt smp sched-eevdf task-ext irq-continuation-diagnostics irq-exit'
+          RUSTDOCFLAGS='-D warnings' \
+            cargo +nightly doc -p thekernel-axtask --no-deps --locked \
+            --features "$features"
+
+      - name: Validate original package artifacts
+        env:
+          CARGO_TOOLCHAIN: 1.85.0
+        run: scripts/package-unpack-original.sh
+
+      - name: Run coordinated publish dry-runs
+        env:
+          AXCBPF_CARGO_TOOLCHAIN: 1.85.0
+          CARGO_TOOLCHAIN: nightly
+          AXTASK_REGISTRY_READY: ${{ inputs.axtask_registry_ready && '1' || '0' }}
+        run: scripts/publish-dry-run.sh
+
+      - name: Validate coordinated package artifacts
+        env:
+          CARGO_TOOLCHAIN: nightly
+        run: scripts/package-unpack.sh

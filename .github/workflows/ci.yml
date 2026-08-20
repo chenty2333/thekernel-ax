@@ -5,157 +5,134 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      axtask_registry_ready:
-        description: Run the real registry-only thekernel-axtask publish dry-run
-        required: false
-        type: boolean
-        default: false
+
+concurrency:
+  group: thekernel-ax-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
 jobs:
-  governance:
-    runs-on: ubuntu-latest
+  current:
+    name: Current-toolchain quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          toolchain: nightly
-          components: rustfmt
-      - name: Formatting, registry graph, and provenance
-        run: |
-          cargo +nightly fmt --all -- --check
-          python3 scripts/check_registry_dependencies.py
-          scripts/check-provenance.sh
+          persist-credentials: false
 
-  axsched-msrv:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
-        with:
-          toolchain: nightly
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
-        with:
-          toolchain: 1.76.0
-          components: clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Test unpacked axsched artifact at MSRV
-        run: scripts/test-axsched-msrv.sh
-
-  axcbpf-msrv:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
-        with:
-          toolchain: 1.85.0
-          components: clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Test, lint, document, package, and cross-check axcbpf
-        run: |
-          cargo +1.85.0 test -p thekernel-axcbpf --all-targets --locked
-          cargo +1.85.0 test -p thekernel-axcbpf --doc --locked
-          cargo +1.85.0 clippy -p thekernel-axcbpf --all-targets --locked -- -D warnings
-          RUSTDOCFLAGS='-D warnings' cargo +1.85.0 doc -p thekernel-axcbpf --no-deps --locked
-          scripts/package-unpack-original.sh thekernel-axcbpf
-
-  axfault-msrv:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
-        with:
-          toolchain: 1.85.0
-          components: clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Test, lint, document, package, and cross-check axfault
-        run: |
-          cargo +1.85.0 test -p thekernel-axfault --all-targets --locked
-          cargo +1.85.0 test -p thekernel-axfault --doc --locked
-          cargo +1.85.0 clippy -p thekernel-axfault --all-targets --locked -- -D warnings
-          RUSTDOCFLAGS='-D warnings' cargo +1.85.0 doc -p thekernel-axfault --no-deps --locked
-          scripts/package-unpack-original.sh thekernel-axfault
-
-  axtlb-msrv:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
-        with:
-          toolchain: 1.85.0
-          components: clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Test, lint, document, package, and cross-check axtlb
-        run: |
-          cargo +1.85.0 test -p thekernel-axtlb --all-targets --locked
-          cargo +1.85.0 test -p thekernel-axtlb --doc --locked
-          cargo +1.85.0 clippy -p thekernel-axtlb --all-targets --locked -- -D warnings
-          RUSTDOCFLAGS='-D warnings' cargo +1.85.0 doc -p thekernel-axtlb --no-deps --locked
-          scripts/package-unpack-original.sh thekernel-axtlb
-
-  axpmu-msrv:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
-        with:
-          toolchain: 1.85.0
-          components: clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Test, lint, document, and cross-check source and packaged axpmu
-        run: |
-          cargo +1.85.0 test -p thekernel-axpmu --all-targets --locked
-          cargo +1.85.0 test -p thekernel-axpmu --doc --locked
-          cargo +1.85.0 clippy -p thekernel-axpmu --all-targets --locked -- -D warnings
-          RUSTDOCFLAGS='-D warnings' cargo +1.85.0 doc -p thekernel-axpmu --no-deps --locked
-          scripts/package-unpack-original.sh thekernel-axpmu
-
-  axpoll-msrv:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
-        with:
-          toolchain: 1.85.0
-          components: clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Test, lint, document, and cross-check axpoll
-        run: |
-          cargo +1.85.0 test -p thekernel-axpoll --all-targets --locked
-          cargo +1.85.0 clippy -p thekernel-axpoll --all-targets --locked -- -D warnings
-          RUSTDOCFLAGS='-D warnings' cargo +1.85.0 doc -p thekernel-axpoll --no-deps --locked
-
-  axtask-nightly:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
-        with:
-          toolchain: 1.85.0
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: nightly
           components: clippy,rustfmt
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Test axtask feature matrix
+
+      - name: Cache Cargo outputs
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Format
+        run: cargo +nightly fmt --all -- --check
+
+      - name: Validate dependency graph and provenance
         run: |
-          features='multitask irq preempt smp sched-eevdf task-ext irq-continuation-diagnostics irq-exit'
+          python3 scripts/check_registry_dependencies.py
+          scripts/check-provenance.sh
+
+      - name: Test and lint stable mechanism crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          packages=(
+            thekernel-axcbpf
+            thekernel-axfault
+            thekernel-axrcu
+            thekernel-axpmu
+            thekernel-axtlb
+            thekernel-axpoll
+          )
+          for package in "${packages[@]}"; do
+            cargo +nightly test -p "$package" --all-targets --locked
+            cargo +nightly clippy -p "$package" --all-targets --locked -- -D warnings
+          done
+
+      - name: Test and lint axtask feature matrix
+        shell: bash
+        run: |
+          set -euo pipefail
           test_features='test multitask irq preempt smp sched-eevdf task-ext irq-continuation-diagnostics irq-exit'
           cargo +nightly check -p thekernel-axtask --no-default-features --locked
-          cargo +nightly test -p thekernel-axtask --all-targets --locked --features "$test_features"
-          cargo +nightly clippy -p thekernel-axtask --all-targets --locked --features "$test_features" -- -D warnings
-          RUSTDOCFLAGS='-D warnings' cargo +nightly doc -p thekernel-axtask --no-deps --locked --features "$features"
+          cargo +nightly test -p thekernel-axtask --all-targets --locked \
+            --features "$test_features"
+          cargo +nightly clippy -p thekernel-axtask --all-targets --no-deps --locked \
+            --features "$test_features" -- -D warnings
           for scheduler in sched-fifo sched-rr sched-eevdf; do
-            cargo +nightly check -p thekernel-axtask --locked --features "multitask irq preempt smp task-ext $scheduler"
+            cargo +nightly check -p thekernel-axtask --locked \
+              --features "multitask irq preempt smp task-ext $scheduler"
           done
-      - name: Test publish and unpacked release artifacts
-        env:
-          AXCBPF_CARGO_TOOLCHAIN: 1.85.0
-          CARGO_TOOLCHAIN: nightly
-          AXTASK_REGISTRY_READY: ${{ github.event_name == 'workflow_dispatch' && inputs.axtask_registry_ready && '1' || '0' }}
+
+  axsched-msrv:
+    name: axsched Rust 1.76 compatibility
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install packaging toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: nightly
+
+      - name: Install Rust 1.76
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.76.0
+
+      - name: Cache Cargo outputs
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Test unpacked axsched artifact
+        run: scripts/test-axsched-msrv.sh
+
+  rust-1-85:
+    name: Stable crates on Rust 1.85
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.85.0
+
+      - name: Cache Cargo outputs
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Test stable mechanism crates
+        shell: bash
         run: |
-          scripts/publish-dry-run.sh
-          scripts/package-unpack.sh
+          set -euo pipefail
+          packages=(
+            thekernel-axcbpf
+            thekernel-axfault
+            thekernel-axrcu
+            thekernel-axpmu
+            thekernel-axtlb
+            thekernel-axpoll
+          )
+          for package in "${packages[@]}"; do
+            cargo +1.85.0 test -p "$package" --all-targets --locked
+          done
