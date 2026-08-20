@@ -36,38 +36,42 @@ source record.
 ## Build and test
 
 The workspace is intentionally self-contained and has no root
-`[patch.crates-io]` table. The pull-request front door is:
+`[patch.crates-io]` table. Routine local checks are ordinary Cargo and project
+commands rather than a second CI dispatcher:
 
 ```sh
-./scripts/ci.sh quality
+cargo +nightly fmt --all -- --check
+python3 scripts/check_registry_dependencies.py
+scripts/check-provenance.sh
+cargo +nightly test --workspace --locked
 ```
 
-That gate runs formatting, registry-dependency and provenance checks, the
-unpacked Rust-1.76 axsched MSRV test, Rust-1.85 tests and Clippy for the stable
-mechanism crates, and the nightly axtask test/Clippy/feature matrix. It includes
-`thekernel-axrcu`, which was previously a workspace member but absent from both
-the workflow and the old hand-written test list.
+GitHub Actions exposes three independent results: current-toolchain quality,
+the unpacked `thekernel-axsched` artifact on Rust 1.76, and stable mechanism
+crates on Rust 1.85. Current Clippy policy is enforced only with the current
+toolchain. The historical toolchains prove compile/test compatibility; they do
+not turn version-specific Clippy opinions into API compatibility requirements.
 
-Release-only rustdoc, archive, and publish-dry-run checks are separate:
+Release documentation, archive checks, and publish dry-runs live in the manual
+`Release Check` workflow. The corresponding commands remain directly
+available:
 
 ```sh
-./scripts/ci.sh release
+scripts/package-unpack-original.sh
+AXCBPF_CARGO_TOOLCHAIN=1.85.0 CARGO_TOOLCHAIN=nightly \
+  scripts/publish-dry-run.sh
+CARGO_TOOLCHAIN=nightly scripts/package-unpack.sh
 ```
 
-`thekernel-axrcu` is quality-tested but is not yet included in the package
-release helpers because it does not yet carry the release documentation and
-provenance asset set required by those helpers. Do not infer release readiness
-from workspace membership alone.
+`thekernel-axrcu` is quality-tested but is not yet included in every package
+release helper because it does not yet carry the complete release documentation
+and provenance asset set required by those helpers. Do not infer release
+readiness from workspace membership alone.
 
 The self-contained registry matrix type-checks and unit-tests `irq-exit` with a
 test-only transport provider. A production consumer must inject its Layer 0
 provider and prove the final link; TheKernel does so through its coordinated
 `axruntime`/`axhal` integration.
-
-The original-package unpack check validates the currently supported original
-mechanism artifacts. The coordinated unpack check packages the three maintained
-fork crates, unpacks their registry artifacts in a temporary directory, and
-tests them without access to TheKernel workspace patches.
 
 A publish dry-run never authorizes an upload. See
 [`docs/RELEASE.md`](docs/RELEASE.md) for the dependency order and exact release

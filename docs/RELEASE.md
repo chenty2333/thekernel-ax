@@ -4,7 +4,7 @@ The packages have independent names and version histories even when they are
 released from one workspace. The coordinated maintained-fork checkpoint is
 `0.1.0` for `thekernel-axsched`, `thekernel-axpoll`, and `thekernel-axtask`.
 `thekernel-axcbpf` and `thekernel-axpmu` are independent original mechanisms
-with their own `0.1.0` release gates at Rust 1.85.0. User-visible changes for
+with their own `0.1.0` release checks at Rust 1.85.0. User-visible changes for
 these checkpoints are recorded in
 [`releases/0.1.0.md`](releases/0.1.0.md).
 
@@ -16,24 +16,26 @@ these checkpoints are recorded in
 3. Set the package version and update user-facing documentation.
 4. Generate and commit `Cargo.lock` with `cargo generate-lockfile`.
 5. Confirm the root manifest has no `[patch]` or `[replace]` table.
+6. Require all three ordinary CI jobs to pass for the exact release commit.
 
 ## Verify
 
-Routine changes use the same front door as pull-request CI:
+The manual `Release Check` workflow performs only release work: rustdoc,
+package-unpack validation, and publish dry-runs. It does not recursively invoke
+the pull-request checks. The same operations can be run locally:
 
 ```sh
-./scripts/ci.sh quality
+# Documentation
+RUSTDOCFLAGS='-D warnings' cargo +1.85.0 doc -p thekernel-axcbpf --no-deps --locked
+RUSTDOCFLAGS='-D warnings' cargo +nightly doc -p thekernel-axtask --no-deps --locked \
+  --features 'multitask irq preempt smp sched-eevdf task-ext irq-continuation-diagnostics irq-exit'
+
+# Package and registry simulations
+CARGO_TOOLCHAIN=1.85.0 scripts/package-unpack-original.sh
+AXCBPF_CARGO_TOOLCHAIN=1.85.0 CARGO_TOOLCHAIN=nightly \
+  scripts/publish-dry-run.sh
+CARGO_TOOLCHAIN=nightly scripts/package-unpack.sh
 ```
-
-Before publishing, run the explicit release tier:
-
-```sh
-./scripts/ci.sh release
-```
-
-The release tier reruns quality, denies rustdoc warnings, validates the original
-and coordinated unpacked package artifacts, and performs the available publish
-dry-runs. Packaging is deliberately not part of every pull request.
 
 Inspect package contents explicitly when preparing an upload:
 
@@ -52,56 +54,31 @@ The original-package unpack test builds `thekernel-axcbpf`,
 archives with Rust 1.85.0, `--locked`, and `--offline`. Registry publish
 dry-runs are currently defined only for `thekernel-axcbpf` and
 `thekernel-axpmu`; archive validation is not itself publication readiness.
-The maintained-fork unpack test builds leaf packages directly
-from normalized archives. The first axtask release uses only sibling archives
-whose SHA-256 values match its generated release lock. These checks prove that
-packaged source builds outside both this workspace and TheKernel's patch table;
-they do not claim a registry-only axtask check before both leaf versions exist.
+The maintained-fork unpack test builds leaf packages directly from normalized
+archives. The first axtask release uses only sibling archives whose SHA-256
+values match its generated release lock.
 
 ## Publish
 
-1. Run `./scripts/ci.sh release`. A successful dry-run does not publish any
-   package.
-2. Publish `thekernel-axcbpf` only from the exact commit whose package, offline
-   unpack, provenance, CI, and publish dry-run gates passed:
+1. Publish `thekernel-axcbpf` only from the exact commit whose package, offline
+   unpack, provenance, CI, and publish dry-run checks passed:
 
    ```sh
    cargo +1.85.0 publish --locked --registry crates-io -p thekernel-axcbpf
    ```
 
-   Wait for both exact-version checks to succeed:
-
-   ```sh
-   cargo +1.85.0 info thekernel-axcbpf@0.1.0 --registry crates-io
-   curl --location --fail --silent --show-error \
-     https://docs.rs/thekernel-axcbpf/0.1.0/axcbpf/
-   ```
-
-   Only then publish the downstream TheKernel Linux-ABI seccomp adapter; a
-   workspace path or patch is not a substitute for this dependency boundary.
-3. Publish `thekernel-axpmu` independently from the same exact verified release
-   commit:
-
-   ```sh
-   cargo +1.85.0 publish --locked --registry crates-io -p thekernel-axpmu
-   ```
-
-   Wait for its exact registry version and docs.rs build before claiming that
-   the package was released or switching a downstream package to the released
-   dependency.
-4. For the first maintained-fork release, crates.io cannot resolve
-   `thekernel-axtask` until the two sibling `0.1.0` packages exist.
-   `scripts/package-unpack.sh` is the pre-publication substitute: it verifies
-   the exact sibling archives and tests the unpacked axtask artifact without a
-   workspace patch leak.
-5. Publish `thekernel-axsched` and `thekernel-axpoll` from the same verified
-   commit. Wait until both are visible in the registry index, then run
+   Wait for the exact registry version and docs.rs build before releasing a
+   downstream package.
+2. Publish `thekernel-axpmu` independently from the same exact verified release
+   commit and wait for its exact registry version and docs.rs build.
+3. For the first maintained-fork release, publish `thekernel-axsched` and
+   `thekernel-axpoll` first. Once both versions are visible, run
    `AXTASK_REGISTRY_READY=1 scripts/publish-dry-run.sh` and publish
-   `thekernel-axtask` only if that final registry dry-run passes.
-6. Publish only after all gates pass for the exact release commit.
-7. Create an exact-commit repository tag `v0.1.0`; its release record lists the
+   `thekernel-axtask` only if that registry-only dry-run passes.
+4. Publish only after all checks pass for the exact release commit.
+5. Create an exact-commit repository tag `v0.1.0`; its release record lists the
    checksum of every package published from that tag.
-8. Verify registry checksums and docs.rs builds after publication.
+6. Verify registry checksums and docs.rs builds after publication.
 
 Publishing and pushing tags are deliberate maintainer actions; local release
 preparation does not imply authorization to perform either action.

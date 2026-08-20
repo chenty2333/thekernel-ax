@@ -17,8 +17,10 @@ if ! git -C "$root" diff --quiet \
 fi
 
 # Cargo 1.76 predates edition 2024 and therefore cannot parse the other
-# workspace members. Package with the repository toolchain, then run the exact
-# registry artifact in isolation with the claimed MSRV.
+# workspace members. Package with the repository toolchain, then test the exact
+# registry artifact in isolation with the claimed MSRV. Lint and rustdoc policy
+# belong to the current toolchain; historical Clippy output is not an MSRV
+# compatibility condition.
 CARGO_TARGET_DIR="$tmp/package-target" \
     cargo +nightly package \
         --manifest-path "$root/Cargo.toml" \
@@ -34,9 +36,5 @@ crate_dir="$tmp/unpacked/thekernel-axsched-0.1.0"
 
 export CARGO_TARGET_DIR="$tmp/msrv-target"
 cargo +1.76.0 test --manifest-path "$crate_dir/Cargo.toml" --all-targets --locked
-cargo +1.76.0 clippy \
-    --manifest-path "$crate_dir/Cargo.toml" --all-targets --locked -- -D warnings
-RUSTDOCFLAGS='-D warnings' \
-    cargo +1.76.0 doc --manifest-path "$crate_dir/Cargo.toml" --no-deps --locked
 
 printf 'axsched-msrv: PASS (1.76.0, unpacked artifact)\n'

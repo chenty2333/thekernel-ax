@@ -13,9 +13,13 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
 jobs:
-  quality:
-    name: Rust quality and compatibility
+  current:
+    name: Current-toolchain quality
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -30,20 +34,105 @@ jobs:
           toolchain: nightly
           components: clippy,rustfmt
 
-      - name: Install Rust 1.85
+      - name: Cache Cargo outputs
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Format
+        run: cargo +nightly fmt --all -- --check
+
+      - name: Validate dependency graph and provenance
+        run: |
+          python3 scripts/check_registry_dependencies.py
+          scripts/check-provenance.sh
+
+      - name: Test and lint stable mechanism crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          packages=(
+            thekernel-axcbpf
+            thekernel-axfault
+            thekernel-axrcu
+            thekernel-axpmu
+            thekernel-axtlb
+            thekernel-axpoll
+          )
+          for package in "${packages[@]}"; do
+            cargo +nightly test -p "$package" --all-targets --locked
+            cargo +nightly clippy -p "$package" --all-targets --locked -- -D warnings
+          done
+
+      - name: Test and lint axtask feature matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_features='test multitask irq preempt smp sched-eevdf task-ext irq-continuation-diagnostics irq-exit'
+          cargo +nightly check -p thekernel-axtask --no-default-features --locked
+          cargo +nightly test -p thekernel-axtask --all-targets --locked \
+            --features "$test_features"
+          cargo +nightly clippy -p thekernel-axtask --all-targets --locked \
+            --features "$test_features" -- -D warnings
+          for scheduler in sched-fifo sched-rr sched-eevdf; do
+            cargo +nightly check -p thekernel-axtask --locked \
+              --features "multitask irq preempt smp task-ext $scheduler"
+          done
+
+  axsched-msrv:
+    name: axsched Rust 1.76 compatibility
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install packaging toolchain
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
-          toolchain: 1.85.0
-          components: clippy
+          toolchain: nightly
 
-      - name: Install axsched MSRV
+      - name: Install Rust 1.76
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: 1.76.0
-          components: clippy
 
       - name: Cache Cargo outputs
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
-      - name: Run quality gate
-        run: ./scripts/ci.sh quality
+      - name: Test unpacked axsched artifact
+        run: scripts/test-axsched-msrv.sh
+
+  rust-1-85:
+    name: Stable crates on Rust 1.85
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.85.0
+
+      - name: Cache Cargo outputs
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Test stable mechanism crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          packages=(
+            thekernel-axcbpf
+            thekernel-axfault
+            thekernel-axrcu
+            thekernel-axpmu
+            thekernel-axtlb
+            thekernel-axpoll
+          )
+          for package in "${packages[@]}"; do
+            cargo +1.85.0 test -p "$package" --all-targets --locked
+          done
