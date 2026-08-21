@@ -17,6 +17,7 @@ static DEFERRED_INIT: Once = Once::new();
 static SERIAL: Mutex<()> = Mutex::new(());
 static DEFERRED_CALLS: AtomicUsize = AtomicUsize::new(0);
 static DEFERRED_REENTER: AtomicBool = AtomicBool::new(false);
+static DEFERRED_BLOCKABLE: AtomicBool = AtomicBool::new(true);
 
 #[cfg(feature = "task-ext")]
 const GC_DROP_OK: usize = 1;
@@ -50,7 +51,13 @@ fn init_for_test() {
 }
 
 fn test_deferred_dispatcher() {
-    assert!(axtask::can_block_current());
+    // The dispatcher stays installed for the whole binary and runs at any
+    // task-context safe point, including points inside another test's
+    // blocking transition where the current task is not running and thus not
+    // allowed to block again. The library contract only guarantees
+    // scheduler-context safety, so record blockability for the owning test
+    // instead of asserting it here; a dispatcher must not panic.
+    DEFERRED_BLOCKABLE.store(axtask::can_block_current(), Ordering::Release);
     DEFERRED_CALLS.fetch_add(1, Ordering::Release);
     if DEFERRED_REENTER.swap(false, Ordering::AcqRel) {
         axtask::run_deferred_work();
@@ -196,6 +203,7 @@ fn deferred_work_runs_at_yield_and_suppresses_same_task_recursion() {
     DEFERRED_REENTER.store(true, Ordering::Release);
     axtask::run_deferred_work();
     assert_eq!(DEFERRED_CALLS.load(Ordering::Acquire), 1);
+    assert!(DEFERRED_BLOCKABLE.load(Ordering::Acquire));
 
     DEFERRED_CALLS.store(0, Ordering::Release);
     axtask::yield_now();
