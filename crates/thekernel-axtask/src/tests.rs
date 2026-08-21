@@ -284,13 +284,19 @@ fn test_wait_queue() {
     static WQ1: WaitQueue = WaitQueue::new();
     static WQ2: WaitQueue = WaitQueue::new();
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    // notify_all only wakes tasks that have already registered a listener, so
+    // a one-shot barrier races against tasks that are still between their
+    // start publication and WQ2 registration. The flag makes the second wait
+    // condition-based: late registrants observe it immediately instead of
+    // blocking on a notification that already fired.
+    static PROCEED: AtomicBool = AtomicBool::new(false);
 
     for _ in 0..NUM_TASKS {
         axtask::spawn(move || {
             COUNTER.fetch_add(1, Ordering::Release);
             println!("wait_queue: task {:?} started", current().id());
             WQ1.notify_one(true); // WQ1.wait_until()
-            WQ2.wait().unwrap();
+            WQ2.wait_until(|| PROCEED.load(Ordering::Acquire)).unwrap();
 
             COUNTER.fetch_sub(1, Ordering::Release);
             println!("wait_queue: task {:?} finished", current().id());
@@ -304,6 +310,7 @@ fn test_wait_queue() {
         .unwrap();
     axtask::yield_now();
     assert_eq!(COUNTER.load(Ordering::Acquire), NUM_TASKS);
+    PROCEED.store(true, Ordering::Release);
     WQ2.notify_all(true); // WQ2.wait()
 
     println!(
