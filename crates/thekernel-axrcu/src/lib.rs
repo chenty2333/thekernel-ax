@@ -391,7 +391,10 @@ impl<P: EpochPlatform, const MAX_CPUS: usize, const CAPACITY: usize>
                             // CPU from observing the admission word between
                             // the increment and the outer marker publication.
                             let active = reader.active_epoch.load(Ordering::Acquire);
-                            debug_assert_ne!(active, 0);
+                            debug_assert_ne!(
+                                active, 0,
+                                "nested admission with quiescent marker: cpu={cpu} depth={depth} state={state:#x}"
+                            );
                             return Ok(Some((true, active.saturating_sub(1))));
                         }
                         Ok(_) => break,
