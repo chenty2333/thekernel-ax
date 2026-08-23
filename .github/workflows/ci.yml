@@ -41,7 +41,7 @@ jobs:
         with:
           toolchain: 1.76.0
           components: clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - name: Test unpacked axsched artifact at MSRV
         run: scripts/test-axsched-msrv.sh
 
@@ -53,7 +53,7 @@ jobs:
         with:
           toolchain: 1.85.0
           components: clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - name: Test, lint, document, package, and cross-check axcbpf
         run: |
           cargo +1.85.0 test -p thekernel-axcbpf --all-targets --locked
@@ -70,7 +70,7 @@ jobs:
         with:
           toolchain: 1.85.0
           components: clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - name: Test, lint, document, package, and cross-check axfault
         run: |
           cargo +1.85.0 test -p thekernel-axfault --all-targets --locked
@@ -87,7 +87,7 @@ jobs:
         with:
           toolchain: 1.85.0
           components: clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - name: Test, lint, document, package, and cross-check axtlb
         run: |
           cargo +1.85.0 test -p thekernel-axtlb --all-targets --locked
@@ -104,7 +104,7 @@ jobs:
         with:
           toolchain: 1.85.0
           components: clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - name: Test, lint, document, and cross-check source and packaged axpmu
         run: |
           cargo +1.85.0 test -p thekernel-axpmu --all-targets --locked
@@ -121,7 +121,7 @@ jobs:
         with:
           toolchain: 1.85.0
           components: clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - name: Test, lint, document, and cross-check axpoll
         run: |
           cargo +1.85.0 test -p thekernel-axpoll --all-targets --locked
@@ -139,7 +139,7 @@ jobs:
         with:
           toolchain: nightly
           components: clippy,rustfmt
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - name: Test axtask feature matrix
         run: |
           features='multitask irq preempt smp sched-eevdf task-ext irq-continuation-diagnostics irq-exit'
