@@ -1964,6 +1964,16 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
         let curr = self.current_task().clone();
         assert!(curr.is_running());
 
+        // A migration helper is deliberately outside every scheduler while it
+        // transfers its predecessor. It must consume a remote reschedule
+        // publication without entering the ordinary Running -> Ready path:
+        // that path would let EEVDF adopt it as `running`, while exit_current
+        // intentionally skips its deactivation. The helper's exit reschedules
+        // the ready work after the handoff is complete.
+        if consume_migration_helper_reschedule(&curr) {
+            return;
+        }
+
         // The outer dispatcher owns one preemption-disable unit while an
         // `IrqSave` runqueue guard protects this iteration. Therefore count 1
         // is the only state that grants preemption permission here.
@@ -2764,7 +2774,8 @@ impl AxRunQueue {
     }
 
     /// Puts target task into current run queue with `Ready` state
-    /// if its state matches `current_state` (except idle task).
+    /// if its state matches `current_state` (except idle and migration-helper
+    /// handoff sentinels).
     ///
     /// If `preempt`, keep current task's time slice, otherwise reset it.
     ///
@@ -2777,8 +2788,8 @@ impl AxRunQueue {
         preempt: bool,
     ) -> PutTaskOutcome {
         // If the task's state matches `current_state`, set its state to `Ready` and
-        // put it back to the run queue (except idle task).
-        if task.is_idle() {
+        // put it back to the run queue (except handoff sentinels).
+        if task.is_idle() || task.is_migration_helper() {
             return PutTaskOutcome::StateMismatch;
         }
         if task.transition_state(current_state, TaskState::Ready) {
@@ -3007,6 +3018,15 @@ impl AxRunQueue {
             clear_prev_task_on_cpu();
         }
     }
+}
+
+#[cfg(feature = "preempt")]
+fn consume_migration_helper_reschedule(task: &AxTaskRef) -> bool {
+    if !task.is_migration_helper() {
+        return false;
+    }
+    let _ = task.take_preempt_pending();
+    true
 }
 
 fn is_valid_idle_fallback(task: &AxTaskRef) -> bool {
@@ -4013,6 +4033,59 @@ mod exited_queue_tests {
         assert!(is_valid_idle_fallback(&idle));
         idle.set_state(TaskState::Blocked);
         assert!(!is_valid_idle_fallback(&idle));
+    }
+
+    #[cfg(feature = "sched-eevdf")]
+    #[test]
+    fn helper_preemption_does_not_admit_it_or_displace_ready_work() {
+        let mut helper = TaskInner::new_init("migration-helper".into()).unwrap();
+        helper.mark_migration_helper();
+        let helper = helper.into_arc().unwrap();
+        helper.set_state(TaskState::Running);
+        helper.set_preempt_pending(true);
+
+        let ready = task("ready-after-helper");
+        let run_queue = AxRunQueue {
+            cpu_id: 0,
+            scheduler: SpinRaw::new(Scheduler::new()),
+            running_accounted_ns: AtomicU64::new(0),
+            load: RunQueueLoad::new(0, false),
+        };
+        run_queue.scheduler.lock().add_task(ready.clone()).unwrap();
+
+        assert!(consume_migration_helper_reschedule(&helper));
+        assert!(
+            !helper.take_preempt_pending(),
+            "helper reschedule must be consumed without a scheduler handoff"
+        );
+        assert!(matches!(
+            run_queue.put_task_with_state(helper.clone(), TaskState::Running, true),
+            PutTaskOutcome::StateMismatch
+        ));
+        assert!(helper.is_running());
+        assert!(!run_queue.scheduler.lock().is_running_task(&helper));
+
+        let selected = run_queue
+            .scheduler
+            .lock()
+            .pick_next_task()
+            .expect("ready work must remain selectable after helper preemption");
+        assert!(Arc::ptr_eq(&selected, &ready));
+        assert!(run_queue.scheduler.lock().is_running_task(&selected));
+
+        let normal = task("ordinary-preempted-task");
+        normal.set_state(TaskState::Running);
+        let normal_run_queue = AxRunQueue {
+            cpu_id: 0,
+            scheduler: SpinRaw::new(Scheduler::new()),
+            running_accounted_ns: AtomicU64::new(0),
+            load: RunQueueLoad::new(0, false),
+        };
+        assert!(matches!(
+            normal_run_queue.put_task_with_state(normal.clone(), TaskState::Running, true),
+            PutTaskOutcome::Enqueued
+        ));
+        assert!(normal.is_ready());
     }
 
     #[cfg(feature = "sched-eevdf")]
