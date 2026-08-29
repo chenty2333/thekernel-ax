@@ -592,10 +592,19 @@ pub fn scheduler_commit_version(task: &AxTaskRef) -> u64 {
 
 /// Exact scheduler state committed by one serialized scheduler transaction.
 #[cfg(feature = "sched-eevdf")]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TaskSchedCommit {
     pub state: SchedState,
     pub version: u64,
+}
+
+/// Snapshots a task's scheduler state and commit version under the scheduler
+/// lock of the run queue that currently owns the task.  Callers that need to
+/// carry scheduler state across another synchronization domain must use this
+/// rather than separately reading the state and version.
+#[cfg(feature = "sched-eevdf")]
+pub fn scheduler_state_snapshot(task: &AxTaskRef) -> Result<TaskSchedCommit, TaskSchedError> {
+    crate::run_queue::scheduler_state_snapshot_stable(task)
 }
 
 /// Applies the runtime scheduling state of a task.

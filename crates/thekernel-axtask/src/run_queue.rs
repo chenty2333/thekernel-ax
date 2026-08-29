@@ -909,6 +909,13 @@ enum TaskSchedUpdate {
     Redirect,
 }
 
+#[cfg(feature = "sched-eevdf")]
+enum TaskSchedSnapshot {
+    Complete(Result<TaskSchedCommit, TaskSchedError>),
+    #[cfg(feature = "smp")]
+    Redirect,
+}
+
 impl From<SchedulerError> for TaskSchedError {
     fn from(error: SchedulerError) -> Self {
         match error {
@@ -961,12 +968,11 @@ pub(crate) fn set_task_nice_stable(
     task: &AxTaskRef,
     nice: i8,
 ) -> Result<TaskSchedCommit, TaskSchedError> {
-    let placeholder = task.sched_params();
     #[cfg(not(feature = "smp"))]
     {
         let TaskSchedUpdate::Complete(result) =
             task_run_queue::<kernel_guard::NoPreemptIrqSave>(task)
-                .set_task_sched_state_once(task, placeholder, Some(nice));
+                .set_task_sched_state_once(task, axsched::EevdfTaskParams::default(), Some(nice));
         result
     }
     #[cfg(feature = "smp")]
@@ -974,10 +980,38 @@ pub(crate) fn set_task_nice_stable(
         let attempts = axconfig::plat::MAX_CPU_NUM.saturating_add(1).max(2);
         for _ in 0..attempts {
             match task_run_queue::<kernel_guard::NoPreemptIrqSave>(task)
-                .set_task_sched_state_once(task, placeholder, Some(nice))
+                .set_task_sched_state_once(task, axsched::EevdfTaskParams::default(), Some(nice))
             {
                 TaskSchedUpdate::Complete(result) => return result,
                 TaskSchedUpdate::Redirect => {}
+            }
+        }
+        Err(TaskSchedError::Scheduler(SchedulerError::TaskBusy))
+    }
+}
+
+/// Returns one exact state/version pair from the scheduler transaction domain
+/// of the task's stable run-queue owner.
+#[cfg(feature = "sched-eevdf")]
+pub(crate) fn scheduler_state_snapshot_stable(
+    task: &AxTaskRef,
+) -> Result<TaskSchedCommit, TaskSchedError> {
+    #[cfg(not(feature = "smp"))]
+    {
+        let TaskSchedSnapshot::Complete(result) =
+            task_run_queue::<kernel_guard::NoPreemptIrqSave>(task)
+                .scheduler_state_snapshot_once(task);
+        result
+    }
+    #[cfg(feature = "smp")]
+    {
+        let attempts = axconfig::plat::MAX_CPU_NUM.saturating_add(1).max(2);
+        for _ in 0..attempts {
+            match task_run_queue::<kernel_guard::NoPreemptIrqSave>(task)
+                .scheduler_state_snapshot_once(task)
+            {
+                TaskSchedSnapshot::Complete(result) => return result,
+                TaskSchedSnapshot::Redirect => {}
             }
         }
         Err(TaskSchedError::Scheduler(SchedulerError::TaskBusy))
@@ -1675,6 +1709,19 @@ impl<G: BaseGuard> AxRunQueueRef<'_, G> {
             )));
         };
         run_queue.set_task_sched_state(task, sched_state, nice)
+    }
+
+    #[cfg(feature = "sched-eevdf")]
+    fn scheduler_state_snapshot_once(&mut self, task: &AxTaskRef) -> TaskSchedSnapshot {
+        if task.is_terminalizing() || matches!(task.state(), TaskState::Exited) {
+            return TaskSchedSnapshot::Complete(Err(TaskSchedError::TaskExited));
+        }
+        let Some(run_queue) = self.inner else {
+            return TaskSchedSnapshot::Complete(Err(TaskSchedError::RunQueueUnavailable(
+                self.selected_cpu,
+            )));
+        };
+        run_queue.scheduler_state_snapshot(task)
     }
 
     #[cfg(feature = "smp")]
@@ -2764,6 +2811,25 @@ impl AxRunQueue {
                 }
             });
         TaskSchedUpdate::Complete(result)
+    }
+
+    #[cfg(feature = "sched-eevdf")]
+    fn scheduler_state_snapshot(&self, task: &AxTaskRef) -> TaskSchedSnapshot {
+        if task.is_terminalizing() || matches!(task.state(), TaskState::Exited) {
+            return TaskSchedSnapshot::Complete(Err(TaskSchedError::TaskExited));
+        }
+        let _scheduler = self.scheduler.lock();
+        if task.is_terminalizing() || matches!(task.state(), TaskState::Exited) {
+            return TaskSchedSnapshot::Complete(Err(TaskSchedError::TaskExited));
+        }
+        #[cfg(feature = "smp")]
+        if task.cpu_id() as usize != self.cpu_id {
+            return TaskSchedSnapshot::Redirect;
+        }
+        TaskSchedSnapshot::Complete(Ok(TaskSchedCommit {
+            state: task.sched_params(),
+            version: task.sched_commit_version(),
+        }))
     }
 
     fn new_gc_task(cpu_id: usize) -> Result<AxTaskRef, TaskRuntimeInitError> {
