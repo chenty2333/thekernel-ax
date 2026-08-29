@@ -585,10 +585,39 @@ pub fn sched_state(task: &AxTaskRef) -> SchedState {
     task.sched_params()
 }
 
+#[cfg(feature = "sched-eevdf")]
+pub fn scheduler_commit_version(task: &AxTaskRef) -> u64 {
+    task.sched_commit_version()
+}
+
+/// Exact scheduler state committed by one serialized scheduler transaction.
+#[cfg(feature = "sched-eevdf")]
+#[derive(Clone, Copy, Debug)]
+pub struct TaskSchedCommit {
+    pub state: SchedState,
+    pub version: u64,
+}
+
 /// Applies the runtime scheduling state of a task.
 #[cfg(feature = "sched-eevdf")]
 pub fn set_sched_state(task: &AxTaskRef, sched_state: SchedState) -> Result<(), TaskSchedError> {
+    crate::run_queue::set_task_sched_state_stable(task, sched_state).map(|_| ())
+}
+
+#[cfg(feature = "sched-eevdf")]
+pub fn set_sched_state_versioned(
+    task: &AxTaskRef,
+    sched_state: SchedState,
+) -> Result<TaskSchedCommit, TaskSchedError> {
     crate::run_queue::set_task_sched_state_stable(task, sched_state)
+}
+
+/// Changes only a task's nice value while its owning scheduler lock is held.
+/// This preserves a concurrent policy/class update instead of publishing a
+/// stale whole-state snapshot.
+#[cfg(feature = "sched-eevdf")]
+pub fn set_task_nice(task: &AxTaskRef, nice: i8) -> Result<TaskSchedCommit, TaskSchedError> {
+    crate::run_queue::set_task_nice_stable(task, nice)
 }
 
 /// Requests reclamation of exited tasks queued on the current CPU.

@@ -646,6 +646,9 @@ pub struct TaskInner {
 
     /// Used to indicate the CPU ID where the task is running or will run.
     cpu_id: AtomicU32,
+    /// Per-task scheduler transaction generation; durable task snapshots only
+    /// compare commits from this same stream.
+    sched_commit_version: AtomicU64,
     /// CPU on which this task most recently received a context-switch-in.
     /// This is separate from `cpu_id`, which is the current routing owner and
     /// may be published ahead of a migration commit.
@@ -771,6 +774,12 @@ impl Drop for PreemptDispatchGuard<'_> {
 }
 
 impl TaskInner {
+    pub fn next_sched_commit_version(&self) -> u64 {
+        self.sched_commit_version.fetch_add(1, Ordering::AcqRel)
+    }
+    pub fn sched_commit_version(&self) -> u64 {
+        self.sched_commit_version.load(Ordering::Acquire).wrapping_sub(1)
+    }
     /// Fallibly creates a new unpublished task.
     ///
     /// This constructor is intentionally fallible in the 0.1 contract: both
@@ -1345,6 +1354,7 @@ impl TaskInner {
             // By default, the task is allowed to run on all CPUs.
             affinity: SpinNoIrq::new(TaskAffinity::new(crate::api::cpu_mask_full())),
             cpu_id: AtomicU32::new(0),
+            sched_commit_version: AtomicU64::new(1),
             #[cfg(feature = "idle-steal")]
             last_run_cpu: AtomicU32::new(0),
             #[cfg(feature = "idle-steal")]
