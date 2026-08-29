@@ -755,7 +755,14 @@ impl PreparedTaskPublication {
         task
     }
 
-    pub(crate) fn commit(mut self) -> AxTaskRef {
+    pub(crate) fn commit(self) -> AxTaskRef {
+        self.commit_with_reschedule(request_reschedule_cpu)
+    }
+
+    fn commit_with_reschedule(
+        mut self,
+        request_reschedule: impl FnOnce(usize, &AxTaskRef),
+    ) -> AxTaskRef {
         let reservation = self
             .reservation
             .take()
@@ -770,7 +777,7 @@ impl PreparedTaskPublication {
         // around this final scheduler mutation. Otherwise the local timer IRQ
         // can re-enter `scheduler_timer_tick()` and spin forever on this raw
         // scheduler lock while publication is refreshing EEVDF state.
-        let _guard = kernel_guard::NoPreemptIrqSave::new();
+        let guard = kernel_guard::NoPreemptIrqSave::new();
         let (publication, publication_claim_corrupt) = {
             let mut scheduler = self.run_queue.scheduler.lock();
             let result = scheduler.commit_reserved_task(reservation);
@@ -799,7 +806,15 @@ impl PreparedTaskPublication {
             axhal::power::system_off();
         }
         match publication {
-            Ok(task) => task,
+            Ok(task) => {
+                // The scheduler lock has made the task selectable. Release
+                // local IRQ/preemption exclusion before notifying the
+                // destination so an IPI or preemption boundary cannot observe
+                // a lock still held here.
+                drop(guard);
+                request_reschedule(self.run_queue.cpu_id, &task);
+                task
+            }
             Err(error) => {
                 let kind = error.kind();
                 let reservation = error.into_reservation();
@@ -3449,6 +3464,78 @@ mod exited_queue_tests {
         let seed = scheduler.fork_seed(&parent).unwrap();
         let child = task("fork-runtime-child");
         child.install_fork_seed(seed).unwrap();
+    }
+
+    #[cfg(all(feature = "sched-eevdf", feature = "smp"))]
+    #[test]
+    fn new_task_publication_kicks_only_after_successful_commit() {
+        if axconfig::plat::MAX_CPU_NUM < 2 {
+            return;
+        }
+
+        // Use a remote CPU so this host-side unit test exercises the complete
+        // publication path without needing an initialized current task for a
+        // local preemption request.
+        let target_cpu = if this_cpu_id() == 0 { 1 } else { 0 };
+        let new_task = task("new-task-publication-kick");
+        assert!(new_task.try_reserve_publication_mutation());
+        let run_queue = alloc::boxed::Box::leak(alloc::boxed::Box::new(AxRunQueue {
+            cpu_id: target_cpu,
+            scheduler: SpinRaw::new(Scheduler::new()),
+            running_accounted_ns: AtomicU64::new(0),
+            load: RunQueueLoad::new(0, false),
+        }));
+        let reservation = run_queue
+            .scheduler
+            .lock()
+            .reserve_new_task(&new_task)
+            .expect("fresh task reservation must succeed");
+
+        let reschedule_requests = AtomicUsize::new(0);
+        let published = PreparedTaskPublication {
+            run_queue,
+            reservation: Some(reservation),
+        }
+        .commit_with_reschedule(|cpu_id, task| {
+            assert_eq!(cpu_id, target_cpu);
+            assert!(Arc::ptr_eq(task, &new_task));
+            assert_eq!(run_queue.load.snapshot().ready_tasks, 1);
+            assert_eq!(
+                run_queue
+                    .scheduler
+                    .try_lock()
+                    .expect("post-publication kick must run after scheduler unlock")
+                    .ready_len(),
+                1,
+            );
+            reschedule_requests.fetch_add(1, Ordering::Relaxed);
+        });
+        assert!(Arc::ptr_eq(&published, &new_task));
+        assert_eq!(run_queue.load.snapshot().ready_tasks, 1);
+        assert_eq!(
+            reschedule_requests.load(Ordering::Relaxed),
+            1,
+            "only the successful scheduler commit may request a kick"
+        );
+
+        let cancelled_task = task("cancelled-new-task-publication");
+        assert!(cancelled_task.try_reserve_publication_mutation());
+        let cancelled_reservation = run_queue
+            .scheduler
+            .lock()
+            .reserve_new_task(&cancelled_task)
+            .expect("fresh cancelled task reservation must succeed");
+        PreparedTaskPublication {
+            run_queue,
+            reservation: Some(cancelled_reservation),
+        }
+        .cancel();
+        assert_eq!(run_queue.load.snapshot().ready_tasks, 1);
+        assert_eq!(
+            reschedule_requests.load(Ordering::Relaxed),
+            1,
+            "cancellation must not request a reschedule"
+        );
     }
 
     #[cfg(feature = "sched-eevdf")]
