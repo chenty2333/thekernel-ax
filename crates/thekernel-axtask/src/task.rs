@@ -600,6 +600,10 @@ pub trait TaskExt {
     fn on_enter(&self, _task: &TaskInner) {}
     /// Called when the task is switched out.
     fn on_leave(&self, _task: &TaskInner) {}
+    /// Called by the owning raw-waker immediately before publishing a blocked
+    /// task runnable. Implementations must be allocation-free and may only
+    /// perform lock-free state transitions.
+    fn on_ready_wake(&self, _task: &TaskInner) {}
     /// Called for the current task from the periodic timer interrupt.
     ///
     /// Implementations must be allocation-free, non-blocking, and bounded.
@@ -1335,6 +1339,13 @@ impl TaskInner {
     pub fn interrupt(&self) {
         self.interrupted.store(true, Ordering::Release);
         self.interrupt_waker.wake();
+    }
+
+    /// Drops an obsolete interrupt waiter before a Linux-uninterruptible wait.
+    /// The pending signal bit is deliberately retained.
+    #[inline]
+    pub fn clear_interrupt_waker(&self) {
+        let _ = self.interrupt_waker.take();
     }
 }
 

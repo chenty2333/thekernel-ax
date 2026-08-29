@@ -16,7 +16,7 @@ use crate::{
     AxTask, AxTaskRef, current, current_run_queue,
     run_queue::{BlockReschedOutcome, WakeTaskOutcome},
     select_run_queue,
-    task::{BeginBlockWaitError, BlockWakeAction, EndBlockWaitError, WakeMutationClaim},
+    task::{BeginBlockWaitError, BlockWakeAction, EndBlockWaitError, TaskExt, WakeMutationClaim},
 };
 
 #[cfg(feature = "irq")]
@@ -53,6 +53,10 @@ fn wake_task(task: &AxTaskRef) {
 /// mutation claim. Affinity cannot change the committed wake owner until an
 /// immediate enqueue completes or the old CPU consumes a deferred handoff.
 pub(crate) fn wake_task_claimed(task: &AxTaskRef) {
+    #[cfg(feature = "task-ext")]
+    if let Some(extension) = task.task_ext() {
+        extension.on_ready_wake(task);
+    }
     let mut rq = select_run_queue::<NoPreemptIrqSave>(task);
     let outcome = rq.unblock_task(task.clone(), true);
     drop(rq);
