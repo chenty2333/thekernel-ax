@@ -806,7 +806,37 @@ impl PreparedTaskPublication {
         let (publication, publication_claim_corrupt) = {
             let mut scheduler = self.run_queue.scheduler.lock();
             #[cfg(feature = "sched-eevdf")]
-            scheduler.rebase_deadline_clock(monotonic_time_nanos());
+            {
+                // Use the same single-sample protocol as the timer path.
+                // Rebasing first while a task is running advances CBS by an
+                // interval which the next timer sample would then also charge
+                // as service.  Charge the selected owner's elapsed interval
+                // first; only an empty/idle boundary may rebase directly.
+                let now = monotonic_time_nanos();
+                if let Some(current) = scheduler.running_task() {
+                    if current.is_running()
+                        && AxRunQueue::should_account_runtime(
+                            current.is_idle(),
+                            current.is_migration_helper(),
+                        )
+                    {
+                        let runtime = self.run_queue.runtime_delta_at(
+                            now,
+                            current.is_idle(),
+                            current.is_migration_helper(),
+                        );
+                        if !runtime.is_zero() {
+                            let _ = scheduler.account_runtime(&current, runtime);
+                        } else {
+                            scheduler.rebase_deadline_clock(now);
+                        }
+                    } else {
+                        scheduler.rebase_deadline_clock(now);
+                    }
+                } else {
+                    scheduler.rebase_deadline_clock(now);
+                }
+            }
             let result = scheduler.commit_reserved_task(reservation);
             let mut publication_claim_corrupt = false;
             if let Ok(task) = &result {

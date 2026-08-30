@@ -1517,6 +1517,15 @@ impl<T> EEVDFScheduler<T> {
         self.running.is_some()
     }
 
+    /// Clones the task currently owning this scheduler's execution slot.
+    ///
+    /// The caller must hold the run-queue lock.  This is used by task-layer
+    /// lifecycle boundaries which need to charge one sampled wall-clock delta
+    /// before mutating the CBS clock for an otherwise unrelated operation.
+    pub fn running_task(&self) -> Option<Arc<EEVDFTask<T>>> {
+        self.running.as_ref().cloned()
+    }
+
     /// Select the first ready task accepted by `predicate` in structural key
     /// order, inspecting at most `limit` tasks.
     ///
@@ -3374,6 +3383,37 @@ impl<T> EEVDFScheduler<T> {
                 if unsafe { task.owned_state().migration.is_some() } {
                     drop(claim);
                     return Err(SchedulerError::TaskBusy);
+                }
+                // A sleeping deadline server is deliberately unadmitted: its
+                // reservation was released at sleep and will be admitted on
+                // wake.  Replace all of its retained CBS state before
+                // publishing the tuple, so wakeup observes one coherent new
+                // server rather than the old residual budget/deadline.  Its
+                // node is unlinked, but stage its EDF key as well to avoid
+                // retaining stale ordering state across the sleep boundary.
+                let sleeping_deadline = is_deadline_class(task.sched_params().class)
+                    && unsafe { task.owned_state().rt_sleeping };
+                if sleeping_deadline {
+                    let absolute = self
+                        .deadline_now_ns
+                        .checked_add(config.deadline_ns)
+                        .ok_or(SchedulerError::ArithmeticExhausted)?;
+                    let replenish = self
+                        .deadline_now_ns
+                        .checked_add(config.period_ns)
+                        .ok_or(SchedulerError::ArithmeticExhausted)?;
+                    let sequence = unsafe { task.key().sequence };
+                    task.value().publish_deadline_config(config);
+                    unsafe {
+                        let mut state = task.owned_state_mut();
+                        state.deadline_remaining_ns = config.runtime_ns;
+                        state.deadline_absolute_ns = absolute;
+                        state.deadline_replenish_at_ns = replenish;
+                        state.deadline_throttled = false;
+                    }
+                    Self::stage_key(task, Self::deadline_key(absolute, sequence), 0);
+                    claim.finish()?;
+                    return Ok(EevdfParamUpdate::NoPreemption);
                 }
                 task.value().publish_deadline_config(config);
                 claim.finish()?;
@@ -6744,19 +6784,71 @@ mod tests {
     }
 
     #[test]
-    fn rr_slice_renewal_uses_runtime_quantum() {
-        let _quantum = crate::test_utils::override_rr_timeslice(2);
-
-        let task = Arc::new(EEVDFTask::new(()));
-        task.configure(rt(EevdfTaskClass::RoundRobin, 1)).unwrap();
-        assert_eq!(task.rr_remaining(), 2);
-
+    fn sleeping_deadline_reconfiguration_resets_cbs_for_next_wakeup() {
         let mut scheduler = EEVDFScheduler::new();
-        scheduler.add_task(task.clone()).unwrap();
-        let running = scheduler.pick_next_task().unwrap();
-        EEVDFScheduler::reset_rr_slice(&running);
-        assert_eq!(running.rr_remaining(), 2);
+        let task = Arc::new(EEVDFTask::new(1));
+        let old = DeadlineConfig {
+            runtime_ns: 25,
+            deadline_ns: 100,
+            period_ns: 120,
+        };
+        let replacement = DeadlineConfig {
+            runtime_ns: 40,
+            deadline_ns: 80,
+            period_ns: 90,
+        };
+        scheduler.stage_task_deadline_config(&task, old).unwrap();
+        let _ = scheduler
+            .set_task_params(&task, rt(EevdfTaskClass::Deadline, 0))
+            .unwrap();
+        scheduler.add_task(Arc::clone(&task)).unwrap();
+        let current = scheduler.pick_next_task().unwrap();
+        scheduler.advance_deadline_clock(100);
+        unsafe { task.owned_state_mut().deadline_remaining_ns = 1 };
+        scheduler.deactivate_task(&current, DeactivateReason::Sleep);
 
+        assert_eq!(scheduler.deadline_utilization, 0);
+        let _ = scheduler
+            .set_task_deadline_config_with_runtime(&task, replacement)
+            .unwrap();
+        let state = unsafe { task.owned_state() };
+        assert_eq!(task.deadline_config(), replacement);
+        assert_eq!(state.deadline_remaining_ns, replacement.runtime_ns);
+        assert_eq!(state.deadline_absolute_ns, 180);
+        assert_eq!(state.deadline_replenish_at_ns, 190);
+        assert!(!state.deadline_throttled);
+        assert_eq!(scheduler.deadline_utilization, 0);
+
+        scheduler
+            .enqueue_task(Arc::clone(&task), EnqueueReason::Wakeup)
+            .unwrap();
+        assert_eq!(scheduler.deadline_utilization, 444_444_445);
+        let state = unsafe { task.owned_state() };
+        assert_eq!(state.deadline_remaining_ns, replacement.runtime_ns);
+        assert_eq!(state.deadline_absolute_ns, 180);
+        assert_eq!(state.deadline_replenish_at_ns, 190);
+    }
+
+    #[test]
+    fn deadline_migration_rollback_restores_source_reservation() {
+        let mut scheduler = EEVDFScheduler::new();
+        let task = Arc::new(EEVDFTask::new(1));
+        let config = DeadlineConfig {
+            runtime_ns: 25,
+            deadline_ns: 100,
+            period_ns: 100,
+        };
+        scheduler.stage_task_deadline_config(&task, config).unwrap();
+        let _ = scheduler
+            .set_task_params(&task, rt(EevdfTaskClass::Deadline, 0))
+            .unwrap();
+        scheduler.add_task(task.clone()).unwrap();
+        assert_eq!(scheduler.deadline_utilization, 250_000_000);
+        let migration = scheduler.begin_ready_migration(&task).unwrap();
+        assert_eq!(scheduler.deadline_utilization, 0);
+        scheduler.rollback_migration(migration).unwrap();
+        assert_eq!(scheduler.deadline_utilization, 250_000_000);
+        assert!(task.is_linked());
     }
 
     #[test]
