@@ -2393,13 +2393,25 @@ impl<T> EEVDFScheduler<T> {
                 metadata.source_eligible_at,
             )
         };
-        if let Err(kind) = self.insert_staged(
-            &task,
-            key,
-            eligible_at,
-            metadata.source_key,
-            metadata.source_eligible_at,
-        ) {
+        let inserted = if metadata.deadline_throttled {
+            Self::stage_key(&task, metadata.source_key, metadata.source_eligible_at);
+            self.deadline_throttled
+                .insert(Arc::clone(&task))
+                .map_err(|error| {
+                    let kind = tree_error(error.kind());
+                    drop(error.into_node());
+                    kind
+                })
+        } else {
+            self.insert_staged(
+                &task,
+                key,
+                eligible_at,
+                metadata.source_key,
+                metadata.source_eligible_at,
+            )
+        };
+        if let Err(kind) = inserted {
             return Err(Self::migration_error(kind, migration));
         }
         let renew_rr = matches!(metadata.params.class, EevdfTaskClass::RoundRobin)
