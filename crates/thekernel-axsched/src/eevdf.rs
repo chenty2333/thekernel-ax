@@ -2099,6 +2099,9 @@ impl<T> EEVDFScheduler<T> {
                 },
             );
         }
+        if is_deadline_class(params.class) {
+            self.release_deadline(removed.deadline_config());
+        }
         self.clock = detached_clock;
         Self::migration_token_from_task(removed, false).ok_or(SchedulerError::InconsistentState)
     }
@@ -2161,6 +2164,9 @@ impl<T> EEVDFScheduler<T> {
                     origin: EevdfMigrationOrigin::Running,
                 },
             );
+        }
+        if is_deadline_class(params.class) {
+            self.release_deadline(task.deadline_config());
         }
         self.clock = detached_clock;
         self.running = None;
@@ -2280,6 +2286,12 @@ impl<T> EEVDFScheduler<T> {
                 0,
             )
         };
+        let admitted_deadline = is_deadline_class(metadata.params.class);
+        if admitted_deadline {
+            if let Err(kind) = self.admit_deadline(task.deadline_config()) {
+                return Err(Self::migration_error(kind, migration));
+            }
+        }
         let inserted = if metadata.deadline_throttled {
             let sequence = match self.peek_rt_sequence(false) {
                 Ok(sequence) => sequence,
@@ -2304,6 +2316,9 @@ impl<T> EEVDFScheduler<T> {
             )
         };
         if let Err(kind) = inserted {
+            if admitted_deadline {
+                self.release_deadline(task.deadline_config());
+            }
             return Err(Self::migration_error(kind, migration));
         }
         let renew_rr = matches!(metadata.params.class, EevdfTaskClass::RoundRobin)
