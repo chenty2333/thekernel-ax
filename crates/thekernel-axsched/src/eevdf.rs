@@ -1107,6 +1107,7 @@ impl<T> fmt::Debug for EevdfMigrationCommitError<T> {
 const DEADLINE_CLASS_RANK: u8 = 0;
 const RT_CLASS_RANK: u8 = 1;
 const FAIR_CLASS_RANK: u8 = 2;
+const DEADLINE_UTIL_SCALE: u128 = 1_000_000_000;
 
 fn is_rt_class(class: EevdfTaskClass) -> bool {
     matches!(
@@ -1176,6 +1177,7 @@ pub struct EEVDFScheduler<T> {
     rt_front_sequence: i128,
     rt_back_sequence: i128,
     deadline_now_ns: u64,
+    deadline_utilization: u128,
 }
 
 impl<T> EEVDFScheduler<T> {
@@ -1191,6 +1193,7 @@ impl<T> EEVDFScheduler<T> {
             rt_front_sequence: 0,
             rt_back_sequence: 0,
             deadline_now_ns: 0,
+            deadline_utilization: 0,
         }
     }
 
@@ -1215,6 +1218,35 @@ impl<T> EEVDFScheduler<T> {
     pub fn advance_deadline_clock(&mut self, elapsed_ns: u64) {
         self.deadline_now_ns = self.deadline_now_ns.saturating_add(elapsed_ns);
         self.replenish_deadlines();
+    }
+
+    fn deadline_utilization(config: DeadlineConfig) -> Result<u128, SchedulerError> {
+        if !config.is_valid() {
+            return Err(SchedulerError::InvalidParameters);
+        }
+        u128::from(config.runtime_ns)
+            .checked_mul(DEADLINE_UTIL_SCALE)
+            .and_then(|value| value.checked_add(u128::from(config.period_ns - 1)))
+            .map(|value| value / u128::from(config.period_ns))
+            .ok_or(SchedulerError::ArithmeticExhausted)
+    }
+
+    fn admit_deadline(&mut self, config: DeadlineConfig) -> Result<(), SchedulerError> {
+        let util = Self::deadline_utilization(config)?;
+        let total = self
+            .deadline_utilization
+            .checked_add(util)
+            .ok_or(SchedulerError::ArithmeticExhausted)?;
+        if total > DEADLINE_UTIL_SCALE {
+            return Err(SchedulerError::TaskBusy);
+        }
+        self.deadline_utilization = total;
+        Ok(())
+    }
+
+    fn release_deadline(&mut self, config: DeadlineConfig) {
+        let util = Self::deadline_utilization(config).unwrap_or(0);
+        self.deadline_utilization = self.deadline_utilization.saturating_sub(util);
     }
 
     /// Rebase CBS time from the globally monotonic task-layer clock before a
@@ -1714,7 +1746,12 @@ impl<T> EEVDFScheduler<T> {
         }
         let (next_clock, entity, key, eligible_at) = if is_rt_class(params.class) {
             if is_deadline_class(params.class) {
+                if let Err(error) = self.admit_deadline(task.deadline_config()) {
+                    self.release_claim(&task);
+                    return Err(error);
+                }
                 if let Err(error) = self.initialize_deadline_state(&task) {
+                    self.release_deadline(task.deadline_config());
                     self.release_claim(&task);
                     return Err(error);
                 }
