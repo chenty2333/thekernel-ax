@@ -1323,7 +1323,11 @@ impl<T> EEVDFScheduler<T> {
         &mut self,
         domain: Arc<DeadlineAdmissionDomain>,
     ) -> Result<(), SchedulerError> {
-        if self.deadline_utilization != 0 {
+        // A domain is part of the identity retained by a parked migration.
+        // Rebinding an otherwise empty source/destination queue could make a
+        // later commit either leak that retained reservation or observe it in
+        // the wrong ledger. Run queues are bound once at construction.
+        if self.deadline_utilization != 0 || self.deadline_domain.is_some() {
             return Err(SchedulerError::TaskBusy);
         }
         self.deadline_domain = Some(domain);
@@ -3350,6 +3354,14 @@ impl<T> EEVDFScheduler<T> {
         match task.owner() {
             UNOWNED => {
                 let claim = task.value().claim_reconfiguration()?;
+                // UNOWNED also represents a parked migration. Its source
+                // snapshot retains the exact admitted tuple in the shared
+                // domain, so mutating this task would invalidate rollback or
+                // same-domain commit accounting.
+                if unsafe { task.owned_state().migration.is_some() } {
+                    drop(claim);
+                    return Err(SchedulerError::TaskBusy);
+                }
                 task.value().publish_deadline_config(config);
                 claim.finish()?;
                 Ok(EevdfParamUpdate::NoPreemption)
@@ -3435,7 +3447,15 @@ impl<T> EEVDFScheduler<T> {
             return Err(SchedulerError::InvalidParameters);
         }
         let owner = task.owner();
-        if owner == UNOWNED || (owner == self.id && self.id != UNOWNED) {
+        if owner == UNOWNED {
+            let claim = task.value().claim_reconfiguration()?;
+            if unsafe { task.owned_state().migration.is_some() } {
+                drop(claim);
+                return Err(SchedulerError::TaskBusy);
+            }
+            task.value().publish_deadline_config(config);
+            claim.finish()
+        } else if owner == self.id && self.id != UNOWNED {
             task.value().publish_deadline_config(config);
             Ok(())
         } else {
@@ -3650,125 +3670,152 @@ impl<T> EEVDFScheduler<T> {
         let old_entity = unsafe { task.owned_state().entity };
         let old_dormant_fair = unsafe { task.owned_state().dormant_fair };
         let old_rt_sleeping = unsafe { task.owned_state().rt_sleeping };
-        let (next_clock, entity, dormant_fair, key, eligible_at, reset_rr) = if let Some(entity) =
-            old_entity
-        {
-            if !entity.is_sleeping() || old_rt_sleeping {
-                self.release_claim(&task);
-                return Err(SchedulerError::InconsistentState);
-            }
-            let weight = match Self::fair_weight(params) {
-                Ok(weight) => weight,
-                Err(error) => {
+        let (next_clock, entity, dormant_fair, key, eligible_at, reset_rr, renewed_deadline) =
+            if let Some(entity) = old_entity {
+                if !entity.is_sleeping() || old_rt_sleeping {
+                    self.release_claim(&task);
+                    return Err(SchedulerError::InconsistentState);
+                }
+                let weight = match Self::fair_weight(params) {
+                    Ok(weight) => weight,
+                    Err(error) => {
+                        self.release_claim(&task);
+                        return Err(error);
+                    }
+                };
+                // A sleeping fair entity is absent from Clock.total_weight.  Add
+                // it to a local final clock before reconfiguring its request.
+                let mut next_clock = self.clock;
+                if let Err(error) = next_clock.checked_add_weight(weight).map_err(model_error) {
                     self.release_claim(&task);
                     return Err(error);
                 }
-            };
-            // A sleeping fair entity is absent from Clock.total_weight.  Add
-            // it to a local final clock before reconfiguring its request.
-            let mut next_clock = self.clock;
-            if let Err(error) = next_clock.checked_add_weight(weight).map_err(model_error) {
-                self.release_claim(&task);
-                return Err(error);
-            }
-            let mut next = entity;
-            if let Err(error) = next
-                .wake_preserving_progress(self.clock.v)
-                .map_err(model_error)
-            {
-                self.release_claim(&task);
-                return Err(error);
-            }
-            if next_clock.v != self.clock.v {
+                let mut next = entity;
                 if let Err(error) = next
-                    .activate_preserving_progress(next_clock.v)
+                    .wake_preserving_progress(self.clock.v)
                     .map_err(model_error)
                 {
                     self.release_claim(&task);
                     return Err(error);
                 }
-            }
-            let class = match fair_class(params.class) {
-                Some(class) => class,
-                None => {
-                    self.release_claim(&task);
-                    return Err(SchedulerError::IncompatibleClass);
-                }
-            };
-            if next.class != class || next.weight != weight {
-                self.release_claim(&task);
-                return Err(SchedulerError::InconsistentState);
-            }
-            let sequence = match self.next_fair_sequence() {
-                Ok(sequence) => sequence,
-                Err(error) => {
-                    self.release_claim(&task);
-                    return Err(error);
-                }
-            };
-            let (key, eligible_at) = match Self::fair_key(&next, sequence) {
-                Ok(key) => key,
-                Err(error) => {
-                    self.release_claim(&task);
-                    return Err(error);
-                }
-            };
-            (
-                next_clock,
-                Some(next),
-                old_dormant_fair,
-                key,
-                eligible_at,
-                false,
-            )
-        } else if is_rt_class(params.class) && old_rt_sleeping {
-            let dormant_fair = match old_dormant_fair {
-                Some(mut dormant) => {
-                    if let Err(error) = dormant.end_sleep_frozen(self.clock.v).map_err(model_error)
+                if next_clock.v != self.clock.v {
+                    if let Err(error) = next
+                        .activate_preserving_progress(next_clock.v)
+                        .map_err(model_error)
                     {
                         self.release_claim(&task);
                         return Err(error);
                     }
-                    Some(dormant)
                 }
-                None => None,
-            };
-            let sequence = match self.next_rt_sequence(false) {
-                Ok(sequence) => sequence,
-                Err(error) => {
-                    self.release_claim(&task);
-                    return Err(error);
-                }
-            };
-            let key = if is_deadline_class(params.class) {
-                if let Err(error) = self.admit_deadline(task.deadline_config()) {
-                    self.release_claim(&task);
-                    return Err(error);
-                }
-                // Sleeping CBS servers retain their residual budget and
-                // absolute deadline. Linux wakeup does not create a fresh
-                // reservation unless the server had actually replenished.
-                if unsafe { task.owned_state().deadline_remaining_ns } == 0 {
-                    self.release_deadline(task.deadline_config());
+                let class = match fair_class(params.class) {
+                    Some(class) => class,
+                    None => {
+                        self.release_claim(&task);
+                        return Err(SchedulerError::IncompatibleClass);
+                    }
+                };
+                if next.class != class || next.weight != weight {
                     self.release_claim(&task);
                     return Err(SchedulerError::InconsistentState);
                 }
-                Self::deadline_key(unsafe { task.owned_state().deadline_absolute_ns }, sequence)
+                let sequence = match self.next_fair_sequence() {
+                    Ok(sequence) => sequence,
+                    Err(error) => {
+                        self.release_claim(&task);
+                        return Err(error);
+                    }
+                };
+                let (key, eligible_at) = match Self::fair_key(&next, sequence) {
+                    Ok(key) => key,
+                    Err(error) => {
+                        self.release_claim(&task);
+                        return Err(error);
+                    }
+                };
+                (
+                    next_clock,
+                    Some(next),
+                    old_dormant_fair,
+                    key,
+                    eligible_at,
+                    false,
+                    None,
+                )
+            } else if is_rt_class(params.class) && old_rt_sleeping {
+                let dormant_fair = match old_dormant_fair {
+                    Some(mut dormant) => {
+                        if let Err(error) =
+                            dormant.end_sleep_frozen(self.clock.v).map_err(model_error)
+                        {
+                            self.release_claim(&task);
+                            return Err(error);
+                        }
+                        Some(dormant)
+                    }
+                    None => None,
+                };
+                let sequence = match self.next_rt_sequence(false) {
+                    Ok(sequence) => sequence,
+                    Err(error) => {
+                        self.release_claim(&task);
+                        return Err(error);
+                    }
+                };
+                let (key, renewed_deadline) = if is_deadline_class(params.class) {
+                    if let Err(error) = self.admit_deadline(task.deadline_config()) {
+                        self.release_claim(&task);
+                        return Err(error);
+                    }
+                    // Sleeping CBS servers retain their residual budget and
+                    // absolute deadline. Linux wakeup does not create a fresh
+                    // reservation unless the server had actually replenished.
+                    if unsafe { task.owned_state().deadline_remaining_ns } == 0 {
+                        self.release_deadline(task.deadline_config());
+                        self.release_claim(&task);
+                        return Err(SchedulerError::InconsistentState);
+                    }
+                    let config = task.deadline_config();
+                    let state = unsafe { task.owned_state() };
+                    let renewed = if state.deadline_absolute_ns <= self.deadline_now_ns {
+                        let absolute = match self.deadline_now_ns.checked_add(config.deadline_ns) {
+                            Some(value) => value,
+                            None => {
+                                self.release_deadline(config);
+                                self.release_claim(&task);
+                                return Err(SchedulerError::ArithmeticExhausted);
+                            }
+                        };
+                        let replenish = match self.deadline_now_ns.checked_add(config.period_ns) {
+                            Some(value) => value,
+                            None => {
+                                self.release_deadline(config);
+                                self.release_claim(&task);
+                                return Err(SchedulerError::ArithmeticExhausted);
+                            }
+                        };
+                        Some((config.runtime_ns, absolute, replenish))
+                    } else {
+                        None
+                    };
+                    let absolute =
+                        renewed.map_or(state.deadline_absolute_ns, |(_, absolute, _)| absolute);
+                    (Self::deadline_key(absolute, sequence), renewed)
+                } else {
+                    (Self::rt_key(params, sequence), None)
+                };
+                (
+                    self.clock,
+                    None,
+                    dormant_fair,
+                    key,
+                    0,
+                    matches!(params.class, EevdfTaskClass::RoundRobin),
+                    renewed_deadline,
+                )
             } else {
-                Self::rt_key(params, sequence)
+                self.release_claim(&task);
+                return Err(SchedulerError::InconsistentState);
             };
-            (
-                self.clock,
-                None,
-                dormant_fair,
-                key,
-                0,
-                matches!(params.class, EevdfTaskClass::RoundRobin),
-            )
-        } else {
-            self.release_claim(&task);
-            return Err(SchedulerError::InconsistentState);
-        };
 
         if let Err(error) = self.insert_staged(&task, key, eligible_at, old_key, old_eligible_at) {
             if is_deadline_class(params.class) {
@@ -3787,6 +3834,12 @@ impl<T> EEVDFScheduler<T> {
             task.owned_state_mut().dormant_fair = dormant_fair;
             task.owned_state_mut().rt_sleeping = false;
             task.owned_state_mut().sleep_v = None;
+            if let Some((remaining, absolute, replenish)) = renewed_deadline {
+                task.owned_state_mut().deadline_remaining_ns = remaining;
+                task.owned_state_mut().deadline_absolute_ns = absolute;
+                task.owned_state_mut().deadline_replenish_at_ns = replenish;
+                task.owned_state_mut().deadline_throttled = false;
+            }
         }
         if matches!(params.class, EevdfTaskClass::RoundRobin) {
             Self::reset_rr_slice(&task);
@@ -6733,6 +6786,72 @@ mod tests {
             Err(SchedulerError::TaskBusy)
         );
         scheduler.rollback_migration(migration).unwrap();
+    }
+
+    #[test]
+    fn parked_deadline_migration_rejects_config_mutation_and_staging() {
+        let mut scheduler = EEVDFScheduler::new();
+        let task = Arc::new(EEVDFTask::new(1));
+        let original = DeadlineConfig {
+            runtime_ns: 25,
+            deadline_ns: 100,
+            period_ns: 100,
+        };
+        let replacement = DeadlineConfig {
+            runtime_ns: 40,
+            deadline_ns: 100,
+            period_ns: 100,
+        };
+        scheduler
+            .stage_task_deadline_config(&task, original)
+            .unwrap();
+        let _ = scheduler
+            .set_task_params(&task, rt(EevdfTaskClass::Deadline, 0))
+            .unwrap();
+        scheduler.add_task(Arc::clone(&task)).unwrap();
+        let parked = scheduler
+            .begin_ready_migration(&task)
+            .unwrap()
+            .park()
+            .unwrap();
+
+        assert_eq!(
+            scheduler.set_task_deadline_config_with_runtime(&parked, replacement),
+            Err(SchedulerError::TaskBusy)
+        );
+        assert_eq!(
+            scheduler.stage_task_deadline_config(&parked, replacement),
+            Err(SchedulerError::TaskBusy)
+        );
+        assert_eq!(parked.deadline_config(), original);
+    }
+
+    #[test]
+    fn deadline_wake_renews_an_expired_residual_server() {
+        let mut scheduler = EEVDFScheduler::new();
+        let task = Arc::new(EEVDFTask::new(1));
+        let config = DeadlineConfig {
+            runtime_ns: 25,
+            deadline_ns: 100,
+            period_ns: 120,
+        };
+        scheduler.stage_task_deadline_config(&task, config).unwrap();
+        let _ = scheduler
+            .set_task_params(&task, rt(EevdfTaskClass::Deadline, 0))
+            .unwrap();
+        scheduler.add_task(Arc::clone(&task)).unwrap();
+        let current = scheduler.pick_next_task().unwrap();
+        unsafe { task.owned_state_mut().deadline_remaining_ns = 7 };
+        scheduler.deactivate_task(&current, DeactivateReason::Sleep);
+        scheduler.advance_deadline_clock(101);
+
+        scheduler
+            .enqueue_task(Arc::clone(&task), EnqueueReason::Wakeup)
+            .unwrap();
+        let state = unsafe { task.owned_state() };
+        assert_eq!(state.deadline_remaining_ns, config.runtime_ns);
+        assert_eq!(state.deadline_absolute_ns, 201);
+        assert_eq!(state.deadline_replenish_at_ns, 221);
     }
 
     #[test]

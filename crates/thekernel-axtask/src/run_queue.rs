@@ -596,11 +596,10 @@ static DEADLINE_ROOT_DOMAIN: Once<Arc<DeadlineAdmissionDomain>> = Once::new();
 
 #[cfg(feature = "sched-eevdf")]
 fn deadline_admission_domain() -> Arc<DeadlineAdmissionDomain> {
-    Arc::clone(DEADLINE_ROOT_DOMAIN.call_once(|| {
-        Arc::new(DeadlineAdmissionDomain::with_cpu_capacity(
-            axconfig::plat::MAX_CPU_NUM,
-        ))
-    }))
+    Arc::clone(
+        DEADLINE_ROOT_DOMAIN
+            .call_once(|| Arc::new(DeadlineAdmissionDomain::with_cpu_capacity(axhal::cpu_num()))),
+    )
 }
 
 /// Advisory, lock-free load observation for one initialized CPU run queue.
@@ -3285,7 +3284,7 @@ impl AxRunQueue {
             deadline: task.deadline_config(),
             version: task.sched_commit_version(),
         };
-        let request = match update(old) {
+        let mut request = match update(old) {
             Ok(request) => request,
             Err(error) => return TaskSchedAttrTransaction::Complete(Ok(Err(error))),
         };
@@ -3302,12 +3301,13 @@ impl AxRunQueue {
                 SchedulerError::InvalidParameters,
             )));
         }
-        if matches!(request.state.class, axsched::EevdfTaskClass::Deadline)
-            && !request.deadline.is_valid()
-        {
-            return TaskSchedAttrTransaction::Complete(Err(TaskSchedError::Scheduler(
-                SchedulerError::InvalidParameters,
-            )));
+        if matches!(request.state.class, axsched::EevdfTaskClass::Deadline) {
+            let Some(normalized) = request.deadline.normalized_linux() else {
+                return TaskSchedAttrTransaction::Complete(Err(TaskSchedError::Scheduler(
+                    SchedulerError::InvalidParameters,
+                )));
+            };
+            request.deadline = normalized;
         }
         if request.fair_runtime_ns != 0
             && !matches!(
