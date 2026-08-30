@@ -2212,7 +2212,14 @@ impl<T> EEVDFScheduler<T> {
                 Ok(sequence) => sequence,
                 Err(kind) => return Err(Self::migration_error(kind, migration)),
             };
-            (Self::rt_key(metadata.params, sequence), 0)
+            (
+                if is_deadline_class(metadata.params.class) {
+                    Self::deadline_key(metadata.deadline_absolute_ns, sequence)
+                } else {
+                    Self::rt_key(metadata.params, sequence)
+                },
+                0,
+            )
         };
         if let Err(kind) = self.insert_staged(
             &task,
@@ -3294,11 +3301,20 @@ impl<T> EEVDFScheduler<T> {
                     return Err(error);
                 }
             };
+            let key = if is_deadline_class(params.class) {
+                if let Err(error) = self.initialize_deadline_state(&task) {
+                    self.release_claim(&task);
+                    return Err(error);
+                }
+                Self::deadline_key(unsafe { task.owned_state().deadline_absolute_ns }, sequence)
+            } else {
+                Self::rt_key(params, sequence)
+            };
             (
                 self.clock,
                 None,
                 dormant_fair,
-                Self::rt_key(params, sequence),
+                key,
                 0,
                 matches!(params.class, EevdfTaskClass::RoundRobin),
             )
