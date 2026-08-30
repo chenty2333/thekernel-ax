@@ -13,15 +13,17 @@ use core::{
 use axhal::{
     mem::total_ram_size,
     percpu::this_cpu_id,
-    time::{NANOS_PER_SEC, monotonic_time_nanos},
+    time::{monotonic_time_nanos, NANOS_PER_SEC},
 };
-#[cfg(feature = "sched-eevdf")]
-use axsched::EevdfTaskReservation;
 use axsched::{BaseScheduler, DeactivateReason, EnqueueReason, RuntimeDelta, SchedulerError};
+#[cfg(feature = "sched-eevdf")]
+use axsched::{DeadlineAdmissionDomain, EevdfTaskReservation};
 use futures_util::task::AtomicWaker;
 use kernel_guard::BaseGuard;
 use kspin::SpinRaw;
 use lazyinit::LazyInit;
+#[cfg(feature = "sched-eevdf")]
+use spin::Once;
 
 #[cfg(feature = "sched-eevdf")]
 use crate::api::{TaskSchedAttrSnapshot, TaskSchedCommit, TaskTimeslice};
@@ -30,12 +32,12 @@ use crate::task::IdleStealMutation;
 #[cfg(feature = "smp")]
 use crate::task::{CpuHandoffCompletion, MigrationClaim, WakeHandoffPublication};
 use crate::{
-    AxCpuMask, AxTask, AxTaskRef, Scheduler, TaskInner,
     future::block_on,
     task::{
         BlockWaitClaim, BlockWaitCommit, BlockWaitToken, CurrentTask, SwitchReason,
         TaskCreateError, TaskExitQueueFault, TaskStack, TaskState, TaskWakeFault,
     },
+    AxCpuMask, AxTask, AxTaskRef, Scheduler, TaskInner,
 };
 #[cfg(all(feature = "remote-resched", feature = "smp", target_os = "none"))]
 use axhal::irq::{IpiReason, IpiTarget};
@@ -108,7 +110,11 @@ impl ExitedTaskQueue {
     }
 
     fn reclaim_len(&self) -> usize {
-        if self.is_empty() { 0 } else { self.len.max(1) }
+        if self.is_empty() {
+            0
+        } else {
+            self.len.max(1)
+        }
     }
 
     fn push_back(&mut self, task: AxTaskRef) -> Result<(), ExitedTaskEnqueueError> {
@@ -577,6 +583,21 @@ fn recycle_task_stack(stack: TaskStack) {
 /// therefore cannot manufacture aliased `&'static mut AxRunQueue` values.
 static RUN_QUEUES: [AtomicPtr<AxRunQueue>; axconfig::plat::MAX_CPU_NUM] =
     [const { AtomicPtr::new(core::ptr::null_mut()) }; axconfig::plat::MAX_CPU_NUM];
+
+// The platform currently exposes one scheduler affinity topology: every
+// initialized CPU belongs to the same root scheduling domain.  Bind each
+// per-CPU EEVDF runqueue to this ledger before its GC task is admitted, so
+// SCHED_DEADLINE bandwidth is capped across the actual migration/affinity
+// placement set rather than independently per CPU.  When topology grows
+// NUMA/domain descriptors, this is the single construction point to select
+// the descriptor's ledger before a runqueue becomes live.
+#[cfg(feature = "sched-eevdf")]
+static DEADLINE_ROOT_DOMAIN: Once<Arc<DeadlineAdmissionDomain>> = Once::new();
+
+#[cfg(feature = "sched-eevdf")]
+fn deadline_admission_domain() -> Arc<DeadlineAdmissionDomain> {
+    Arc::clone(DEADLINE_ROOT_DOMAIN.call_once(|| Arc::new(DeadlineAdmissionDomain::new())))
+}
 
 /// Advisory, lock-free load observation for one initialized CPU run queue.
 ///
@@ -2185,6 +2206,8 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
                 return;
             }
             let mut scheduler = self.inner.scheduler.lock();
+            #[cfg(feature = "sched-eevdf")]
+            scheduler.rebase_deadline_clock(monotonic_time_nanos());
             let runtime = self.inner.runtime_delta(curr);
             if !runtime.is_zero() {
                 let _ = scheduler.account_runtime(curr, runtime);
@@ -2204,8 +2227,7 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
                 #[cfg(feature = "sched-eevdf")]
                 {
                     let mut scheduler = self.inner.scheduler.lock();
-                    scheduler
-                        .advance_deadline_clock(NANOS_PER_SEC / axconfig::TICKS_PER_SEC as u64);
+                    scheduler.advance_deadline_clock(monotonic_time_nanos());
                     #[cfg(feature = "preempt")]
                     if scheduler.ready_len() != 0 {
                         curr.set_preempt_pending(true);
@@ -3382,6 +3404,10 @@ impl AxRunQueue {
         debug_assert_eq!(gc_task.cpumask(), AxCpuMask::one_shot(cpu_id));
 
         let mut scheduler = Scheduler::new();
+        #[cfg(feature = "sched-eevdf")]
+        scheduler
+            .set_deadline_admission_domain(deadline_admission_domain())
+            .expect("fresh EEVDF runqueue must accept its affinity-domain ledger");
         scheduler
             .add_task(gc_task)
             .map_err(TaskRuntimeInitError::Scheduler)?;

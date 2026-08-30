@@ -1212,12 +1212,25 @@ impl<T> EEVDFScheduler<T> {
         self.ready_tree.len()
     }
 
-    /// Advance the run queue's monotonic CBS clock even when it is idle.
-    /// The task layer invokes this from its periodic timer path; therefore an
-    /// exhausted sole deadline server is replenished without unrelated work.
-    pub fn advance_deadline_clock(&mut self, elapsed_ns: u64) {
-        self.deadline_now_ns = self.deadline_now_ns.saturating_add(elapsed_ns);
-        self.replenish_deadlines();
+    /// Bind an empty runqueue to the shared ledger for its CPU-affinity
+    /// domain. Live reservations move between domains only through migration.
+    pub fn set_deadline_admission_domain(
+        &mut self,
+        domain: Arc<DeadlineAdmissionDomain>,
+    ) -> Result<(), SchedulerError> {
+        if self.deadline_utilization != 0 {
+            return Err(SchedulerError::TaskBusy);
+        }
+        self.deadline_domain = Some(domain);
+        Ok(())
+    }
+
+    /// Rebase CBS onto the task layer's global monotonic nanosecond clock.
+    /// This is intentionally an absolute timestamp, never a per-runqueue
+    /// elapsed delta: a migrated server must retain the same replenishment
+    /// instant on every CPU.
+    pub fn advance_deadline_clock(&mut self, now_ns: u64) {
+        self.rebase_deadline_clock(now_ns);
     }
 
     fn deadline_utilization(config: DeadlineConfig) -> Result<u128, SchedulerError> {
@@ -1924,12 +1937,30 @@ impl<T> EEVDFScheduler<T> {
             });
         }
         let (next_clock, entity, key, eligible_at) = if is_rt_class(params.class) {
-            (
-                self.clock,
-                None,
-                Self::rt_key(params, reservation.sequence),
-                0,
-            )
+            let key = if is_deadline_class(params.class) {
+                let config = task.deadline_config();
+                if !config.is_valid() {
+                    return Err(EevdfReservationCommitError {
+                        kind: SchedulerError::InvalidParameters,
+                        reservation,
+                    });
+                }
+                Self::deadline_key(
+                    match self.deadline_now_ns.checked_add(config.deadline_ns) {
+                        Some(value) => value,
+                        None => {
+                            return Err(EevdfReservationCommitError {
+                                kind: SchedulerError::ArithmeticExhausted,
+                                reservation,
+                            })
+                        }
+                    },
+                    reservation.sequence,
+                )
+            } else {
+                Self::rt_key(params, reservation.sequence)
+            };
+            (self.clock, None, key, 0)
         } else {
             let weight = match Self::fair_weight(params) {
                 Ok(weight) => weight,
@@ -1971,8 +2002,24 @@ impl<T> EEVDFScheduler<T> {
             };
             (next_clock, Some(entity), key, eligible_at)
         };
+        let old_state = unsafe { *task.owned_state() };
+        let deadline_admitted = is_deadline_class(params.class);
+        if deadline_admitted {
+            if let Err(kind) = self.admit_deadline(task.deadline_config()) {
+                return Err(EevdfReservationCommitError { kind, reservation });
+            }
+            if let Err(kind) = self.initialize_deadline_state(&task) {
+                self.release_deadline(task.deadline_config());
+                return Err(EevdfReservationCommitError { kind, reservation });
+            }
+        }
         let old_key = unsafe { task.key() };
         if let Err(kind) = self.insert_staged(&task, key, eligible_at, old_key, 0) {
+            if deadline_admitted {
+                self.release_deadline(task.deadline_config());
+                // SAFETY: the reservation still exclusively owns this virgin task.
+                unsafe { *task.owned_state_mut() = old_state };
+            }
             return Err(EevdfReservationCommitError { kind, reservation });
         }
         if matches!(params.class, EevdfTaskClass::RoundRobin) {
@@ -2907,7 +2954,13 @@ impl<T> EEVDFScheduler<T> {
                 } else {
                     let key = unsafe { task.key() };
                     let eligible_at = unsafe { task.eligible_at() };
-                    let removed = match self.ready_tree.remove(task).map_err(tree_error) {
+                    let removed = match (if old_state.deadline_throttled {
+                        self.deadline_throttled.remove(task)
+                    } else {
+                        self.ready_tree.remove(task)
+                    })
+                    .map_err(tree_error)
+                    {
                         Ok(removed) => removed,
                         Err(error) => {
                             self.replace_deadline_domain(new_deadline, old_deadline)
@@ -2928,9 +2981,17 @@ impl<T> EEVDFScheduler<T> {
                         // removed node must itself be restored before the
                         // error leaves the scheduler.
                         let removed = removed.expect("ready task disappeared during reconfigure");
-                        self.ready_tree
-                            .insert(removed)
-                            .expect("EEVDF ready rollback encountered a duplicate old key");
+                        if old_state.deadline_throttled {
+                            self.deadline_throttled
+                                .insert(removed)
+                                .expect("EEVDF throttled rollback encountered a duplicate old key");
+                        } else {
+                            self.ready_tree
+                                .insert(removed)
+                                .expect("EEVDF ready rollback encountered a duplicate old key");
+                        }
+                        self.replace_deadline_domain(new_deadline, old_deadline)
+                            .expect("deadline domain replacement rollback failed");
                         return Err(error);
                     }
                     if new_fair {
@@ -3517,7 +3578,15 @@ impl<T> EEVDFScheduler<T> {
         }
         let (next_clock, entity) = if is_rt_class(params.class) {
             if is_deadline_class(params.class) {
-                self.initialize_deadline_state(task)?;
+                if let Err(error) = self.admit_deadline(task.deadline_config()) {
+                    self.release_claim(task);
+                    return Err(error);
+                }
+                if let Err(error) = self.initialize_deadline_state(task) {
+                    self.release_deadline(task.deadline_config());
+                    self.release_claim(task);
+                    return Err(error);
+                }
             }
             (self.clock, None)
         } else {
@@ -4376,7 +4445,6 @@ impl<T> BaseScheduler for EEVDFScheduler<T> {
             .expect("EEVDF task_tick current validation failed");
         let params = current.sched_params();
         if is_deadline_class(params.class) {
-            self.deadline_now_ns = self.deadline_now_ns.saturating_add(1);
             self.replenish_deadlines();
             self.account_deadline_runtime(current, 1)
                 .expect("deadline tick accounting failed")
