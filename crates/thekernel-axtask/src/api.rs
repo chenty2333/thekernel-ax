@@ -35,7 +35,7 @@ pub enum RemoteReschedInitError {
 pub(crate) use crate::run_queue::{current_run_queue, select_run_queue};
 #[doc(cfg(all(feature = "multitask", feature = "task-ext")))]
 #[cfg(feature = "task-ext")]
-pub use crate::task::{AxTaskExt, TaskExt};
+pub use crate::task::{AxTaskExt, SwitchReason, TaskExt};
 #[doc(cfg(all(feature = "multitask", feature = "irq")))]
 #[cfg(feature = "irq")]
 pub use crate::timers::{

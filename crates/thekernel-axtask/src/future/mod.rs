@@ -12,11 +12,14 @@ use core::{
 use axerrno::AxError;
 use kernel_guard::NoPreemptIrqSave;
 
+#[cfg(feature = "task-ext")]
+use crate::task::TaskExt;
+
 use crate::{
     AxTask, AxTaskRef, current, current_run_queue,
     run_queue::{BlockReschedOutcome, WakeTaskOutcome},
     select_run_queue,
-    task::{BeginBlockWaitError, BlockWakeAction, EndBlockWaitError, TaskExt, WakeMutationClaim},
+    task::{BeginBlockWaitError, BlockWakeAction, EndBlockWaitError, WakeMutationClaim},
 };
 
 #[cfg(feature = "irq")]

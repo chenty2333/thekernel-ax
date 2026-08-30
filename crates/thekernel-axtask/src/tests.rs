@@ -10,6 +10,7 @@ use axerrno::AxError;
 
 #[cfg(feature = "task-ext")]
 use crate::TaskInner;
+use crate::task::SwitchReason;
 use crate::{WaitQueue, api as axtask, current};
 
 static INIT: Once = Once::new();

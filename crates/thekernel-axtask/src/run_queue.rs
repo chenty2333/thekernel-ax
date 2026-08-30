@@ -31,8 +31,8 @@ use crate::{
     AxCpuMask, AxTask, AxTaskRef, Scheduler, TaskInner,
     future::block_on,
     task::{
-        BlockWaitClaim, BlockWaitCommit, BlockWaitToken, CurrentTask, TaskCreateError,
-        TaskExitQueueFault, TaskStack, TaskState, TaskWakeFault,
+        BlockWaitClaim, BlockWaitCommit, BlockWaitToken, CurrentTask, SwitchReason,
+        TaskCreateError, TaskExitQueueFault, TaskStack, TaskState, TaskWakeFault,
     },
 };
 #[cfg(feature = "sched-eevdf")]
@@ -1982,7 +1982,7 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
             // The idle task is never a ready-queue member. Keep its lifecycle
             // state Running and still probe the scheduler so a wake published
             // without immediate preemption can take the CPU.
-            self.inner.resched();
+            self.inner.resched(SwitchReason::Yield);
             return;
         }
 
@@ -1990,7 +1990,7 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
             .inner
             .put_task_with_state(curr, TaskState::Running, false)
         {
-            PutTaskOutcome::Enqueued => self.inner.resched(),
+            PutTaskOutcome::Enqueued => self.inner.resched(SwitchReason::Yield),
             PutTaskOutcome::Rejected(_) | PutTaskOutcome::StateMismatch => {}
             #[cfg(feature = "smp")]
             PutTaskOutcome::Deferred => {}
@@ -2025,7 +2025,8 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
         }
 
         // Call `switch_to` to reschedule to the migration task that performs the migration directly.
-        self.inner.switch_to(crate::current(), migration_task);
+        self.inner
+            .switch_to(crate::current(), migration_task, SwitchReason::Migrate);
     }
 
     /// Preempts the current task and reschedules.
@@ -2087,14 +2088,14 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
                 drop(scheduler);
             }
             if curr.is_idle() {
-                self.inner.resched();
+                self.inner.resched(SwitchReason::Preempt);
                 return;
             }
             match self
                 .inner
                 .put_task_with_state(curr.clone(), TaskState::Running, true)
             {
-                PutTaskOutcome::Enqueued => self.inner.resched(),
+                PutTaskOutcome::Enqueued => self.inner.resched(SwitchReason::Preempt),
                 PutTaskOutcome::Rejected(_) => curr.set_preempt_pending(true),
                 PutTaskOutcome::StateMismatch => {
                     curr.record_wake_fault(TaskWakeFault::SchedulerInvariant);
@@ -2180,7 +2181,7 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
             drop(curr);
 
             // Schedule to next task.
-            self.inner.resched();
+            self.inner.resched(SwitchReason::Exit);
         }
         unreachable!("task exited!");
     }
@@ -2319,7 +2320,7 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
         match commit {
             BlockWaitCommit::Blocked => {
                 debug!("task block: id={}", curr.id().as_u64());
-                self.inner.resched();
+                self.inner.resched(SwitchReason::Block);
                 BlockReschedOutcome::Blocked
             }
             BlockWaitCommit::Woken => {
@@ -2948,7 +2949,7 @@ impl AxRunQueue {
 
     /// Core reschedule subroutine.
     /// Pick the next task to run and switch to it.
-    fn resched(&self) {
+    fn resched(&self, reason: SwitchReason) {
         let next = {
             let mut scheduler = self.scheduler.lock();
             let next = match scheduler.pick_next_task() {
@@ -2992,10 +2993,15 @@ impl AxRunQueue {
             }
             next
         };
-        self.switch_to(crate::current(), next);
+        self.switch_to(crate::current(), next, reason);
     }
 
-    fn switch_to(&self, prev_task: CurrentTask, next_task: AxTaskRef) {
+    fn switch_to(
+        &self,
+        prev_task: CurrentTask,
+        next_task: AxTaskRef,
+        reason: SwitchReason,
+    ) {
         // Make sure that IRQs are disabled by kernel guard or other means.
         #[cfg(all(target_os = "none", feature = "irq"))] // Note: irq is faked under unit tests.
         assert!(
@@ -3069,7 +3075,7 @@ impl AxRunQueue {
             use crate::TaskExt;
 
             if let Some(ext) = prev_task.task_ext() {
-                ext.on_leave(&prev_task)
+                ext.on_leave(&prev_task, reason)
             }
             if let Some(ext) = next_task.task_ext() {
                 ext.on_enter(&next_task)

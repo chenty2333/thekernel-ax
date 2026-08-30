@@ -590,6 +590,10 @@ pub(crate) enum BlockMutationClaim {
 }
 
 /// User-defined task extended data.
+///
+/// The reason is supplied at the actual scheduler handoff, rather than
+/// inferred from the task state after it has become Ready.  This preserves
+/// Linux's voluntary/involuntary switch distinction for rusage accounting.
 #[cfg(feature = "task-ext")]
 #[extern_trait::extern_trait(
     /// The impl proxy type for [`TaskExt`].
@@ -599,7 +603,7 @@ pub trait TaskExt {
     /// Called when the task is switched in.
     fn on_enter(&self, _task: &TaskInner) {}
     /// Called when the task is switched out.
-    fn on_leave(&self, _task: &TaskInner) {}
+    fn on_leave(&self, _task: &TaskInner, _reason: SwitchReason) {}
     /// Called by the owning raw-waker immediately before publishing a blocked
     /// task runnable. Implementations must be allocation-free and may only
     /// perform lock-free state transitions.
@@ -612,6 +616,36 @@ pub trait TaskExt {
     /// Returning `true` requests a normal reschedule boundary after IRQ exit.
     fn on_timer_tick(&self, _task: &TaskInner) -> bool {
         false
+    }
+}
+
+/// Why a task stopped running at a scheduler switch edge.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum SwitchReason {
+    /// The task explicitly yielded the processor.
+    Yield,
+    /// The task blocked waiting for an event or timer.
+    Block,
+    /// The scheduler preempted the task while it remained runnable.
+    Preempt,
+    /// The task was moved to another run queue.
+    Migrate,
+    /// The task exited and can no longer be scheduled.
+    Exit,
+}
+
+impl SwitchReason {
+    /// Returns whether this switch is a scheduler-forced transition from a
+    /// runnable task. An explicit yield is still involuntary for Linux's
+    /// `ru_nivcsw` accounting; blocking and exit transitions are voluntary.
+    pub const fn is_involuntary(self) -> bool {
+        matches!(self, Self::Yield | Self::Preempt | Self::Migrate)
+    }
+
+    /// Task exit is a voluntary context switch: Linux accounts the final
+    /// TASK_DEAD handoff in `ru_nvcsw`.
+    pub const fn counts_as_context_switch(self) -> bool {
+        true
     }
 }
 
@@ -2321,6 +2355,22 @@ extern "C" fn task_entry() -> ! {
 #[cfg(test)]
 mod mechanism_tests {
     use super::*;
+
+    #[test]
+    fn switch_reason_accounting_preserves_linux_classes() {
+        assert!(SwitchReason::Block.counts_as_context_switch());
+        assert!(!SwitchReason::Block.is_involuntary());
+        for reason in [
+            SwitchReason::Yield,
+            SwitchReason::Preempt,
+            SwitchReason::Migrate,
+        ] {
+            assert!(reason.counts_as_context_switch());
+            assert!(reason.is_involuntary());
+        }
+        assert!(SwitchReason::Exit.counts_as_context_switch());
+        assert!(!SwitchReason::Exit.is_involuntary());
+    }
 
     #[test]
     fn task_identity_allocates_max_once_and_never_wraps() {
