@@ -2907,7 +2907,14 @@ impl<T> EEVDFScheduler<T> {
                 } else {
                     let key = unsafe { task.key() };
                     let eligible_at = unsafe { task.eligible_at() };
-                    let removed = self.ready_tree.remove(task).map_err(tree_error)?;
+                    let removed = match self.ready_tree.remove(task).map_err(tree_error) {
+                        Ok(removed) => removed,
+                        Err(error) => {
+                            self.replace_deadline_domain(new_deadline, old_deadline)
+                                .expect("deadline domain replacement rollback failed");
+                            return Err(error);
+                        }
+                    };
                     let seq_kind = if new_fair { Some(true) } else { Some(false) };
                     (Some(removed), key, eligible_at, seq_kind)
                 };
@@ -3056,8 +3063,27 @@ impl<T> EEVDFScheduler<T> {
                 if !running {
                     let old_key = unsafe { task.key() };
                     let old_eligible = unsafe { task.eligible_at() };
-                    let removed = self.ready_tree.remove(task).map_err(tree_error)?;
-                    let sequence = self.peek_rt_sequence(false)?;
+                    let sequence = match self.peek_rt_sequence(false) {
+                        Ok(sequence) => sequence,
+                        Err(error) => {
+                            self.replace_deadline_domain(Some(config), Some(old_config))
+                                .expect("deadline domain replacement rollback failed");
+                            return Err(error);
+                        }
+                    };
+                    let removed = if old_state.deadline_throttled {
+                        self.deadline_throttled.remove(task).map_err(tree_error)
+                    } else {
+                        self.ready_tree.remove(task).map_err(tree_error)
+                    };
+                    let removed = match removed {
+                        Ok(removed) => removed,
+                        Err(error) => {
+                            self.replace_deadline_domain(Some(config), Some(old_config))
+                                .expect("deadline domain replacement rollback failed");
+                            return Err(error);
+                        }
+                    };
                     if let Err(error) = self.insert_staged(
                         task,
                         Self::deadline_key(absolute, sequence),
