@@ -157,7 +157,7 @@ pub use cfs::{
 pub use eevdf::{
     EEVDFScheduler, EEVDFTask, EevdfForkSeed, EevdfMigration, EevdfMigrationCommitError,
     EevdfMigrationOrigin, EevdfParamUpdate, EevdfReadyCandidate, EevdfReadyCursor,
-    DeadlineConfig, EevdfReservationCommitError, EevdfTaskClass, EevdfTaskParams,
+    DeadlineAdmissionDomain, DeadlineConfig, EevdfReservationCommitError, EevdfTaskClass, EevdfTaskParams,
     EevdfTaskReservation, clamp_fair_runtime_ns, FAIR_RUNTIME_MAX_NS, FAIR_RUNTIME_MIN_NS,
 };
 pub use eevdf_profile::{eevdf_profile, EevdfProfile, EEVDF_PROFILE};
