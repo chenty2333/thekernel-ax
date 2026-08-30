@@ -1007,6 +1007,38 @@ fn sched_state_update_preserves_typed_failure_causes() {
 
 #[cfg(feature = "sched-eevdf")]
 #[test]
+fn versioned_sched_transaction_keeps_policy_rejection_and_commit_atomic() {
+    let _lock = SERIAL.lock();
+    init_for_test();
+
+    let task = current().clone();
+    let original = axtask::scheduler_state_snapshot(&task).unwrap();
+    let rejected: Result<Result<crate::TaskSchedCommit, &'static str>, crate::TaskSchedError> =
+        axtask::update_sched_state_versioned_with_reset(&task, |old| {
+            assert_eq!(old, original);
+            Err("policy rejected")
+        });
+    assert_eq!(rejected, Ok(Err("policy rejected")));
+    assert_eq!(axtask::scheduler_state_snapshot(&task).unwrap(), original);
+
+    let committed = axtask::update_sched_state_versioned_with_reset(&task, |old| {
+        assert_eq!(old, original);
+        let mut state = old.state;
+        state.nice = 1;
+        Ok::<_, ()>((state, !old.reset_on_fork))
+    })
+    .unwrap()
+    .unwrap();
+    assert_eq!(committed.state.nice, 1);
+    assert_eq!(committed.reset_on_fork, !original.reset_on_fork);
+    assert_eq!(committed.version, original.version.wrapping_add(1));
+
+    axtask::set_sched_state_versioned_with_reset(&task, original.state, original.reset_on_fork)
+        .unwrap();
+}
+
+#[cfg(feature = "sched-eevdf")]
+#[test]
 fn failed_publication_reservation_returns_the_exact_task_owner() {
     let _lock = SERIAL.lock();
     init_for_test();

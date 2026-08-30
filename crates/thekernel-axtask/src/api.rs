@@ -631,6 +631,28 @@ pub fn set_sched_state_versioned_with_reset(
     crate::run_queue::set_task_sched_state_with_reset_stable(task, sched_state, reset_on_fork)
 }
 
+/// Atomically decides and, on success, applies a complete scheduler state
+/// update while holding the task's owning run-queue lock.
+///
+/// The callback receives one coherent old state, reset-on-fork bit, and
+/// scheduler commit version. Returning `Err` leaves all three unchanged; an
+/// outer error is a task/scheduler mechanism failure. The callback is invoked
+/// at most once, after a stable run-queue owner has been established.
+///
+/// The nested result deliberately keeps policy failures in `E` separate from
+/// mechanism failures in [`TaskSchedError`], so OS personalities can map
+/// their policy decision without attempting a stale rollback.
+#[cfg(feature = "sched-eevdf")]
+pub fn update_sched_state_versioned_with_reset<E, F>(
+    task: &AxTaskRef,
+    update: F,
+) -> Result<Result<TaskSchedCommit, E>, TaskSchedError>
+where
+    F: FnMut(TaskSchedCommit) -> Result<(SchedState, bool), E>,
+{
+    crate::run_queue::update_task_sched_state_versioned_with_reset_stable(task, update)
+}
+
 /// Initializes the ABI policy flag before a prepared task is published.  No
 /// scheduler owner exists yet, therefore no concurrent snapshot can observe
 /// the initialization separately from first publication.
