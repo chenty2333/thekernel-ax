@@ -1143,25 +1143,21 @@ pub(crate) fn scheduler_state_snapshot_stable(
 
 /// Returns all scheduler attributes from one stable owner transaction.
 ///
-/// The fair slice is selected by the scheduler profile rather than by a
-/// per-task atom; deriving it from the already-locked class therefore cannot
-/// combine values from different scheduler commits.
+/// The fair slice is sampled under the same stable owner transaction as the
+/// rest of the ABI tuple.
 #[cfg(feature = "sched-eevdf")]
 pub(crate) fn scheduler_attr_snapshot_stable(
     task: &AxTaskRef,
 ) -> Result<TaskSchedAttrSnapshot, TaskSchedError> {
     let commit = scheduler_state_snapshot_stable(task)?;
-    let target_ticks = match commit.state.class {
-        axsched::EevdfTaskClass::Normal => axsched::EEVDF_PROFILE.normal_target_ticks,
-        axsched::EevdfTaskClass::Batch => axsched::EEVDF_PROFILE.batch_target_ticks,
-        axsched::EevdfTaskClass::Idle => axsched::EEVDF_PROFILE.idle_target_ticks,
-        axsched::EevdfTaskClass::RoundRobin | axsched::EevdfTaskClass::Fifo => 0,
+    let fair_runtime_ns = if matches!(
+        commit.state.class,
+        axsched::EevdfTaskClass::Normal | axsched::EevdfTaskClass::Batch | axsched::EevdfTaskClass::Idle
+    ) {
+        task.fair_runtime_ns()
+    } else {
+        0
     };
-    let fair_runtime_ns = target_ticks
-        .saturating_mul(u128::from(NANOS_PER_SEC))
-        .checked_div(axconfig::TICKS_PER_SEC as u128)
-        .unwrap_or(0)
-        .min(u128::from(u64::MAX)) as u64;
     Ok(TaskSchedAttrSnapshot {
         commit,
         fair_runtime_ns,
@@ -3154,6 +3150,14 @@ impl AxRunQueue {
                 SchedulerError::InvalidParameters,
             )));
         }
+        if request.fair_runtime_ns != 0
+            && !(axsched::FAIR_RUNTIME_MIN_NS..=axsched::FAIR_RUNTIME_MAX_NS)
+                .contains(&request.fair_runtime_ns)
+        {
+            return TaskSchedAttrTransaction::Complete(Err(TaskSchedError::Scheduler(
+                SchedulerError::InvalidParameters,
+            )));
+        }
 
         let executing = scheduler.is_running_task(task)
             && task.is_running()
@@ -3170,6 +3174,19 @@ impl AxRunQueue {
         }
         let result = scheduler
             .set_task_params_with_runtime(task, request.state, Self::scheduler_period_ns())
+            .and_then(|outcome| {
+                scheduler
+                    .set_task_fair_runtime_with_runtime(
+                        task,
+                        request.fair_runtime_ns,
+                        Self::scheduler_period_ns(),
+                    )
+                    .map(|runtime_outcome| match (outcome, runtime_outcome) {
+                        (axsched::EevdfParamUpdate::PreemptCurrent(task), _) =>
+                            axsched::EevdfParamUpdate::PreemptCurrent(task),
+                        (_, outcome) => outcome,
+                    })
+            })
             .map_err(TaskSchedError::from)
             .map(|outcome| {
                 task.set_sched_reset_on_fork(request.reset_on_fork);

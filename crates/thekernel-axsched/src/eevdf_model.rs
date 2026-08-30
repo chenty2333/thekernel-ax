@@ -1248,6 +1248,19 @@ pub struct Entity {
 }
 
 impl Entity {
+    /// Rebind this entity's EEVDF request to an explicit scheduler-owned
+    /// quantum while preserving its completed fraction and lag.
+    pub fn rebind_request_quantum(&mut self, quantum: u128) -> Result<(), ModelError> {
+        if quantum == 0 {
+            return Err(ModelError::InvalidState);
+        }
+        let anchor = self.sleeper_v.unwrap_or(self.lag_stamp);
+        let request = self.reconfigured_request(self.class, quantum, self.weight, anchor, self.lag)?;
+        self.request = request;
+        self.lag_stamp = anchor;
+        Ok(())
+    }
+
     pub fn new(
         class: RequestClass,
         weight: u128,

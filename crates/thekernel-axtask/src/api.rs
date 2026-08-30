@@ -492,6 +492,9 @@ pub fn spawn_task_with_sched_from(
     task_ref
         .configure(sched_state)
         .map_err(map_scheduler_error)?;
+    task_ref
+        .configure_fair_runtime_ns(parent.fair_runtime_ns())
+        .map_err(map_scheduler_error)?;
     let (util_min, util_max) = parent.sched_util_clamp();
     task_ref.set_sched_util_clamp(util_min, util_max);
     install_fork_seed_if_applicable(&task_ref, parent)?;
@@ -511,6 +514,9 @@ pub fn prepare_task_with_sched_from(
     let task_ref = task.try_into_arc().map_err(map_task_create_error)?;
     task_ref
         .configure(sched_state)
+        .map_err(map_scheduler_error)?;
+    task_ref
+        .configure_fair_runtime_ns(parent.fair_runtime_ns())
         .map_err(map_scheduler_error)?;
     // The child is still private here. A fork inherits the parent's effective
     // clamp; exec retains the existing task and consequently needs no action.
@@ -672,6 +678,8 @@ pub struct TaskSchedAttrSnapshot {
 pub struct TaskSchedAttrUpdate {
     pub state: SchedState,
     pub reset_on_fork: bool,
+    /// Requested fair runtime in ns; zero selects the scheduler profile.
+    pub fair_runtime_ns: u64,
     pub util_min: u32,
     pub util_max: u32,
 }
@@ -767,6 +775,16 @@ pub fn set_prepared_task_sched_util_clamp(task: &AxTaskRef, util_min: u32, util_
     debug_assert!(!task.is_running());
     debug_assert!(util_min <= util_max && util_max <= 1024);
     task.set_sched_util_clamp(util_min, util_max);
+}
+
+/// Initializes a not-yet-published task's Linux fair runtime request.
+#[cfg(feature = "sched-eevdf")]
+pub fn set_prepared_task_sched_fair_runtime(
+    task: &AxTaskRef,
+    fair_runtime_ns: u64,
+) -> Result<(), TaskSchedError> {
+    task.configure_fair_runtime_ns(fair_runtime_ns)
+        .map_err(TaskSchedError::from)
 }
 
 /// Changes only a task's nice value while its owning scheduler lock is held.

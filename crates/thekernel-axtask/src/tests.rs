@@ -1068,6 +1068,7 @@ fn sched_attr_transaction_commits_util_clamp_with_scheduler_state() {
         Ok::<_, ()>(crate::TaskSchedAttrUpdate {
             state,
             reset_on_fork: !old.reset_on_fork,
+            fair_runtime_ns: 0,
             util_min: 256,
             util_max: 768,
         })
@@ -1087,6 +1088,7 @@ fn sched_attr_transaction_commits_util_clamp_with_scheduler_state() {
         Ok::<_, ()>(crate::TaskSchedAttrUpdate {
             state: original.commit.state,
             reset_on_fork: original.commit.reset_on_fork,
+            fair_runtime_ns: 0,
             util_min: original.commit.util_min,
             util_max: original.commit.util_max,
         })
