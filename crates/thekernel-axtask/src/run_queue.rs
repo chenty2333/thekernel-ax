@@ -807,11 +807,12 @@ impl PreparedTaskPublication {
             let mut scheduler = self.run_queue.scheduler.lock();
             #[cfg(feature = "sched-eevdf")]
             {
-                // Use the same single-sample protocol as the timer path.
-                // Rebasing first while a task is running advances CBS by an
-                // interval which the next timer sample would then also charge
-                // as service.  Charge the selected owner's elapsed interval
-                // first; only an empty/idle boundary may rebase directly.
+                // Use the same one-sample protocol as the timer path. Charge
+                // the selected owner's elapsed interval first, then advance
+                // the CBS high-water mark to that identical sample. The
+                // scheduler-switch work belongs to neither task; rebasing is
+                // therefore clock synchronization, not another service
+                // charge.
                 let now = monotonic_time_nanos();
                 if let Some(current) = scheduler.running_task() {
                     if current.is_running()
@@ -827,9 +828,8 @@ impl PreparedTaskPublication {
                         );
                         if !runtime.is_zero() {
                             let _ = scheduler.account_runtime(&current, runtime);
-                        } else {
-                            scheduler.rebase_deadline_clock(now);
                         }
+                        scheduler.rebase_deadline_clock(now);
                     } else {
                         scheduler.rebase_deadline_clock(now);
                     }
@@ -3355,11 +3355,12 @@ impl AxRunQueue {
             )));
         }
 
+        let now = monotonic_time_nanos();
         let executing = scheduler.is_running_task(task)
             && task.is_running()
             && AxRunQueue::should_account_runtime(task.is_idle(), task.is_migration_helper());
         if executing {
-            let runtime = self.runtime_delta_flags(task.is_idle(), task.is_migration_helper());
+            let runtime = self.runtime_delta_at(now, task.is_idle(), task.is_migration_helper());
             if !runtime.is_zero() {
                 let needs_resched = scheduler.account_runtime(task, runtime);
                 #[cfg(feature = "preempt")]
@@ -3368,6 +3369,11 @@ impl AxRunQueue {
                 }
             }
         }
+        // The timestamp used to derive a sleeping replacement CBS server
+        // must be current global monotonic time. For a running owner the same
+        // sample was charged above, so this is only a high-water rebase and
+        // cannot double-account its service.
+        scheduler.rebase_deadline_clock(now);
         let deadline_staged = matches!(request.state.class, axsched::EevdfTaskClass::Deadline);
         let deadline_reconfigured =
             deadline_staged && matches!(old.state.class, axsched::EevdfTaskClass::Deadline);

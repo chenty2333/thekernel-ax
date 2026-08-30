@@ -3384,16 +3384,18 @@ impl<T> EEVDFScheduler<T> {
                     drop(claim);
                     return Err(SchedulerError::TaskBusy);
                 }
-                // A sleeping deadline server is deliberately unadmitted: its
-                // reservation was released at sleep and will be admitted on
-                // wake.  Replace all of its retained CBS state before
-                // publishing the tuple, so wakeup observes one coherent new
-                // server rather than the old residual budget/deadline.  Its
+                // A sleeping deadline server retains its policy-lifetime
+                // admission. Replace its retained CBS state before publishing
+                // the tuple, so wakeup observes one coherent new server rather
+                // than the old residual budget/deadline. Its
                 // node is unlinked, but stage its EDF key as well to avoid
                 // retaining stale ordering state across the sleep boundary.
                 let sleeping_deadline = is_deadline_class(task.sched_params().class)
                     && unsafe { task.owned_state().rt_sleeping };
                 if sleeping_deadline {
+                    let old_config = task.deadline_config();
+                    let next_utilization =
+                        self.replaced_deadline_utilization(Some(old_config), Some(config))?;
                     let absolute = self
                         .deadline_now_ns
                         .checked_add(config.deadline_ns)
@@ -3403,6 +3405,10 @@ impl<T> EEVDFScheduler<T> {
                         .checked_add(config.period_ns)
                         .ok_or(SchedulerError::ArithmeticExhausted)?;
                     let sequence = unsafe { task.key().sequence };
+                    // Sleeping is not an admission boundary. Replace the
+                    // policy-lifetime reservation in both ledgers before
+                    // publishing the coherent new CBS state.
+                    self.replace_deadline_domain(Some(old_config), Some(config))?;
                     task.value().publish_deadline_config(config);
                     unsafe {
                         let mut state = task.owned_state_mut();
@@ -3412,6 +3418,7 @@ impl<T> EEVDFScheduler<T> {
                         state.deadline_throttled = false;
                     }
                     Self::stage_key(task, Self::deadline_key(absolute, sequence), 0);
+                    self.deadline_utilization = next_utilization;
                     claim.finish()?;
                     return Ok(EevdfParamUpdate::NoPreemption);
                 }
@@ -3817,15 +3824,11 @@ impl<T> EEVDFScheduler<T> {
                     }
                 };
                 let (key, renewed_deadline) = if is_deadline_class(params.class) {
-                    if let Err(error) = self.admit_deadline(task.deadline_config()) {
-                        self.release_claim(&task);
-                        return Err(error);
-                    }
                     // Sleeping CBS servers retain their residual budget and
                     // absolute deadline. Linux wakeup does not create a fresh
-                    // reservation unless the server had actually replenished.
+                    // reservation: admission is retained for the complete
+                    // lifetime of the deadline policy.
                     if unsafe { task.owned_state().deadline_remaining_ns } == 0 {
-                        self.release_deadline(task.deadline_config());
                         self.release_claim(&task);
                         return Err(SchedulerError::InconsistentState);
                     }
@@ -3835,7 +3838,6 @@ impl<T> EEVDFScheduler<T> {
                         let absolute = match self.deadline_now_ns.checked_add(config.deadline_ns) {
                             Some(value) => value,
                             None => {
-                                self.release_deadline(config);
                                 self.release_claim(&task);
                                 return Err(SchedulerError::ArithmeticExhausted);
                             }
@@ -3843,7 +3845,6 @@ impl<T> EEVDFScheduler<T> {
                         let replenish = match self.deadline_now_ns.checked_add(config.period_ns) {
                             Some(value) => value,
                             None => {
-                                self.release_deadline(config);
                                 self.release_claim(&task);
                                 return Err(SchedulerError::ArithmeticExhausted);
                             }
@@ -3873,9 +3874,6 @@ impl<T> EEVDFScheduler<T> {
             };
 
         if let Err(error) = self.insert_staged(&task, key, eligible_at, old_key, old_eligible_at) {
-            if is_deadline_class(params.class) {
-                self.release_deadline(task.deadline_config());
-            }
             self.release_claim(&task);
             return Err(error);
         }
@@ -4699,9 +4697,6 @@ impl<T> BaseScheduler for EEVDFScheduler<T> {
                         task.owned_state_mut().rt_sleeping = true;
                         task.owned_state_mut().sleep_v = Some(self.clock.v);
                     };
-                    if is_deadline_class(params.class) {
-                        self.release_deadline(task.deadline_config());
-                    }
                     self.running = None;
                     task.transfer_owner(self.id, UNOWNED)
                         .expect("EEVDF RT owner invariant violated during sleep");
@@ -6785,7 +6780,11 @@ mod tests {
 
     #[test]
     fn sleeping_deadline_reconfiguration_resets_cbs_for_next_wakeup() {
+        let domain = Arc::new(DeadlineAdmissionDomain::new());
         let mut scheduler = EEVDFScheduler::new();
+        scheduler
+            .set_deadline_admission_domain(Arc::clone(&domain))
+            .unwrap();
         let task = Arc::new(EEVDFTask::new(1));
         let old = DeadlineConfig {
             runtime_ns: 25,
@@ -6807,17 +6806,21 @@ mod tests {
         unsafe { task.owned_state_mut().deadline_remaining_ns = 1 };
         scheduler.deactivate_task(&current, DeactivateReason::Sleep);
 
-        assert_eq!(scheduler.deadline_utilization, 0);
+        assert_eq!(scheduler.deadline_utilization, 208_333_334);
+        // The task layer rebases the owner to a freshly sampled monotonic
+        // timestamp before changing a sleeping CBS tuple.
+        scheduler.advance_deadline_clock(150);
         let _ = scheduler
             .set_task_deadline_config_with_runtime(&task, replacement)
             .unwrap();
         let state = unsafe { task.owned_state() };
         assert_eq!(task.deadline_config(), replacement);
         assert_eq!(state.deadline_remaining_ns, replacement.runtime_ns);
-        assert_eq!(state.deadline_absolute_ns, 180);
-        assert_eq!(state.deadline_replenish_at_ns, 190);
+        assert_eq!(state.deadline_absolute_ns, 230);
+        assert_eq!(state.deadline_replenish_at_ns, 240);
         assert!(!state.deadline_throttled);
-        assert_eq!(scheduler.deadline_utilization, 0);
+        assert_eq!(scheduler.deadline_utilization, 444_444_445);
+        assert_eq!(domain.utilization.load(Ordering::Acquire), 444_444_445);
 
         scheduler
             .enqueue_task(Arc::clone(&task), EnqueueReason::Wakeup)
@@ -6825,8 +6828,58 @@ mod tests {
         assert_eq!(scheduler.deadline_utilization, 444_444_445);
         let state = unsafe { task.owned_state() };
         assert_eq!(state.deadline_remaining_ns, replacement.runtime_ns);
-        assert_eq!(state.deadline_absolute_ns, 180);
-        assert_eq!(state.deadline_replenish_at_ns, 190);
+        assert_eq!(state.deadline_absolute_ns, 230);
+        assert_eq!(state.deadline_replenish_at_ns, 240);
+        assert_eq!(domain.utilization.load(Ordering::Acquire), 444_444_445);
+    }
+
+    #[test]
+    fn sleeping_deadline_server_keeps_admission_and_wakes_without_readmission() {
+        let domain = Arc::new(DeadlineAdmissionDomain::new());
+        let mut scheduler = EEVDFScheduler::new();
+        scheduler
+            .set_deadline_admission_domain(Arc::clone(&domain))
+            .unwrap();
+        let sleeper = Arc::new(EEVDFTask::new(1));
+        let contender = Arc::new(EEVDFTask::new(2));
+        let sleeper_config = DeadlineConfig {
+            runtime_ns: 60,
+            deadline_ns: 100,
+            period_ns: 100,
+        };
+        let contender_config = DeadlineConfig {
+            runtime_ns: 50,
+            deadline_ns: 100,
+            period_ns: 100,
+        };
+        scheduler
+            .stage_task_deadline_config(&sleeper, sleeper_config)
+            .unwrap();
+        let _ = scheduler
+            .set_task_params(&sleeper, rt(EevdfTaskClass::Deadline, 0))
+            .unwrap();
+        scheduler.add_task(Arc::clone(&sleeper)).unwrap();
+        let current = scheduler.pick_next_task().unwrap();
+        scheduler.deactivate_task(&current, DeactivateReason::Sleep);
+
+        assert_eq!(scheduler.deadline_utilization, 600_000_000);
+        assert_eq!(domain.utilization.load(Ordering::Acquire), 600_000_000);
+        scheduler
+            .stage_task_deadline_config(&contender, contender_config)
+            .unwrap();
+        let _ = scheduler
+            .set_task_params(&contender, rt(EevdfTaskClass::Deadline, 0))
+            .unwrap();
+        assert_eq!(
+            scheduler.add_task(contender),
+            Err(SchedulerError::TaskBusy)
+        );
+
+        scheduler
+            .enqueue_task(sleeper, EnqueueReason::Wakeup)
+            .unwrap();
+        assert_eq!(scheduler.deadline_utilization, 600_000_000);
+        assert_eq!(domain.utilization.load(Ordering::Acquire), 600_000_000);
     }
 
     #[test]
