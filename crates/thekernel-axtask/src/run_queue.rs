@@ -2990,6 +2990,8 @@ impl AxRunQueue {
             victim.load.ready_dequeued();
             task.set_cpu_id(self.cpu_id as _);
 
+            #[cfg(feature = "sched-eevdf")]
+            destination_scheduler.rebase_deadline_clock(monotonic_time_nanos());
             match destination_scheduler.commit_migration(migration) {
                 Ok(_) => {
                     self.load.ready_enqueued();

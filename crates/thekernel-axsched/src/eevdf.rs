@@ -1217,6 +1217,15 @@ impl<T> EEVDFScheduler<T> {
         self.replenish_deadlines();
     }
 
+    /// Rebase CBS time from the globally monotonic task-layer clock before a
+    /// migration destination admits a reservation.
+    pub fn rebase_deadline_clock(&mut self, now_ns: u64) {
+        if now_ns > self.deadline_now_ns {
+            self.deadline_now_ns = now_ns;
+            self.replenish_deadlines();
+        }
+    }
+
     /// Return whether `task` is the current owner of this run queue.
     ///
     /// The task layer uses this under the scheduler lock to account a pending
