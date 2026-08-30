@@ -3170,15 +3170,7 @@ impl AxRunQueue {
             )));
         }
         if request.fair_runtime_ns != 0
-            && !(axsched::FAIR_RUNTIME_MIN_NS..=axsched::FAIR_RUNTIME_MAX_NS)
-                .contains(&request.fair_runtime_ns)
-        {
-            return TaskSchedAttrTransaction::Complete(Err(TaskSchedError::Scheduler(
-                SchedulerError::InvalidParameters,
-            )));
-        }
-        if request.fair_runtime_ns != 0
-            && !matches!(request.state.class, axsched::EevdfTaskClass::Normal)
+            && !matches!(request.state.class, axsched::EevdfTaskClass::Normal | axsched::EevdfTaskClass::Batch)
         {
             return TaskSchedAttrTransaction::Complete(Err(TaskSchedError::Scheduler(
                 SchedulerError::InvalidParameters,
@@ -3225,7 +3217,7 @@ impl AxRunQueue {
                     reset_on_fork: request.reset_on_fork,
                     util_min: request.util_min,
                     util_max: request.util_max,
-                    fair_runtime_ns: request.fair_runtime_ns,
+                    fair_runtime_ns: task.fair_runtime_ns(),
                     version: task.next_sched_commit_version(),
                 }
             });

@@ -30,6 +30,19 @@ const NICE_MAX: i8 = 19;
 pub const FAIR_RUNTIME_MIN_NS: u64 = 100_000;
 pub const FAIR_RUNTIME_MAX_NS: u64 = 100_000_000;
 
+/// Linux clamps a nonzero fair runtime request to this interval.
+pub const fn clamp_fair_runtime_ns(runtime_ns: u64) -> u64 {
+    if runtime_ns == 0 {
+        0
+    } else if runtime_ns < FAIR_RUNTIME_MIN_NS {
+        FAIR_RUNTIME_MIN_NS
+    } else if runtime_ns > FAIR_RUNTIME_MAX_NS {
+        FAIR_RUNTIME_MAX_NS
+    } else {
+        runtime_ns
+    }
+}
+
 // These are the Linux fair-class weights used by CFS as well.  Keeping the
 // conversion local means the task representation does not depend on CFS's
 // private implementation details or on a scheduler core.
@@ -768,11 +781,9 @@ impl<T> EevdfNode<EevdfReadyKey, EevdfTaskPayload<T>> {
     /// Configure a virgin task's fair slice. A nonzero value is constrained
     /// exactly as Linux `sched_setattr` constrains fair `sched_runtime`.
     pub fn configure_fair_runtime_ns(&self, runtime_ns: u64) -> Result<(), SchedulerError> {
-        if runtime_ns != 0 && !(FAIR_RUNTIME_MIN_NS..=FAIR_RUNTIME_MAX_NS).contains(&runtime_ns) {
-            return Err(SchedulerError::InvalidParameters);
-        }
+        let runtime_ns = clamp_fair_runtime_ns(runtime_ns);
         let claim = self.value().claim_configuration()?;
-        if runtime_ns != 0 && !matches!(self.sched_params().class, EevdfTaskClass::Normal) {
+        if runtime_ns != 0 && !matches!(self.sched_params().class, EevdfTaskClass::Normal | EevdfTaskClass::Batch) {
             drop(claim);
             return Err(SchedulerError::InvalidParameters);
         }
@@ -1516,7 +1527,7 @@ impl<T> EEVDFScheduler<T> {
                     return Err(error);
                 }
             };
-            if let Err(error) = Self::rebind_fair_runtime(&mut entity, task.fair_runtime_ns(), next_clock.total_weight, 1_000_000) {
+            if let Err(error) = Self::rebind_fair_runtime(&mut entity, task.fair_runtime_ns(), next_clock.total_weight, 10_000_000) {
                 self.release_claim(&task);
                 return Err(error);
             }
@@ -1662,7 +1673,7 @@ impl<T> EEVDFScheduler<T> {
                 Ok(entity) => entity,
                 Err(kind) => return Err(EevdfReservationCommitError { kind, reservation }),
             };
-            if let Err(kind) = Self::rebind_fair_runtime(&mut entity, task.fair_runtime_ns(), next_clock.total_weight, 1_000_000) {
+            if let Err(kind) = Self::rebind_fair_runtime(&mut entity, task.fair_runtime_ns(), next_clock.total_weight, 10_000_000) {
                 return Err(EevdfReservationCommitError { kind, reservation });
             }
             let (key, eligible_at) = match Self::fair_key(&entity, reservation.sequence) {
@@ -2182,7 +2193,7 @@ impl<T> EEVDFScheduler<T> {
                         clock_v,
                     )
                     .map_err(model_error)?;
-                Self::rebind_fair_runtime(&mut entity, fair_runtime_ns, next_total_weight, 1_000_000)?;
+                Self::rebind_fair_runtime(&mut entity, fair_runtime_ns, next_total_weight, 10_000_000)?;
                 Ok((Some(entity), None))
             }
             (true, false) => {
@@ -2212,7 +2223,7 @@ impl<T> EEVDFScheduler<T> {
                     .map_err(model_error)?
                 };
                 let mut entity = entity;
-                Self::rebind_fair_runtime(&mut entity, fair_runtime_ns, next_total_weight, 1_000_000)?;
+                Self::rebind_fair_runtime(&mut entity, fair_runtime_ns, next_total_weight, 10_000_000)?;
                 Ok((Some(entity), None))
             }
             (false, false) => Ok((None, old_state.dormant_fair)),
@@ -2245,7 +2256,7 @@ impl<T> EEVDFScheduler<T> {
                         total_weight,
                     )
                     .map_err(model_error)?;
-                Self::rebind_fair_runtime(&mut entity, fair_runtime_ns, total_weight, 1_000_000)?;
+                Self::rebind_fair_runtime(&mut entity, fair_runtime_ns, total_weight, 10_000_000)?;
                 Ok((Some(entity), None, false))
             }
             (true, false) => Ok((None, old_state.entity, true)),
@@ -2282,7 +2293,7 @@ impl<T> EEVDFScheduler<T> {
                 if !entity.is_sleeping() {
                     entity.begin_sleep(anchor).map_err(model_error)?;
                 }
-                Self::rebind_fair_runtime(&mut entity, fair_runtime_ns, total_weight, 1_000_000)?;
+                Self::rebind_fair_runtime(&mut entity, fair_runtime_ns, total_weight, 10_000_000)?;
                 Ok((Some(entity), None, false))
             }
             (false, false) => Ok((None, old_state.dormant_fair, true)),
@@ -2589,11 +2600,9 @@ impl<T> EEVDFScheduler<T> {
         runtime_ns: u64,
         period_ns: u64,
     ) -> Result<EevdfParamUpdate<T>, SchedulerError> {
-        if runtime_ns != 0 && !(FAIR_RUNTIME_MIN_NS..=FAIR_RUNTIME_MAX_NS).contains(&runtime_ns) {
-            return Err(SchedulerError::InvalidParameters);
-        }
+        let runtime_ns = clamp_fair_runtime_ns(runtime_ns);
         let params = task.sched_params();
-        if runtime_ns != 0 && !matches!(params.class, EevdfTaskClass::Normal) {
+        if runtime_ns != 0 && !matches!(params.class, EevdfTaskClass::Normal | EevdfTaskClass::Batch) {
             return Err(SchedulerError::InvalidParameters);
         }
         if is_rt_class(params.class) {
@@ -5637,5 +5646,23 @@ mod tests {
         assert_eq!(task.fair_runtime_ns(), FAIR_RUNTIME_MAX_NS);
         assert_eq!(long_q, FAIR_RUNTIME_MAX_NS as u128 / 10_000_000u128);
         assert!(long_q > short_q);
+    }
+
+    #[test]
+    fn fair_runtime_clamps_and_accepts_batch_but_not_idle() {
+        let normal = EEVDFTask::new(1usize);
+        normal.configure_fair_runtime_ns(1).unwrap();
+        assert_eq!(normal.fair_runtime_ns(), FAIR_RUNTIME_MIN_NS);
+        normal.configure_fair_runtime_ns(u64::MAX).unwrap();
+        assert_eq!(normal.fair_runtime_ns(), FAIR_RUNTIME_MAX_NS);
+
+        let batch = EEVDFTask::new(2usize);
+        batch.configure(EevdfTaskParams { class: EevdfTaskClass::Batch, ..EevdfTaskParams::default() }).unwrap();
+        batch.configure_fair_runtime_ns(1).unwrap();
+        assert_eq!(batch.fair_runtime_ns(), FAIR_RUNTIME_MIN_NS);
+
+        let idle = EEVDFTask::new(3usize);
+        idle.configure(EevdfTaskParams { class: EevdfTaskClass::Idle, ..EevdfTaskParams::default() }).unwrap();
+        assert_eq!(idle.configure_fair_runtime_ns(FAIR_RUNTIME_MIN_NS), Err(SchedulerError::InvalidParameters));
     }
 }
