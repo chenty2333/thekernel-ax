@@ -2015,7 +2015,12 @@ impl<T> EEVDFScheduler<T> {
                 .checked_sub_weight(entity.weight)
                 .map_err(model_error)?;
         }
-        let removed = self.ready_tree.remove(task).map_err(tree_error)?;
+        let throttled = unsafe { task.owned_state().deadline_throttled };
+        let removed = if throttled {
+            self.deadline_throttled.remove(task).map_err(tree_error)?
+        } else {
+            self.ready_tree.remove(task).map_err(tree_error)?
+        };
         removed
             .transfer_owner(self.id, CONFIGURING)
             .expect("EEVDF ready owner changed while beginning migration");
@@ -3581,7 +3586,11 @@ impl<T> EEVDFScheduler<T> {
         } else {
             None
         };
-        let removed = self.ready_tree.remove(task).map_err(tree_error)?;
+        let removed = if unsafe { task.owned_state().deadline_throttled } {
+            self.deadline_throttled.remove(task).map_err(tree_error)?
+        } else {
+            self.ready_tree.remove(task).map_err(tree_error)?
+        };
         if let Some(next_clock) = next_clock {
             self.clock = next_clock;
         }
