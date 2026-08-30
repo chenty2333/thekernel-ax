@@ -802,6 +802,8 @@ impl PreparedTaskPublication {
         let guard = kernel_guard::NoPreemptIrqSave::new();
         let (publication, publication_claim_corrupt) = {
             let mut scheduler = self.run_queue.scheduler.lock();
+            #[cfg(feature = "sched-eevdf")]
+            scheduler.rebase_deadline_clock(monotonic_time_nanos());
             let result = scheduler.commit_reserved_task(reservation);
             let mut publication_claim_corrupt = false;
             if let Ok(task) = &result {
@@ -2774,6 +2776,8 @@ impl AxRunQueue {
         let scheduler_task = task.clone();
         let (result, wake_claim_corrupt) = {
             let mut scheduler = self.scheduler.lock();
+            #[cfg(feature = "sched-eevdf")]
+            scheduler.rebase_deadline_clock(monotonic_time_nanos());
             let result = scheduler.enqueue_task(scheduler_task, reason);
             let mut wake_claim_corrupt = false;
             if result.is_ok() {
@@ -3408,6 +3412,8 @@ impl AxRunQueue {
         scheduler
             .set_deadline_admission_domain(deadline_admission_domain())
             .expect("fresh EEVDF runqueue must accept its affinity-domain ledger");
+        #[cfg(feature = "sched-eevdf")]
+        scheduler.rebase_deadline_clock(monotonic_time_nanos());
         scheduler
             .add_task(gc_task)
             .map_err(TaskRuntimeInitError::Scheduler)?;
@@ -3488,6 +3494,8 @@ impl AxRunQueue {
     fn resched(&self, reason: SwitchReason) {
         let next = {
             let mut scheduler = self.scheduler.lock();
+            #[cfg(feature = "sched-eevdf")]
+            scheduler.rebase_deadline_clock(monotonic_time_nanos());
             let next = match scheduler.pick_next_task() {
                 Some(next) => {
                     self.load.ready_dequeued();
