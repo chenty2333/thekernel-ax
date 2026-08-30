@@ -1209,6 +1209,14 @@ impl<T> EEVDFScheduler<T> {
         self.ready_tree.len()
     }
 
+    /// Advance the run queue's monotonic CBS clock even when it is idle.
+    /// The task layer invokes this from its periodic timer path; therefore an
+    /// exhausted sole deadline server is replenished without unrelated work.
+    pub fn advance_deadline_clock(&mut self, elapsed_ns: u64) {
+        self.deadline_now_ns = self.deadline_now_ns.saturating_add(elapsed_ns);
+        self.replenish_deadlines();
+    }
+
     /// Return whether `task` is the current owner of this run queue.
     ///
     /// The task layer uses this under the scheduler lock to account a pending

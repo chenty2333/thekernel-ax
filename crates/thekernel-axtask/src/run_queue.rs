@@ -2201,6 +2201,16 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
                 // not used for correctness and must not add a contended CAS
                 // retry loop here.
                 IDLE_TICKS.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "sched-eevdf")]
+                {
+                    let mut scheduler = self.inner.scheduler.lock();
+                    scheduler
+                        .advance_deadline_clock(NANOS_PER_SEC / axconfig::TICKS_PER_SEC as u64);
+                    #[cfg(feature = "preempt")]
+                    if scheduler.ready_len() != 0 {
+                        curr.set_preempt_pending(true);
+                    }
+                }
             }
             return;
         }
