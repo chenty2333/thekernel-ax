@@ -50,9 +50,6 @@ irq-exit = ["multitask", "preempt", "axhal/irq"]
 # the architecture-specific context field behind axhal's fp-simd contract;
 # consumers must opt in when they own the corresponding signal path.
 legacy-fxsave = ["multitask", "preempt", "axhal/fp-simd"]
-# x86_64 user protection-key state.  The scheduler saves/restores PKRU through
-# axhal, while this crate exposes the current-task update helpers.
-pkeys = ["multitask", "preempt", "axhal/pkeys"]
 # Allocation-free, lock-free trace snapshots for diagnosing IRQ-return
 # scheduling. This is intentionally opt-in because it adds atomics to context
 # switch and suspicious IRQ-off preemption paths.
