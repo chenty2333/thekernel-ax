@@ -72,6 +72,22 @@ pub enum EevdfTaskClass {
     /// Fixed-priority scheduling without time slicing represented by the task
     /// layer.
     Fifo = 4,
+    /// CBS reservation scheduled by earliest absolute deadline.
+    Deadline = 5,
+}
+
+/// One SCHED_DEADLINE reservation, expressed in nanoseconds.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DeadlineConfig {
+    pub runtime_ns: u64,
+    pub deadline_ns: u64,
+    pub period_ns: u64,
+}
+
+impl DeadlineConfig {
+    pub const fn is_valid(self) -> bool {
+        self.runtime_ns != 0 && self.runtime_ns <= self.deadline_ns && self.deadline_ns <= self.period_ns
+    }
 }
 
 /// Runtime scheduling parameters for an EEVDF task.
@@ -111,12 +127,12 @@ impl EevdfTaskParams {
             EevdfTaskClass::Normal | EevdfTaskClass::Batch => {
                 self.rt_priority = 0;
             }
-            EevdfTaskClass::RoundRobin | EevdfTaskClass::Fifo => {
+            EevdfTaskClass::RoundRobin | EevdfTaskClass::Fifo | EevdfTaskClass::Deadline => {
                 self.nice = 0;
             }
         }
         let valid = match self.class {
-            EevdfTaskClass::RoundRobin | EevdfTaskClass::Fifo => {
+            EevdfTaskClass::RoundRobin | EevdfTaskClass::Fifo | EevdfTaskClass::Deadline => {
                 (RT_PRIORITY_MIN..=RT_PRIORITY_MAX).contains(&self.rt_priority)
             }
             EevdfTaskClass::Normal | EevdfTaskClass::Batch | EevdfTaskClass::Idle => {
@@ -235,7 +251,7 @@ pub(crate) fn eevdf_weight_for(params: EevdfTaskParams) -> Option<u128> {
     match params.class {
         EevdfTaskClass::Idle => eevdf_weight_for_nice(NICE_RANGE_POS),
         EevdfTaskClass::Normal | EevdfTaskClass::Batch => eevdf_weight_for_nice(params.nice),
-        EevdfTaskClass::RoundRobin | EevdfTaskClass::Fifo => eevdf_weight_for_nice(0),
+        EevdfTaskClass::RoundRobin | EevdfTaskClass::Fifo | EevdfTaskClass::Deadline => eevdf_weight_for_nice(0),
     }
 }
 
@@ -358,6 +374,9 @@ pub struct EevdfTaskPayload<T> {
     inner: T,
     params: AtomicU32,
     fair_runtime_ns: AtomicU64,
+    deadline_runtime_ns: AtomicU64,
+    deadline_ns: AtomicU64,
+    deadline_period_ns: AtomicU64,
     queue_owner: AtomicUsize,
     rr_remaining: AtomicUsize,
     state: UnsafeCell<EevdfOwnedState>,
@@ -486,6 +505,9 @@ impl<T> EevdfTaskPayload<T> {
                 .packed(),
             ),
             fair_runtime_ns: AtomicU64::new(0),
+            deadline_runtime_ns: AtomicU64::new(0),
+            deadline_ns: AtomicU64::new(0),
+            deadline_period_ns: AtomicU64::new(0),
             queue_owner: AtomicUsize::new(UNOWNED),
             rr_remaining: AtomicUsize::new(0),
             state: UnsafeCell::new(EevdfOwnedState {
@@ -521,10 +543,21 @@ impl<T> EevdfTaskPayload<T> {
         self.fair_runtime_ns.store(runtime_ns, Ordering::Release);
     }
 
+    fn deadline_config(&self) -> DeadlineConfig {
+        DeadlineConfig { runtime_ns: self.deadline_runtime_ns.load(Ordering::Acquire), deadline_ns: self.deadline_ns.load(Ordering::Acquire), period_ns: self.deadline_period_ns.load(Ordering::Acquire) }
+    }
+
+    fn publish_deadline_config(&self, value: DeadlineConfig) {
+        self.deadline_runtime_ns.store(value.runtime_ns, Ordering::Release);
+        self.deadline_ns.store(value.deadline_ns, Ordering::Release);
+        self.deadline_period_ns.store(value.period_ns, Ordering::Release);
+    }
+
     fn apply_validated(&self, params: EevdfTaskParams) {
         let rr_remaining = match params.class {
             EevdfTaskClass::RoundRobin => rr_timeslice_ticks(),
             EevdfTaskClass::Fifo
+            | EevdfTaskClass::Deadline
             | EevdfTaskClass::Normal
             | EevdfTaskClass::Batch
             | EevdfTaskClass::Idle => 0,
@@ -761,6 +794,15 @@ impl<T> EevdfNode<EevdfReadyKey, EevdfTaskPayload<T>> {
     /// default. Published tasks are changed through the scheduler transaction.
     pub fn fair_runtime_ns(&self) -> u64 {
         self.value().fair_runtime_ns()
+    }
+
+    pub fn deadline_config(&self) -> DeadlineConfig { self.value().deadline_config() }
+
+    pub fn configure_deadline(&self, value: DeadlineConfig) -> Result<(), SchedulerError> {
+        if !value.is_valid() { return Err(SchedulerError::InvalidParameters); }
+        let claim = self.value().claim_configuration()?;
+        self.value().publish_deadline_config(value);
+        claim.finish()
     }
 
     pub(crate) fn rr_remaining(&self) -> usize {
@@ -1037,7 +1079,7 @@ const FAIR_CLASS_RANK: u8 = 1;
 const RT_CLASS_RANK: u8 = 0;
 
 fn is_rt_class(class: EevdfTaskClass) -> bool {
-    matches!(class, EevdfTaskClass::RoundRobin | EevdfTaskClass::Fifo)
+    matches!(class, EevdfTaskClass::RoundRobin | EevdfTaskClass::Fifo | EevdfTaskClass::Deadline)
 }
 
 fn fair_class(class: EevdfTaskClass) -> Option<crate::eevdf_model::RequestClass> {
@@ -1045,7 +1087,7 @@ fn fair_class(class: EevdfTaskClass) -> Option<crate::eevdf_model::RequestClass>
         EevdfTaskClass::Normal => Some(crate::eevdf_model::RequestClass::Normal),
         EevdfTaskClass::Batch => Some(crate::eevdf_model::RequestClass::Batch),
         EevdfTaskClass::Idle => Some(crate::eevdf_model::RequestClass::Idle),
-        EevdfTaskClass::RoundRobin | EevdfTaskClass::Fifo => None,
+        EevdfTaskClass::RoundRobin | EevdfTaskClass::Fifo | EevdfTaskClass::Deadline => None,
     }
 }
 
@@ -1539,7 +1581,7 @@ impl<T> EEVDFScheduler<T> {
         }
         let (next_clock, entity, key, eligible_at) = if is_rt_class(params.class) {
             let sequence = match params.class {
-                EevdfTaskClass::Fifo | EevdfTaskClass::RoundRobin => self.next_rt_sequence(false),
+                EevdfTaskClass::Fifo | EevdfTaskClass::RoundRobin | EevdfTaskClass::Deadline => self.next_rt_sequence(false),
                 EevdfTaskClass::Normal | EevdfTaskClass::Batch | EevdfTaskClass::Idle => {
                     unreachable!("validated realtime class mismatch")
                 }
