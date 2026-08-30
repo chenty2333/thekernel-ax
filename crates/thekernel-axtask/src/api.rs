@@ -798,13 +798,58 @@ struct AffinityMutation<'a>(&'a AxTaskRef);
 
 impl<'a> AffinityMutation<'a> {
     fn try_begin(task: &'a AxTaskRef) -> AxResult<Self> {
-        task.try_begin_affinity_mutation()
-            // `then_some(Self(task))` would eagerly construct and immediately
-            // drop a guard on the busy path, falsely releasing another
-            // publication owner's mutation state.
-            .then(|| Self(task))
-            .ok_or(AxError::ResourceBusy)
+        // Affinity changes are serialized with the short wake/block
+        // publication windows.  Those owners always complete without waiting
+        // for this caller, so retrying here preserves the operation instead of
+        // leaking an implementation-only EBUSY to an ordinary concurrent
+        // sched_setaffinity caller.
+        while !task.try_begin_affinity_mutation() {
+            if matches!(task.state(), TaskState::Exited)
+                || {
+                    #[cfg(feature = "sched-eevdf")]
+                    {
+                        task.affinity_mutation_is_publication_reservation()
+                    }
+                    #[cfg(not(feature = "sched-eevdf"))]
+                    {
+                        false
+                    }
+                }
+            {
+                return Err(AxError::NoSuchProcess);
+            }
+            // A mutation owner may be completing a wake or block handoff on
+            // another CPU.  Never burn this CPU (or starve that owner) while
+            // waiting for that bounded handoff: reschedule before retrying.
+            // No task/rq lock is held here, and the owner releases the word
+            // before any wait that could depend on this caller.  The next
+            // loop iteration rechecks terminalization before attempting to
+            // acquire ownership again.
+            yield_now();
+        }
+        Ok(Self(task))
     }
+}
+
+/// Validates an affinity mask against the scheduler's current active CPU set.
+/// This is shared by live-task migration and durable zombie updates so both
+/// reject empty or possible-but-offline masks identically.
+pub fn validate_affinity_mask(cpumask: AxCpuMask) -> AxResult {
+    if cpumask.is_empty() {
+        return Err(AxError::InvalidInput);
+    }
+
+    #[cfg(feature = "smp")]
+    if !crate::run_queue::affinity_has_online_cpu(cpumask) {
+        return Err(AxError::InvalidInput);
+    }
+
+    #[cfg(not(feature = "smp"))]
+    if !cpumask.get(0) {
+        return Err(AxError::InvalidInput);
+    }
+
+    Ok(())
 }
 
 impl Drop for AffinityMutation<'_> {
@@ -837,14 +882,7 @@ impl Drop for AffinityMutation<'_> {
 /// old affinity unchanged instead of collapsing the failure into an invalid
 /// mask error at the caller.
 pub fn set_current_affinity(cpumask: AxCpuMask) -> AxResult {
-    if cpumask.is_empty() {
-        return Err(AxError::InvalidInput);
-    }
-
-    #[cfg(feature = "smp")]
-    if !crate::run_queue::affinity_has_online_cpu(cpumask) {
-        return Err(AxError::InvalidInput);
-    }
+    validate_affinity_mask(cpumask)?;
 
     let curr = current().clone();
     let _mutation = AffinityMutation::try_begin(&curr)?;
@@ -879,9 +917,6 @@ pub fn set_current_affinity(cpumask: AxCpuMask) -> AxResult {
 
     #[cfg(not(feature = "smp"))]
     {
-        if !cpumask.get(0) {
-            return Err(AxError::InvalidInput);
-        }
         curr.set_cpumask(cpumask);
         Ok(())
     }
@@ -894,14 +929,7 @@ pub fn set_current_affinity(cpumask: AxCpuMask) -> AxResult {
 /// mask immediately. For a remote running task, the new mask is recorded and
 /// the task is nudged so it can self-migrate at its next scheduling point.
 pub fn set_task_affinity(task: &AxTaskRef, cpumask: AxCpuMask) -> AxResult {
-    if cpumask.is_empty() {
-        return Err(AxError::InvalidInput);
-    }
-
-    #[cfg(feature = "smp")]
-    if !crate::run_queue::affinity_has_online_cpu(cpumask) {
-        return Err(AxError::InvalidInput);
-    }
+    validate_affinity_mask(cpumask)?;
 
     if current().ptr_eq(task) {
         return set_current_affinity(cpumask);
@@ -973,9 +1001,6 @@ pub fn set_task_affinity(task: &AxTaskRef, cpumask: AxCpuMask) -> AxResult {
 
     #[cfg(not(feature = "smp"))]
     {
-        if !cpumask.get(0) {
-            return Err(AxError::InvalidInput);
-        }
         task.set_cpumask(cpumask);
         if matches!(task.state(), TaskState::Exited) {
             Err(AxError::NoSuchProcess)

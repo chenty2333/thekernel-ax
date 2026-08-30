@@ -1118,6 +1118,15 @@ impl TaskInner {
             .is_ok()
     }
 
+    /// A publication reservation owns an unpublished task.  It is not a
+    /// scheduler handoff that a public affinity operation may wait on: PID
+    /// lookup cannot legitimately expose this task until the reservation has
+    /// released its mutation word.
+    #[cfg(feature = "sched-eevdf")]
+    pub(crate) fn affinity_mutation_is_publication_reservation(&self) -> bool {
+        self.mutation.load(Ordering::Acquire) == TASK_MUTATION_PUBLICATION
+    }
+
     /// Claim the independent ready-task idle-steal transaction.
     #[cfg(feature = "idle-steal")]
     pub(crate) fn try_begin_idle_steal_mutation(&self) -> bool {

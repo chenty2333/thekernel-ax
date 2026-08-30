@@ -93,6 +93,14 @@ fn current_handle_owns_an_independent_strong_reference() {
 }
 
 #[test]
+fn affinity_admission_rejects_an_empty_mask_before_mutation() {
+    assert_eq!(
+        axtask::validate_affinity_mask(crate::AxCpuMask::new()),
+        Err(AxError::InvalidInput)
+    );
+}
+
+#[test]
 fn interruptible_ready_result_preserves_a_simultaneous_interrupt() {
     let _lock = SERIAL.lock();
     init_for_test();
@@ -1108,7 +1116,7 @@ fn publication_reservation_cancel_returns_the_unpublished_task() {
     let original_affinity = reserved.cpumask();
     assert_eq!(
         axtask::set_task_affinity(&reserved, original_affinity),
-        Err(AxError::ResourceBusy)
+        Err(AxError::NoSuchProcess),
     );
     assert_eq!(reserved.cpumask(), original_affinity);
     assert_eq!(
