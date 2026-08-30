@@ -153,6 +153,7 @@ impl EevdfTaskParams {
             2 => EevdfTaskClass::Idle,
             3 => EevdfTaskClass::RoundRobin,
             4 => EevdfTaskClass::Fifo,
+            5 => EevdfTaskClass::Deadline,
             // The publication word is private and every safe writer stores
             // a validated tuple.  Contain a corrupted word by returning the
             // canonical default instead of indexing a weight table out of
