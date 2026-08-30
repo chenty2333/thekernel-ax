@@ -596,7 +596,11 @@ static DEADLINE_ROOT_DOMAIN: Once<Arc<DeadlineAdmissionDomain>> = Once::new();
 
 #[cfg(feature = "sched-eevdf")]
 fn deadline_admission_domain() -> Arc<DeadlineAdmissionDomain> {
-    Arc::clone(DEADLINE_ROOT_DOMAIN.call_once(|| Arc::new(DeadlineAdmissionDomain::new())))
+    Arc::clone(DEADLINE_ROOT_DOMAIN.call_once(|| {
+        Arc::new(DeadlineAdmissionDomain::with_cpu_capacity(
+            axconfig::plat::MAX_CPU_NUM,
+        ))
+    }))
 }
 
 /// Advisory, lock-free load observation for one initialized CPU run queue.
@@ -3331,7 +3335,11 @@ impl AxRunQueue {
         let deadline_staged = matches!(request.state.class, axsched::EevdfTaskClass::Deadline);
         let deadline_reconfigured =
             deadline_staged && matches!(old.state.class, axsched::EevdfTaskClass::Deadline);
-        let result = (if deadline_reconfigured {
+        let dl_param_changed = old.deadline != request.deadline;
+        let skip_unchanged_deadline = deadline_reconfigured && !dl_param_changed;
+        let result = (if skip_unchanged_deadline {
+            Ok(())
+        } else if deadline_reconfigured {
             // Preserve the admitted tuple until the scheduler has derived
             // the old reservation delta. Staging first would overwrite the
             // only old runtime/period witness for DL->DL rollback.
@@ -3344,7 +3352,15 @@ impl AxRunQueue {
             Ok(())
         })
         .and_then(|_| {
-            scheduler.set_task_params_with_runtime(task, request.state, Self::scheduler_period_ns())
+            if skip_unchanged_deadline && old.state == request.state {
+                Ok(axsched::EevdfParamUpdate::NoPreemption)
+            } else {
+                scheduler.set_task_params_with_runtime(
+                    task,
+                    request.state,
+                    Self::scheduler_period_ns(),
+                )
+            }
         })
         .and_then(|outcome| {
             scheduler

@@ -84,6 +84,65 @@ pub struct DeadlineConfig {
     pub period_ns: u64,
 }
 
+/// Shared admission ledger for run queues in one CPU-affinity domain.
+///
+/// Reservations use an optimistic CAS so admission never needs to take one
+/// CPU's runqueue lock while holding another.  Callers first update this
+/// domain ledger, then their local runqueue; failed local publication refunds
+/// the exact delta before releasing the runqueue lock.
+pub struct DeadlineAdmissionDomain {
+    utilization: AtomicU64,
+    capacity: u64,
+}
+
+impl DeadlineAdmissionDomain {
+    pub const fn new() -> Self {
+        Self {
+            utilization: AtomicU64::new(0),
+            capacity: DEADLINE_UTIL_SCALE as u64,
+        }
+    }
+
+    /// Construct a root domain spanning `cpus` participating CPUs.
+    pub fn with_cpu_capacity(cpus: usize) -> Self {
+        Self {
+            utilization: AtomicU64::new(0),
+            capacity: (DEADLINE_UTIL_SCALE as u64).saturating_mul(cpus.max(1) as u64),
+        }
+    }
+
+    fn replace(&self, old: u128, new: u128) -> Result<(), SchedulerError> {
+        let old = u64::try_from(old).map_err(|_| SchedulerError::ArithmeticExhausted)?;
+        let new = u64::try_from(new).map_err(|_| SchedulerError::ArithmeticExhausted)?;
+        let mut current = self.utilization.load(Ordering::Acquire);
+        loop {
+            let total = current
+                .checked_sub(old)
+                .ok_or(SchedulerError::InconsistentState)?
+                .checked_add(new)
+                .ok_or(SchedulerError::ArithmeticExhausted)?;
+            if total > self.capacity {
+                return Err(SchedulerError::TaskBusy);
+            }
+            match self.utilization.compare_exchange_weak(
+                current,
+                total,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl Default for DeadlineAdmissionDomain {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DeadlineConfig {
     pub const fn is_valid(self) -> bool {
         self.runtime_ns != 0
@@ -3506,10 +3565,13 @@ impl<T> EEVDFScheduler<T> {
                     self.release_claim(&task);
                     return Err(error);
                 }
-                if let Err(error) = self.initialize_deadline_state(&task) {
+                // Sleeping CBS servers retain their residual budget and
+                // absolute deadline. Linux wakeup does not create a fresh
+                // reservation unless the server had actually replenished.
+                if unsafe { task.owned_state().deadline_remaining_ns } == 0 {
                     self.release_deadline(task.deadline_config());
                     self.release_claim(&task);
-                    return Err(error);
+                    return Err(SchedulerError::InconsistentState);
                 }
                 Self::deadline_key(unsafe { task.owned_state().deadline_absolute_ns }, sequence)
             } else {
