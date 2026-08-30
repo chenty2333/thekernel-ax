@@ -924,6 +924,13 @@ enum TaskSchedTransaction<E> {
     Redirect,
 }
 
+#[cfg(feature = "sched-eevdf")]
+enum TaskSchedAttrTransaction<E> {
+    Complete(Result<Result<TaskSchedCommit, E>, TaskSchedError>),
+    #[cfg(feature = "smp")]
+    Redirect,
+}
+
 impl From<SchedulerError> for TaskSchedError {
     fn from(error: SchedulerError) -> Self {
         match error {
@@ -1038,6 +1045,37 @@ where
     }
 }
 
+/// Stable-owner transaction which also publishes Linux utilization clamps.
+#[cfg(feature = "sched-eevdf")]
+pub(crate) fn update_task_sched_attr_versioned_stable<E, F>(
+    task: &AxTaskRef,
+    mut update: F,
+) -> Result<Result<TaskSchedCommit, E>, TaskSchedError>
+where
+    F: FnMut(TaskSchedCommit) -> Result<crate::api::TaskSchedAttrUpdate, E>,
+{
+    #[cfg(not(feature = "smp"))]
+    {
+        let TaskSchedAttrTransaction::Complete(result) =
+            task_run_queue::<kernel_guard::NoPreemptIrqSave>(task)
+                .update_task_sched_attr_once(task, &mut update);
+        result
+    }
+    #[cfg(feature = "smp")]
+    {
+        let attempts = axconfig::plat::MAX_CPU_NUM.saturating_add(1).max(2);
+        for _ in 0..attempts {
+            match task_run_queue::<kernel_guard::NoPreemptIrqSave>(task)
+                .update_task_sched_attr_once(task, &mut update)
+            {
+                TaskSchedAttrTransaction::Complete(result) => return result,
+                TaskSchedAttrTransaction::Redirect => {}
+            }
+        }
+        Err(TaskSchedError::Scheduler(SchedulerError::TaskBusy))
+    }
+}
+
 /// Stable-owner counterpart of [`set_task_sched_state_stable`] for a
 /// field-only nice update. The current scheduler state is sampled only after
 /// acquiring the owner lock.
@@ -1129,8 +1167,8 @@ pub(crate) fn scheduler_attr_snapshot_stable(
         fair_runtime_ns,
         deadline_ns: 0,
         period_ns: 0,
-        util_min: 0,
-        util_max: 0,
+        util_min: commit.util_min,
+        util_max: commit.util_max,
     })
 }
 
@@ -1874,6 +1912,26 @@ impl<G: BaseGuard> AxRunQueueRef<'_, G> {
             )));
         };
         run_queue.update_task_sched_state(task, update)
+    }
+
+    #[cfg(feature = "sched-eevdf")]
+    fn update_task_sched_attr_once<E, F>(
+        &mut self,
+        task: &AxTaskRef,
+        update: &mut F,
+    ) -> TaskSchedAttrTransaction<E>
+    where
+        F: FnMut(TaskSchedCommit) -> Result<crate::api::TaskSchedAttrUpdate, E>,
+    {
+        if task.is_terminalizing() || matches!(task.state(), TaskState::Exited) {
+            return TaskSchedAttrTransaction::Complete(Err(TaskSchedError::TaskExited));
+        }
+        let Some(run_queue) = self.inner else {
+            return TaskSchedAttrTransaction::Complete(Err(TaskSchedError::RunQueueUnavailable(
+                self.selected_cpu,
+            )));
+        };
+        run_queue.update_task_sched_attr(task, update)
     }
 
     #[cfg(feature = "smp")]
@@ -2965,6 +3023,8 @@ impl AxRunQueue {
                 TaskSchedCommit {
                     state: sched_state,
                     reset_on_fork: task.sched_reset_on_fork(),
+                    util_min: task.sched_util_clamp().0,
+                    util_max: task.sched_util_clamp().1,
                     version: task.next_sched_commit_version(),
                 }
             });
@@ -2987,6 +3047,8 @@ impl AxRunQueue {
         TaskSchedSnapshot::Complete(Ok(TaskSchedCommit {
             state: task.sched_params(),
             reset_on_fork: task.sched_reset_on_fork(),
+            util_min: task.sched_util_clamp().0,
+            util_max: task.sched_util_clamp().1,
             version: task.sched_commit_version(),
         }))
     }
@@ -3015,6 +3077,8 @@ impl AxRunQueue {
         let old = TaskSchedCommit {
             state: task.sched_params(),
             reset_on_fork: task.sched_reset_on_fork(),
+            util_min: task.sched_util_clamp().0,
+            util_max: task.sched_util_clamp().1,
             version: task.sched_commit_version(),
         };
         let (sched_state, reset_on_fork) = match update(old) {
@@ -3046,10 +3110,82 @@ impl AxRunQueue {
                 TaskSchedCommit {
                     state: sched_state,
                     reset_on_fork,
+                    util_min: old.util_min,
+                    util_max: old.util_max,
                     version: task.next_sched_commit_version(),
                 }
             });
         TaskSchedTransaction::Complete(result.map(Ok))
+    }
+
+    #[cfg(feature = "sched-eevdf")]
+    fn update_task_sched_attr<E, F>(
+        &self,
+        task: &AxTaskRef,
+        update: &mut F,
+    ) -> TaskSchedAttrTransaction<E>
+    where
+        F: FnMut(TaskSchedCommit) -> Result<crate::api::TaskSchedAttrUpdate, E>,
+    {
+        if task.is_terminalizing() || matches!(task.state(), TaskState::Exited) {
+            return TaskSchedAttrTransaction::Complete(Err(TaskSchedError::TaskExited));
+        }
+        let mut scheduler = self.scheduler.lock();
+        if task.is_terminalizing() || matches!(task.state(), TaskState::Exited) {
+            return TaskSchedAttrTransaction::Complete(Err(TaskSchedError::TaskExited));
+        }
+        #[cfg(feature = "smp")]
+        if task.cpu_id() as usize != self.cpu_id {
+            return TaskSchedAttrTransaction::Redirect;
+        }
+        let old = TaskSchedCommit {
+            state: task.sched_params(),
+            reset_on_fork: task.sched_reset_on_fork(),
+            util_min: task.sched_util_clamp().0,
+            util_max: task.sched_util_clamp().1,
+            version: task.sched_commit_version(),
+        };
+        let request = match update(old) {
+            Ok(request) => request,
+            Err(error) => return TaskSchedAttrTransaction::Complete(Ok(Err(error))),
+        };
+        if request.util_min > request.util_max || request.util_max > 1024 {
+            return TaskSchedAttrTransaction::Complete(Err(TaskSchedError::Scheduler(
+                SchedulerError::InvalidParameters,
+            )));
+        }
+
+        let executing = scheduler.is_running_task(task)
+            && task.is_running()
+            && AxRunQueue::should_account_runtime(task.is_idle(), task.is_migration_helper());
+        if executing {
+            let runtime = self.runtime_delta_flags(task.is_idle(), task.is_migration_helper());
+            if !runtime.is_zero() {
+                let needs_resched = scheduler.account_runtime(task, runtime);
+                #[cfg(feature = "preempt")]
+                if needs_resched {
+                    request_reschedule_cpu(self.cpu_id, task);
+                }
+            }
+        }
+        let result = scheduler
+            .set_task_params_with_runtime(task, request.state, Self::scheduler_period_ns())
+            .map_err(TaskSchedError::from)
+            .map(|outcome| {
+                task.set_sched_reset_on_fork(request.reset_on_fork);
+                task.set_sched_util_clamp(request.util_min, request.util_max);
+                if let Some(current) = outcome.into_preempt_current() {
+                    request_reschedule_cpu(self.cpu_id, &current);
+                }
+                TaskSchedCommit {
+                    state: request.state,
+                    reset_on_fork: request.reset_on_fork,
+                    util_min: request.util_min,
+                    util_max: request.util_max,
+                    version: task.next_sched_commit_version(),
+                }
+            });
+        TaskSchedAttrTransaction::Complete(result.map(Ok))
     }
 
     fn new_gc_task(cpu_id: usize) -> Result<AxTaskRef, TaskRuntimeInitError> {
@@ -4477,7 +4613,13 @@ mod exited_queue_tests {
         };
         assert!(matches!(
             run_queue.set_task_sched_state(&selected, axsched::EevdfTaskParams::default(), None, None),
-            TaskSchedUpdate::Complete(Ok(TaskSchedCommit { state, reset_on_fork: _, version }))
+            TaskSchedUpdate::Complete(Ok(TaskSchedCommit {
+                state,
+                reset_on_fork: _,
+                util_min: _,
+                util_max: _,
+                version,
+            }))
                 if state == axsched::EevdfTaskParams::default() && version != 0
         ));
         assert_eq!(

@@ -1046,11 +1046,53 @@ fn versioned_sched_transaction_keeps_policy_rejection_and_commit_atomic() {
     assert!(attr.fair_runtime_ns > 0);
     assert_eq!(attr.deadline_ns, 0);
     assert_eq!(attr.period_ns, 0);
-    assert_eq!(attr.util_min, 0);
-    assert_eq!(attr.util_max, 0);
+    assert_eq!(attr.util_min, original.util_min);
+    assert_eq!(attr.util_max, original.util_max);
 
     axtask::set_sched_state_versioned_with_reset(&task, original.state, original.reset_on_fork)
         .unwrap();
+}
+
+#[cfg(feature = "sched-eevdf")]
+#[test]
+fn sched_attr_transaction_commits_util_clamp_with_scheduler_state() {
+    let _lock = SERIAL.lock();
+    init_for_test();
+
+    let task = current().clone();
+    let original = axtask::scheduler_attr_snapshot(&task).unwrap();
+    let committed = axtask::update_sched_attr_versioned(&task, |old| {
+        assert_eq!(old, original.commit);
+        let mut state = old.state;
+        state.nice = 2;
+        Ok::<_, ()>(crate::TaskSchedAttrUpdate {
+            state,
+            reset_on_fork: !old.reset_on_fork,
+            util_min: 256,
+            util_max: 768,
+        })
+    })
+    .unwrap()
+    .unwrap();
+    assert_eq!(committed.util_min, 256);
+    assert_eq!(committed.util_max, 768);
+    assert_eq!(committed.state.nice, 2);
+    assert_eq!(committed.version, original.commit.version.wrapping_add(1));
+
+    let observed = axtask::scheduler_attr_snapshot(&task).unwrap();
+    assert_eq!(observed.commit, committed);
+    assert_eq!((observed.util_min, observed.util_max), (256, 768));
+
+    axtask::update_sched_attr_versioned(&task, |_| {
+        Ok::<_, ()>(crate::TaskSchedAttrUpdate {
+            state: original.commit.state,
+            reset_on_fork: original.commit.reset_on_fork,
+            util_min: original.commit.util_min,
+            util_max: original.commit.util_max,
+        })
+    })
+    .unwrap()
+    .unwrap();
 }
 
 #[cfg(feature = "sched-eevdf")]

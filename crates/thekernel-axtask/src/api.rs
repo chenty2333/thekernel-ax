@@ -492,6 +492,8 @@ pub fn spawn_task_with_sched_from(
     task_ref
         .configure(sched_state)
         .map_err(map_scheduler_error)?;
+    let (util_min, util_max) = parent.sched_util_clamp();
+    task_ref.set_sched_util_clamp(util_min, util_max);
     install_fork_seed_if_applicable(&task_ref, parent)?;
     let publication = select_run_queue::<NoPreemptIrqSave>(&task_ref).add_task(task_ref.clone());
     publication.map_err(map_task_enqueue_error)?;
@@ -510,6 +512,10 @@ pub fn prepare_task_with_sched_from(
     task_ref
         .configure(sched_state)
         .map_err(map_scheduler_error)?;
+    // The child is still private here. A fork inherits the parent's effective
+    // clamp; exec retains the existing task and consequently needs no action.
+    let (util_min, util_max) = parent.sched_util_clamp();
+    task_ref.set_sched_util_clamp(util_min, util_max);
     install_fork_seed_if_applicable(&task_ref, parent)?;
     Ok(task_ref)
 }
@@ -625,16 +631,23 @@ pub fn scheduler_commit_version(task: &AxTaskRef) -> u64 {
 pub struct TaskSchedCommit {
     pub state: SchedState,
     pub reset_on_fork: bool,
+    /// Effective utilization-clamp bounds in Linux's 0..=1024 scale.
+    ///
+    /// This build has no cgroup clamp controller, so the effective bounds are
+    /// the task request.  Keeping them in the scheduler commit (rather than
+    /// the syscall layer) makes that fact explicit and keeps future cgroup
+    /// composition in the same transaction domain.
+    pub util_min: u32,
+    pub util_max: u32,
     pub version: u64,
 }
 
 /// Complete scheduler-owned data exported by Linux `sched_getattr`.
 ///
 /// The tuple is produced under the same stable run-queue ownership check as
-/// [`TaskSchedCommit`].  Deadline and utilization-clamp fields are reserved
-/// for scheduler classes which do not exist in this build and consequently
-/// remain zero; keeping them here prevents an ABI reader from combining the
-/// committed class with independently sampled future fields.
+/// [`TaskSchedCommit`]. Deadline fields are reserved for scheduler classes
+/// which do not exist in this build. Utilization clamps are scheduler-owned
+/// and therefore sampled from the same transaction as policy and priority.
 #[cfg(feature = "sched-eevdf")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TaskSchedAttrSnapshot {
@@ -644,6 +657,21 @@ pub struct TaskSchedAttrSnapshot {
     pub fair_runtime_ns: u64,
     pub deadline_ns: u64,
     pub period_ns: u64,
+    pub util_min: u32,
+    pub util_max: u32,
+}
+
+/// One complete scheduler update request, including utilization clamps.
+///
+/// Callers must validate `util_min <= util_max <= 1024` before submitting the
+/// request. Keeping validation at the Linux personality boundary preserves
+/// its precise errno and capability ordering; this type carries only an
+/// already-authorized scheduler transaction.
+#[cfg(feature = "sched-eevdf")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskSchedAttrUpdate {
+    pub state: SchedState,
+    pub reset_on_fork: bool,
     pub util_min: u32,
     pub util_max: u32,
 }
@@ -709,6 +737,20 @@ where
     crate::run_queue::update_task_sched_state_versioned_with_reset_stable(task, update)
 }
 
+/// Atomically decides and commits scheduler policy, reset-on-fork, and
+/// utilization clamps. This is the `sched_setattr` entry point: no reader can
+/// observe its successful clamp update paired with an older policy commit.
+#[cfg(feature = "sched-eevdf")]
+pub fn update_sched_attr_versioned<E, F>(
+    task: &AxTaskRef,
+    update: F,
+) -> Result<Result<TaskSchedCommit, E>, TaskSchedError>
+where
+    F: FnMut(TaskSchedCommit) -> Result<TaskSchedAttrUpdate, E>,
+{
+    crate::run_queue::update_task_sched_attr_versioned_stable(task, update)
+}
+
 /// Initializes the ABI policy flag before a prepared task is published.  No
 /// scheduler owner exists yet, therefore no concurrent snapshot can observe
 /// the initialization separately from first publication.
@@ -716,6 +758,15 @@ where
 pub fn set_prepared_task_sched_reset_on_fork(task: &AxTaskRef, reset_on_fork: bool) {
     debug_assert!(!task.is_running());
     task.set_sched_reset_on_fork(reset_on_fork);
+}
+
+/// Initializes clamp state for a not-yet-published task. Fork creation uses
+/// this to transfer its scheduler snapshot before the child is visible.
+#[cfg(feature = "sched-eevdf")]
+pub fn set_prepared_task_sched_util_clamp(task: &AxTaskRef, util_min: u32, util_max: u32) {
+    debug_assert!(!task.is_running());
+    debug_assert!(util_min <= util_max && util_max <= 1024);
+    task.set_sched_util_clamp(util_min, util_max);
 }
 
 /// Changes only a task's nice value while its owning scheduler lock is held.

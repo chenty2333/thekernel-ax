@@ -689,6 +689,13 @@ pub struct TaskInner {
     sched_commit_version: AtomicU64,
     /// ABI-visible scheduler policy bit, serialized by the owning run queue.
     sched_reset_on_fork: AtomicBool,
+    /// Linux utilization-clamp request.  The low half is the minimum and the
+    /// high half the maximum, each expressed on Linux's 0..=1024 scale.
+    ///
+    /// This is owned by the same run-queue transaction which publishes
+    /// `sched_reset_on_fork` and `sched_params`; atomic storage is only used
+    /// for pre-publication inheritance and never substitutes for that lock.
+    sched_util_clamp: AtomicU32,
     /// CPU on which this task most recently received a context-switch-in.
     /// This is separate from `cpu_id`, which is the current routing owner and
     /// may be published ahead of a migration commit.
@@ -827,6 +834,15 @@ impl TaskInner {
     }
     pub(crate) fn set_sched_reset_on_fork(&self, enabled: bool) {
         self.sched_reset_on_fork.store(enabled, Ordering::Relaxed);
+    }
+    pub(crate) fn sched_util_clamp(&self) -> (u32, u32) {
+        let clamp = self.sched_util_clamp.load(Ordering::Relaxed);
+        (clamp & 0xffff, clamp >> 16)
+    }
+    pub(crate) fn set_sched_util_clamp(&self, min: u32, max: u32) {
+        debug_assert!(min <= max && max <= 1024);
+        self.sched_util_clamp
+            .store((min & 0xffff) | ((max & 0xffff) << 16), Ordering::Relaxed);
     }
     /// Fallibly creates a new unpublished task.
     ///
@@ -1439,6 +1455,7 @@ impl TaskInner {
             cpu_id: AtomicU32::new(0),
             sched_commit_version: AtomicU64::new(1),
             sched_reset_on_fork: AtomicBool::new(false),
+            sched_util_clamp: AtomicU32::new(1024 << 16),
             #[cfg(feature = "idle-steal")]
             last_run_cpu: AtomicU32::new(0),
             #[cfg(feature = "idle-steal")]
