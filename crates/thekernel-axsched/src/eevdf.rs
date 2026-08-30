@@ -431,6 +431,10 @@ struct MigrationState {
     runtime_fraction_weight: u128,
     rr_fraction_q: u64,
     dormant_fair: Option<Entity>,
+    deadline_remaining_ns: u64,
+    deadline_absolute_ns: u64,
+    deadline_replenish_at_ns: u64,
+    deadline_throttled: bool,
     origin: EevdfMigrationOrigin,
 }
 
@@ -2028,6 +2032,10 @@ impl<T> EEVDFScheduler<T> {
                     runtime_fraction_weight: old_state.runtime_fraction_weight,
                     rr_fraction_q: old_state.rr_fraction_q,
                     dormant_fair: old_state.dormant_fair,
+                    deadline_remaining_ns: old_state.deadline_remaining_ns,
+                    deadline_absolute_ns: old_state.deadline_absolute_ns,
+                    deadline_replenish_at_ns: old_state.deadline_replenish_at_ns,
+                    deadline_throttled: old_state.deadline_throttled,
                     origin: EevdfMigrationOrigin::Ready,
                 },
             );
@@ -2087,6 +2095,10 @@ impl<T> EEVDFScheduler<T> {
                     runtime_fraction_weight: old_state.runtime_fraction_weight,
                     rr_fraction_q: old_state.rr_fraction_q,
                     dormant_fair: old_state.dormant_fair,
+                    deadline_remaining_ns: old_state.deadline_remaining_ns,
+                    deadline_absolute_ns: old_state.deadline_absolute_ns,
+                    deadline_replenish_at_ns: old_state.deadline_replenish_at_ns,
+                    deadline_throttled: old_state.deadline_throttled,
                     origin: EevdfMigrationOrigin::Running,
                 },
             );
@@ -2231,6 +2243,10 @@ impl<T> EEVDFScheduler<T> {
             state.runtime_fraction_weight = metadata.runtime_fraction_weight;
             state.rr_fraction_q = if renew_rr { 0 } else { metadata.rr_fraction_q };
             state.dormant_fair = metadata.dormant_fair;
+            state.deadline_remaining_ns = metadata.deadline_remaining_ns;
+            state.deadline_absolute_ns = metadata.deadline_absolute_ns;
+            state.deadline_replenish_at_ns = metadata.deadline_replenish_at_ns;
+            state.deadline_throttled = metadata.deadline_throttled;
             state.migration = None;
             state.rt_sleeping = false;
             state.fork_seed = None;
@@ -2368,6 +2384,10 @@ impl<T> EEVDFScheduler<T> {
             state.runtime_fraction_weight = metadata.runtime_fraction_weight;
             state.rr_fraction_q = if renew_rr { 0 } else { metadata.rr_fraction_q };
             state.dormant_fair = metadata.dormant_fair;
+            state.deadline_remaining_ns = metadata.deadline_remaining_ns;
+            state.deadline_absolute_ns = metadata.deadline_absolute_ns;
+            state.deadline_replenish_at_ns = metadata.deadline_replenish_at_ns;
+            state.deadline_throttled = metadata.deadline_throttled;
             state.migration = None;
             state.rt_sleeping = false;
             state.fork_seed = None;
