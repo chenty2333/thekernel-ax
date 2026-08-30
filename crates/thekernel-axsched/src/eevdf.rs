@@ -1780,6 +1780,9 @@ impl<T> EEVDFScheduler<T> {
             let sequence = match sequence {
                 Ok(sequence) => sequence,
                 Err(error) => {
+                    if is_deadline_class(params.class) {
+                        self.release_deadline(task.deadline_config());
+                    }
                     self.release_claim(&task);
                     return Err(error);
                 }
@@ -1850,6 +1853,9 @@ impl<T> EEVDFScheduler<T> {
         // representation without publishing owner or model state.
         let old_key = unsafe { task.key() };
         if let Err(error) = self.insert_staged(&task, key, eligible_at, old_key, 0) {
+            if is_deadline_class(params.class) {
+                self.release_deadline(task.deadline_config());
+            }
             self.release_claim(&task);
             return Err(error);
         }
@@ -2502,7 +2508,11 @@ impl<T> EEVDFScheduler<T> {
             )
         };
         let inserted = if metadata.deadline_throttled {
-            Self::stage_key(&task, metadata.source_key, metadata.source_eligible_at);
+            let key = Self::throttled_deadline_key(
+                metadata.deadline_replenish_at_ns,
+                metadata.source_key.sequence(),
+            );
+            Self::stage_key(&task, key, u128::from(metadata.deadline_replenish_at_ns));
             self.deadline_throttled
                 .insert(Arc::clone(&task))
                 .map_err(|error| {
@@ -3492,7 +3502,12 @@ impl<T> EEVDFScheduler<T> {
                 }
             };
             let key = if is_deadline_class(params.class) {
+                if let Err(error) = self.admit_deadline(task.deadline_config()) {
+                    self.release_claim(&task);
+                    return Err(error);
+                }
                 if let Err(error) = self.initialize_deadline_state(&task) {
+                    self.release_deadline(task.deadline_config());
                     self.release_claim(&task);
                     return Err(error);
                 }
@@ -3514,6 +3529,9 @@ impl<T> EEVDFScheduler<T> {
         };
 
         if let Err(error) = self.insert_staged(&task, key, eligible_at, old_key, old_eligible_at) {
+            if is_deadline_class(params.class) {
+                self.release_deadline(task.deadline_config());
+            }
             self.release_claim(&task);
             return Err(error);
         }
@@ -4331,6 +4349,9 @@ impl<T> BaseScheduler for EEVDFScheduler<T> {
                         task.owned_state_mut().rt_sleeping = true;
                         task.owned_state_mut().sleep_v = Some(self.clock.v);
                     };
+                    if is_deadline_class(params.class) {
+                        self.release_deadline(task.deadline_config());
+                    }
                     self.running = None;
                     task.transfer_owner(self.id, UNOWNED)
                         .expect("EEVDF RT owner invariant violated during sleep");

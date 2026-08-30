@@ -2208,9 +2208,15 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
                 return;
             }
             let mut scheduler = self.inner.scheduler.lock();
+            let now = monotonic_time_nanos();
             #[cfg(feature = "sched-eevdf")]
-            scheduler.rebase_deadline_clock(monotonic_time_nanos());
-            let runtime = self.inner.runtime_delta(curr);
+            scheduler.rebase_deadline_clock(now);
+            // The CBS clock and charged service use one timestamp sample.
+            // Sampling them independently can advance a replenishment boundary
+            // past work which the per-CPU runtime ledger has not yet charged.
+            let runtime =
+                self.inner
+                    .runtime_delta_at(now, curr.is_idle(), curr.is_migration_helper());
             if !runtime.is_zero() {
                 let _ = scheduler.account_runtime(curr, runtime);
             }
@@ -3323,7 +3329,16 @@ impl AxRunQueue {
             }
         }
         let deadline_staged = matches!(request.state.class, axsched::EevdfTaskClass::Deadline);
-        let result = (if deadline_staged {
+        let deadline_reconfigured =
+            deadline_staged && matches!(old.state.class, axsched::EevdfTaskClass::Deadline);
+        let result = (if deadline_reconfigured {
+            // Preserve the admitted tuple until the scheduler has derived
+            // the old reservation delta. Staging first would overwrite the
+            // only old runtime/period witness for DL->DL rollback.
+            scheduler
+                .set_task_deadline_config_with_runtime(task, request.deadline)
+                .map(|_| ())
+        } else if deadline_staged {
             scheduler.stage_task_deadline_config(task, request.deadline)
         } else {
             Ok(())
@@ -3345,7 +3360,9 @@ impl AxRunQueue {
                     (_, outcome) => outcome,
                 })
         });
-        if result.is_err() && deadline_staged {
+        if result.is_err() && deadline_reconfigured {
+            let _ = scheduler.set_task_deadline_config_with_runtime(task, old.deadline);
+        } else if result.is_err() && deadline_staged {
             // The policy transaction did not publish. Restore the previous
             // staged configuration before dropping the rq lock.
             let _ = scheduler.stage_task_deadline_config(task, old.deadline);
