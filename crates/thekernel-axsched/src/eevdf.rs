@@ -4019,6 +4019,10 @@ impl<T> BaseScheduler for EEVDFScheduler<T> {
                     task.owned_state_mut().rt_sleeping = false;
                     task.owned_state_mut().fork_seed = None;
                     task.owned_state_mut().sleep_v = None;
+                    task.owned_state_mut().deadline_remaining_ns = 0;
+                    task.owned_state_mut().deadline_absolute_ns = 0;
+                    task.owned_state_mut().deadline_replenish_at_ns = 0;
+                    task.owned_state_mut().deadline_throttled = false;
                 }
                 self.clock = next_clock;
                 self.running = None;
