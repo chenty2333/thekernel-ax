@@ -3284,7 +3284,8 @@ impl AxRunQueue {
                 }
             }
         }
-        let result = (if matches!(request.state.class, axsched::EevdfTaskClass::Deadline) {
+        let deadline_staged = matches!(request.state.class, axsched::EevdfTaskClass::Deadline);
+        let result = (if deadline_staged {
             scheduler.stage_task_deadline_config(task, request.deadline)
         } else {
             Ok(())
@@ -3305,9 +3306,13 @@ impl AxRunQueue {
                     }
                     (_, outcome) => outcome,
                 })
-        })
-        .map_err(TaskSchedError::from)
-        .map(|outcome| {
+        });
+        if result.is_err() && deadline_staged {
+            // The policy transaction did not publish. Restore the previous
+            // staged configuration before dropping the rq lock.
+            let _ = scheduler.stage_task_deadline_config(task, old.deadline);
+        }
+        let result = result.map_err(TaskSchedError::from).map(|outcome| {
             task.set_sched_reset_on_fork(request.reset_on_fork);
             task.set_sched_util_clamp(request.util_min, request.util_max);
             if let Some(current) = outcome.into_preempt_current() {
