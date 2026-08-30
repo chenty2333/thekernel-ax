@@ -1034,6 +1034,16 @@ impl TaskInner {
         self.ctx.get_mut()
     }
 
+    /// Copies the current task's PKRU into this unpublished task.
+    ///
+    /// Taking `&mut self` makes publication while mutating the child
+    /// impossible; the parent snapshot is separately pinned by the task API.
+    #[cfg(feature = "pkeys")]
+    pub fn inherit_current_pkru(&mut self) {
+        self.ctx_mut()
+            .set_saved_pkru(crate::api::current_task_pkru());
+    }
+
     /// Returns the top address of the kernel stack.
     #[inline]
     pub const fn kernel_stack_top(&self) -> Option<VirtAddr> {
