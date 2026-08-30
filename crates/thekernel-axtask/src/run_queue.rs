@@ -2787,7 +2787,12 @@ impl AxRunQueue {
         let (result, wake_claim_corrupt) = {
             let mut scheduler = self.scheduler.lock();
             #[cfg(feature = "sched-eevdf")]
-            scheduler.rebase_deadline_clock(monotonic_time_nanos());
+            // A running task's next runtime sample advances this same CBS
+            // clock. Rebasing here would advance wall time once for enqueue
+            // and again when that sample is charged.
+            if !scheduler.has_running_task() {
+                scheduler.rebase_deadline_clock(monotonic_time_nanos());
+            }
             let result = scheduler.enqueue_task(scheduler_task, reason);
             let mut wake_claim_corrupt = false;
             if result.is_ok() {
@@ -3353,7 +3358,12 @@ impl AxRunQueue {
             Ok(())
         })
         .and_then(|_| {
-            if skip_unchanged_deadline && old.state == request.state {
+            // A SCHED_DEADLINE tuple has no mutable priority/nice component.
+            // Once its request has changed in place, do not enter a second
+            // fallible scheduler transaction after the CBS domain replacement:
+            // it would require restoring capacity that a competing admission
+            // could already have consumed.
+            if deadline_reconfigured && old.state == request.state {
                 Ok(axsched::EevdfParamUpdate::NoPreemption)
             } else {
                 scheduler.set_task_params_with_runtime(
@@ -4837,6 +4847,7 @@ mod exited_queue_tests {
                 util_min: _,
                 util_max: _,
                 fair_runtime_ns: _,
+                deadline: _,
                 version,
             }))
                 if state == axsched::EevdfTaskParams::default() && version != 0

@@ -95,6 +95,7 @@ pub const DEADLINE_MIN_PERIOD_NS: u64 = 100_000;
 /// CPU's runqueue lock while holding another.  Callers first update this
 /// domain ledger, then their local runqueue; failed local publication refunds
 /// the exact delta before releasing the runqueue lock.
+#[derive(Debug)]
 pub struct DeadlineAdmissionDomain {
     utilization: AtomicU64,
     capacity: u64,
@@ -504,7 +505,7 @@ pub enum EevdfMigrationOrigin {
 /// This is deliberately a single task-owned value.  The public migration
 /// token is only a capability for the task and does not copy any of this
 /// rollback state, so a parked task cannot retain two disagreeing snapshots.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 struct MigrationState {
     source_scheduler_id: usize,
     params: EevdfTaskParams,
@@ -535,17 +536,17 @@ struct MigrationState {
     deadline_absolute_ns: u64,
     deadline_replenish_at_ns: u64,
     deadline_throttled: bool,
-    /// A nonzero identity means source detachment retained its reservation in
-    /// this shared domain.  Same-domain commit/rollback moves only the local
-    /// per-runqueue utilization, so no capacity is briefly visible to a
-    /// competing admission.
-    deadline_domain_identity: usize,
+    /// Source detachment retains this shared-domain owner alongside the
+    /// reservation.  Keeping an Arc, rather than an address-sized identity,
+    /// prevents a parked migration from observing an allocator-reused domain
+    /// address after its source queue has been dropped.
+    deadline_domain: Option<Arc<DeadlineAdmissionDomain>>,
     origin: EevdfMigrationOrigin,
 }
 
 /// Scheduler-owned fair state.  Access requires the queue-owner/rq-lock
 /// contract described by [`EevdfTaskPayload::owned_state_mut`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct EevdfOwnedState {
     pub(crate) entity: Option<Entity>,
     /// Runtime below one scheduler period retained for the current task.
@@ -1392,12 +1393,6 @@ impl<T> EEVDFScheduler<T> {
         self.deadline_utilization = self.deadline_utilization.saturating_sub(util);
     }
 
-    fn deadline_domain_identity(&self) -> usize {
-        self.deadline_domain
-            .as_ref()
-            .map_or(0, |domain| Arc::as_ptr(domain) as usize)
-    }
-
     fn replace_deadline_domain(
         &self,
         old: Option<DeadlineConfig>,
@@ -1514,6 +1509,12 @@ impl<T> EEVDFScheduler<T> {
             }
         };
         Ok((class, interval_ticks))
+    }
+
+    /// Whether this queue has a current task whose wall-clock service must be
+    /// accounted before advancing the shared CBS clock.
+    pub fn has_running_task(&self) -> bool {
+        self.running.is_some()
     }
 
     /// Select the first ready task accepted by `predicate` in structural key
@@ -1729,7 +1730,7 @@ impl<T> EEVDFScheduler<T> {
     /// different tuple merely because the task's packed parameters changed.
     fn validate_runtime_fraction_owner(
         task: &Arc<EEVDFTask<T>>,
-        state: EevdfOwnedState,
+        state: &EevdfOwnedState,
     ) -> Result<(), SchedulerError> {
         if state.runtime_remainder_ns == 0 && state.runtime_fraction_remainder_ns == 0 {
             return Ok(());
@@ -2190,7 +2191,7 @@ impl<T> EEVDFScheduler<T> {
             };
             (next_clock, Some(entity), key, eligible_at)
         };
-        let old_state = unsafe { *task.owned_state() };
+        let old_state = unsafe { task.owned_state().clone() };
         let deadline_admitted = is_deadline_class(params.class);
         if deadline_admitted {
             if let Err(kind) = self.admit_deadline(task.deadline_config()) {
@@ -2247,7 +2248,7 @@ impl<T> EEVDFScheduler<T> {
         // SAFETY: callers hold the task's CONFIGURING claim (or an equivalent
         // scheduler owner exclusion) while reading the one task-owned record.
         unsafe {
-            let metadata = task.owned_state().migration?;
+            let metadata = task.owned_state().migration.clone()?;
             Some(EevdfMigration {
                 task: Some(task),
                 source_scheduler_id: metadata.source_scheduler_id,
@@ -2279,7 +2280,7 @@ impl<T> EEVDFScheduler<T> {
         let params = task.sched_params();
         let source_key = unsafe { task.key() };
         let source_eligible_at = unsafe { task.eligible_at() };
-        let old_state = unsafe { *task.owned_state() };
+        let old_state = unsafe { task.owned_state().clone() };
         let source_entity = old_state.entity;
         let snapshot = if let Some(entity) = source_entity {
             Some(
@@ -2330,7 +2331,7 @@ impl<T> EEVDFScheduler<T> {
                     deadline_absolute_ns: old_state.deadline_absolute_ns,
                     deadline_replenish_at_ns: old_state.deadline_replenish_at_ns,
                     deadline_throttled: old_state.deadline_throttled,
-                    deadline_domain_identity: self.deadline_domain_identity(),
+                    deadline_domain: self.deadline_domain.clone(),
                     origin: EevdfMigrationOrigin::Ready,
                 },
             );
@@ -2360,7 +2361,7 @@ impl<T> EEVDFScheduler<T> {
         self.settle_before_lifecycle(task)?;
         let source_clock = self.clock;
         let params = task.sched_params();
-        let old_state = unsafe { *task.owned_state() };
+        let old_state = unsafe { task.owned_state().clone() };
         let source_entity = old_state.entity;
         let source_key = unsafe { task.key() };
         let source_eligible_at = unsafe { task.eligible_at() };
@@ -2404,7 +2405,7 @@ impl<T> EEVDFScheduler<T> {
                     deadline_absolute_ns: old_state.deadline_absolute_ns,
                     deadline_replenish_at_ns: old_state.deadline_replenish_at_ns,
                     deadline_throttled: old_state.deadline_throttled,
-                    deadline_domain_identity: self.deadline_domain_identity(),
+                    deadline_domain: self.deadline_domain.clone(),
                     origin: EevdfMigrationOrigin::Running,
                 },
             );
@@ -2470,7 +2471,7 @@ impl<T> EEVDFScheduler<T> {
         }
         // SAFETY: `claim_migration_for_commit` holds CONFIGURING for a parked
         // token, and an active token already owns that claim.
-        let metadata = unsafe { task.owned_state().migration };
+        let metadata = unsafe { task.owned_state().migration.clone() };
         let Some(metadata) = metadata else {
             return Err(Self::migration_error(
                 SchedulerError::InconsistentState,
@@ -2535,16 +2536,22 @@ impl<T> EEVDFScheduler<T> {
             )
         };
         let admitted_deadline = is_deadline_class(metadata.params.class);
-        let retained_domain = metadata.deadline_domain_identity != 0;
-        if retained_domain && metadata.deadline_domain_identity != self.deadline_domain_identity() {
-            // A retained reservation can only move within the domain which
-            // owns it.  Leave the token intact so its source can roll back;
-            // admitting it here would either leak the old ledger entry or
-            // create a window for a competing reservation.
-            return Err(Self::migration_error(
-                SchedulerError::ForeignQueue,
-                migration,
-            ));
+        let retained_domain = metadata.deadline_domain.is_some();
+        if let Some(source_domain) = metadata.deadline_domain.as_ref() {
+            if self
+                .deadline_domain
+                .as_ref()
+                .is_none_or(|domain| !Arc::ptr_eq(domain, source_domain))
+            {
+                // A retained reservation can only move within the domain which
+                // owns it.  Leave the token intact so its source can roll back;
+                // admitting it here would either leak the old ledger entry or
+                // create a window for a competing reservation.
+                return Err(Self::migration_error(
+                    SchedulerError::ForeignQueue,
+                    migration,
+                ));
+            }
         }
         if admitted_deadline {
             let admission = if retained_domain {
@@ -2670,7 +2677,7 @@ impl<T> EEVDFScheduler<T> {
             return Err(Self::migration_error(kind, migration));
         }
         // SAFETY: the migration claim is held for this complete snapshot.
-        let metadata = unsafe { task.owned_state().migration };
+        let metadata = unsafe { task.owned_state().migration.clone() };
         let Some(metadata) = metadata else {
             return Err(Self::migration_error(
                 SchedulerError::InconsistentState,
@@ -2726,12 +2733,18 @@ impl<T> EEVDFScheduler<T> {
         // parking. Reacquire it before publishing the task back on this run
         // queue; failure leaves the token intact for the caller to resolve.
         let admitted_deadline = is_deadline_class(metadata.params.class);
-        let retained_domain = metadata.deadline_domain_identity != 0;
-        if retained_domain && metadata.deadline_domain_identity != self.deadline_domain_identity() {
-            return Err(Self::migration_error(
-                SchedulerError::InconsistentState,
-                migration,
-            ));
+        let retained_domain = metadata.deadline_domain.is_some();
+        if let Some(source_domain) = metadata.deadline_domain.as_ref() {
+            if self
+                .deadline_domain
+                .as_ref()
+                .is_none_or(|domain| !Arc::ptr_eq(domain, source_domain))
+            {
+                return Err(Self::migration_error(
+                    SchedulerError::InconsistentState,
+                    migration,
+                ));
+            }
         }
         if admitted_deadline {
             let admission = if retained_domain {
@@ -2828,7 +2841,7 @@ impl<T> EEVDFScheduler<T> {
 
     fn active_reconfigured_state(
         &self,
-        old_state: EevdfOwnedState,
+        old_state: &EevdfOwnedState,
         old_params: EevdfTaskParams,
         new_params: EevdfTaskParams,
         next_total_weight: u128,
@@ -2903,7 +2916,7 @@ impl<T> EEVDFScheduler<T> {
 
     fn sleeping_reconfigured_state(
         &self,
-        old_state: EevdfOwnedState,
+        old_state: &EevdfOwnedState,
         old_params: EevdfTaskParams,
         new_params: EevdfTaskParams,
         fair_runtime_ns: u64,
@@ -3016,7 +3029,7 @@ impl<T> EEVDFScheduler<T> {
                 // particular, a parked migration is represented in the same
                 // UNOWNED owner word and must not be inspected locklessly.
                 let claim = task.value().claim_reconfiguration()?;
-                let state = unsafe { *task.owned_state() };
+                let state = unsafe { task.owned_state().clone() };
                 if state.migration.is_some() {
                     drop(claim);
                     return Err(SchedulerError::TaskBusy);
@@ -3028,7 +3041,7 @@ impl<T> EEVDFScheduler<T> {
                     return Err(SchedulerError::InconsistentState);
                 }
                 let old_params = task.sched_params();
-                Self::validate_runtime_fraction_owner(task, state)?;
+                Self::validate_runtime_fraction_owner(task, &state)?;
                 let old_fraction_weight = Self::runtime_fraction_weight(old_params)?;
                 let new_fraction_weight = Self::runtime_fraction_weight(params)?;
                 let clear_fraction = state.runtime_fraction_remainder_ns != 0
@@ -3051,7 +3064,7 @@ impl<T> EEVDFScheduler<T> {
                     return claim.finish().map(|_| EevdfParamUpdate::NoPreemption);
                 }
                 let (entity, dormant, rt_sleeping) = self.sleeping_reconfigured_state(
-                    state,
+                    &state,
                     old_params,
                     params,
                     task.fair_runtime_ns(),
@@ -3105,13 +3118,13 @@ impl<T> EEVDFScheduler<T> {
             owner if owner != self.id || self.id == UNOWNED => Err(SchedulerError::ForeignQueue),
             _ => {
                 let old_params = task.sched_params();
-                let old_state = unsafe { *task.owned_state() };
+                let old_state = unsafe { task.owned_state().clone() };
                 if old_state.runtime_remainder_ns != 0
                     || (!allow_settled_fraction && old_state.runtime_fraction_remainder_ns != 0)
                 {
                     return Err(SchedulerError::InconsistentState);
                 }
-                Self::validate_runtime_fraction_owner(task, old_state)?;
+                Self::validate_runtime_fraction_owner(task, &old_state)?;
                 let old_fraction_weight = Self::runtime_fraction_weight(old_params)?;
                 let new_fraction_weight = Self::runtime_fraction_weight(params)?;
                 let clear_fraction = old_state.runtime_fraction_remainder_ns != 0
@@ -3157,7 +3170,7 @@ impl<T> EEVDFScheduler<T> {
                         .map_err(model_error)?;
                 }
                 let (entity, dormant) = self.active_reconfigured_state(
-                    old_state,
+                    &old_state,
                     old_params,
                     params,
                     next_clock.total_weight,
@@ -3318,7 +3331,7 @@ impl<T> EEVDFScheduler<T> {
             .is_some_and(|current| Arc::ptr_eq(current, task));
         if running {
             let before_clock = self.clock;
-            let before_state = unsafe { *task.owned_state() };
+            let before_state = unsafe { task.owned_state().clone() };
             let before_rr = task.rr_remaining();
             self.settle_runtime_remainder(task, period_ns)?;
             let result = self.set_task_params_impl(task, params, true);
@@ -3373,7 +3386,9 @@ impl<T> EEVDFScheduler<T> {
                     .as_ref()
                     .is_some_and(|current| Arc::ptr_eq(current, task));
                 let old_config = task.deadline_config();
-                let old_state = unsafe { *task.owned_state() };
+                let old_state = unsafe { task.owned_state().clone() };
+                let next_utilization =
+                    self.replaced_deadline_utilization(Some(old_config), Some(config))?;
                 let absolute = self
                     .deadline_now_ns
                     .checked_add(config.deadline_ns)
@@ -3490,7 +3505,7 @@ impl<T> EEVDFScheduler<T> {
             CONFIGURING => Err(SchedulerError::TaskBusy),
             UNOWNED => {
                 let claim = task.value().claim_reconfiguration()?;
-                let state = unsafe { *task.owned_state() };
+                let state = unsafe { task.owned_state().clone() };
                 if state.migration.is_some() {
                     drop(claim);
                     return Err(SchedulerError::TaskBusy);
@@ -3515,7 +3530,7 @@ impl<T> EEVDFScheduler<T> {
                     .is_some_and(|current| Arc::ptr_eq(current, task));
                 if running {
                     let before_clock = self.clock;
-                    let before_state = unsafe { *task.owned_state() };
+                    let before_state = unsafe { task.owned_state().clone() };
                     let before_runtime = task.fair_runtime_ns();
                     self.settle_runtime_remainder(task, period_ns)?;
                     let result = (|| {
@@ -3541,7 +3556,7 @@ impl<T> EEVDFScheduler<T> {
                 if !task.is_linked() {
                     return Err(SchedulerError::InconsistentState);
                 }
-                let old_state = unsafe { *task.owned_state() };
+                let old_state = unsafe { task.owned_state().clone() };
                 let mut entity = old_state.entity.ok_or(SchedulerError::InconsistentState)?;
                 Self::rebind_fair_runtime(
                     &mut entity,
@@ -3624,7 +3639,7 @@ impl<T> EEVDFScheduler<T> {
             .is_some_and(|current| Arc::ptr_eq(current, task));
         if running {
             let before_clock = self.clock;
-            let before_state = unsafe { *task.owned_state() };
+            let before_state = unsafe { task.owned_state().clone() };
             let before_rr = task.rr_remaining();
             self.settle_runtime_remainder(task, period_ns)?;
             let result = self.set_priority_impl(task, prio, true);
@@ -3968,7 +3983,7 @@ impl<T> EEVDFScheduler<T> {
         self.settle_before_lifecycle(&prev)?;
         let params = prev.sched_params();
         if is_deadline_class(params.class) {
-            let state = unsafe { *prev.owned_state() };
+            let state = unsafe { prev.owned_state().clone() };
             let sequence = self.next_rt_sequence(false)?;
             if state.deadline_throttled {
                 Self::stage_key(
@@ -4308,7 +4323,7 @@ impl<T> EEVDFScheduler<T> {
         if !matches!(params.class, EevdfTaskClass::RoundRobin) {
             return Ok(self.has_higher_rt(params.rt_priority));
         }
-        let state = unsafe { *current.owned_state() };
+        let state = unsafe { current.owned_state().clone() };
         let old_fraction = u128::from(state.rr_fraction_q);
         if old_fraction >= ONE {
             return Err(SchedulerError::InconsistentState);
@@ -4397,7 +4412,7 @@ impl<T> EEVDFScheduler<T> {
         if period_ns == 0 {
             return Err(SchedulerError::InconsistentState);
         }
-        let state = unsafe { *current.owned_state() };
+        let state = unsafe { current.owned_state().clone() };
         if state.runtime_remainder_ns >= period_ns
             || (state.runtime_remainder_ns != 0
                 && state.runtime_fraction_period_ns != 0
@@ -4408,7 +4423,7 @@ impl<T> EEVDFScheduler<T> {
         {
             return Err(SchedulerError::InconsistentState);
         }
-        Self::validate_runtime_fraction_owner(current, state)?;
+        Self::validate_runtime_fraction_owner(current, &state)?;
         if state.runtime_fraction_remainder_ns != 0 && state.runtime_fraction_period_ns != period_ns
         {
             // A conversion residue is still runtime in the old tuple.  Do not
@@ -4474,7 +4489,7 @@ impl<T> EEVDFScheduler<T> {
         current: &Arc<EEVDFTask<T>>,
         elapsed_ns: u64,
     ) -> Result<bool, SchedulerError> {
-        let state = unsafe { *current.owned_state() };
+        let state = unsafe { current.owned_state().clone() };
         if state.deadline_throttled || state.deadline_remaining_ns == 0 {
             return Err(SchedulerError::InconsistentState);
         }
@@ -4508,7 +4523,7 @@ impl<T> EEVDFScheduler<T> {
         if is_deadline_class(current.sched_params().class) {
             return self.account_deadline_runtime(current, delta.elapsed_ns());
         }
-        let state = unsafe { *current.owned_state() };
+        let state = unsafe { current.owned_state().clone() };
         if state.runtime_remainder_ns >= period
             || (state.runtime_remainder_ns != 0
                 && state.runtime_fraction_period_ns != 0
@@ -4521,7 +4536,7 @@ impl<T> EEVDFScheduler<T> {
         {
             return Err(SchedulerError::InconsistentState);
         }
-        Self::validate_runtime_fraction_owner(current, state)?;
+        Self::validate_runtime_fraction_owner(current, &state)?;
         let params = current.sched_params();
         let fraction_weight = Self::runtime_fraction_weight(params)?;
         let total = u128::from(state.runtime_remainder_ns)
@@ -4579,7 +4594,7 @@ impl<T> EEVDFScheduler<T> {
     }
 
     fn settle_before_lifecycle(&mut self, task: &Arc<EEVDFTask<T>>) -> Result<(), SchedulerError> {
-        let state = unsafe { *task.owned_state() };
+        let state = unsafe { task.owned_state().clone() };
         if state.runtime_remainder_ns != 0 || state.runtime_fraction_remainder_ns != 0 {
             let period = state.runtime_fraction_period_ns;
             self.settle_runtime_remainder(task, period)?;
@@ -5130,7 +5145,7 @@ mod tests {
         assert!(!scheduler.account_runtime(&current, delta));
         let before_clock = scheduler.clock;
         let before_entity = unsafe { current.owned_state().entity.unwrap() };
-        let before_state = unsafe { *current.owned_state() };
+        let before_state = unsafe { current.owned_state().clone() };
 
         scheduler.clock.v = i128::MAX;
         assert_eq!(
@@ -5146,7 +5161,10 @@ mod tests {
             unsafe { current.owned_state().runtime_remainder_ns },
             before_state.runtime_remainder_ns
         );
-        assert_eq!(unsafe { *current.owned_state() }, before_state);
+        assert_eq!(
+            format!("{:?}", unsafe { current.owned_state() }),
+            format!("{before_state:?}")
+        );
 
         scheduler.clock = before_clock;
         let _ = scheduler
@@ -5339,7 +5357,7 @@ mod tests {
         let current = scheduler.pick_next_task().unwrap();
         assert!(!scheduler.account_runtime(&current, RuntimeDelta::new(1, 3)));
 
-        let before_state = unsafe { *current.owned_state() };
+        let before_state = unsafe { current.owned_state().clone() };
         let before_rr = current.rr_remaining();
         let mut failed_clock = scheduler.clock;
         failed_clock.total_weight = u128::MAX;
@@ -5353,7 +5371,10 @@ mod tests {
             Err(SchedulerError::ArithmeticExhausted)
         );
         assert_eq!(scheduler.clock, failed_clock);
-        assert_eq!(unsafe { *current.owned_state() }, before_state);
+        assert_eq!(
+            format!("{:?}", unsafe { current.owned_state() }),
+            format!("{before_state:?}")
+        );
         assert_eq!(current.rr_remaining(), before_rr);
         assert_eq!(current.sched_params().class, EevdfTaskClass::Fifo);
     }
@@ -6116,6 +6137,7 @@ mod tests {
         let snapshot = unsafe {
             task.owned_state()
                 .migration
+                .clone()
                 .expect("migration metadata missing")
                 .snapshot
                 .expect("fair migration snapshot missing")
@@ -6225,7 +6247,7 @@ mod tests {
         let source_key = unsafe { task.key() };
         let source_eligible_at = unsafe { task.eligible_at() };
         let migration = source.begin_ready_migration(&task).unwrap();
-        let metadata = unsafe { task.owned_state().migration.unwrap() };
+        let metadata = unsafe { task.owned_state().migration.clone().unwrap() };
         assert_eq!(metadata.source_clock, source_clock);
         assert_eq!(metadata.source_entity, source_entity);
         assert_eq!(metadata.detached_clock, source.clock);
@@ -6253,7 +6275,7 @@ mod tests {
         let source_key = unsafe { task.key() };
         let source_eligible_at = unsafe { task.eligible_at() };
         let migration = source.begin_running_migration(&task).unwrap();
-        let metadata = unsafe { task.owned_state().migration.unwrap() };
+        let metadata = unsafe { task.owned_state().migration.clone().unwrap() };
         assert_eq!(metadata.source_clock, source_clock);
         assert_eq!(metadata.source_entity, source_entity);
         assert_eq!(metadata.detached_clock, source.clock);
@@ -6277,7 +6299,7 @@ mod tests {
         source.add_task(peer).unwrap();
         let source_key = unsafe { task.key() };
         let migration = source.begin_ready_migration(&task).unwrap();
-        let metadata = unsafe { task.owned_state().migration.unwrap() };
+        let metadata = unsafe { task.owned_state().migration.clone().unwrap() };
         let snapshot = metadata.snapshot.unwrap();
         let detached_clock = metadata.detached_clock;
 
@@ -6468,7 +6490,7 @@ mod tests {
         let before_clock = scheduler.clock;
         let before_key = unsafe { second.key() };
         let before_eligible_at = unsafe { second.eligible_at() };
-        let before_state = unsafe { *second.owned_state() };
+        let before_state = unsafe { second.owned_state().clone() };
         let before_params = second.sched_params();
         let before_rr_remaining = second.rr_remaining();
         let before_ready_len = scheduler.ready_tree.len();
@@ -6490,7 +6512,10 @@ mod tests {
         assert!(second.is_linked());
         assert_eq!(unsafe { second.key() }, before_key);
         assert_eq!(unsafe { second.eligible_at() }, before_eligible_at);
-        assert_eq!(unsafe { *second.owned_state() }, before_state);
+        assert_eq!(
+            format!("{:?}", unsafe { second.owned_state() }),
+            format!("{before_state:?}")
+        );
         assert_eq!(second.sched_params(), before_params);
         assert_eq!(second.rr_remaining(), before_rr_remaining);
         assert_eq!(scheduler.ready_tree.len(), before_ready_len);
