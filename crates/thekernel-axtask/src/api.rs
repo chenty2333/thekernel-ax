@@ -963,6 +963,15 @@ pub fn yield_now() {
     TaskInner::current_check_preempt_pending();
 }
 
+/// Linux `sched_yield(2)` scheduling boundary.
+///
+/// This deliberately enters the local run queue's `Yield` enqueue path rather
+/// than requesting a generic reschedule, preserving scheduler-class policy
+/// (fair eligible placement and RT same-priority tail placement).
+pub fn sched_yield() {
+    yield_now();
+}
+
 /// Current task is going to sleep for the given duration.
 ///
 /// If the feature `irq` is not enabled, it uses busy-wait instead.
