@@ -2745,6 +2745,20 @@ impl<T> EEVDFScheduler<T> {
                     };
                     Some(if let Some(entity) = entity.as_ref() {
                         Self::fair_key(entity, sequence)?
+                    } else if is_deadline_class(params.class) {
+                        let config = task.deadline_config();
+                        if !config.is_valid() {
+                            return Err(SchedulerError::InvalidParameters);
+                        }
+                        (
+                            Self::deadline_key(
+                                self.deadline_now_ns
+                                    .checked_add(config.deadline_ns)
+                                    .ok_or(SchedulerError::ArithmeticExhausted)?,
+                                sequence,
+                            ),
+                            0,
+                        )
                     } else {
                         (Self::rt_key(params, sequence), 0)
                     })
@@ -2802,6 +2816,24 @@ impl<T> EEVDFScheduler<T> {
                     next.rt_sleeping = false;
                     next.migration = None;
                     next.sleep_v = None;
+                    if is_deadline_class(params.class) {
+                        let config = task.deadline_config();
+                        next.deadline_remaining_ns = config.runtime_ns;
+                        next.deadline_absolute_ns = self
+                            .deadline_now_ns
+                            .checked_add(config.deadline_ns)
+                            .expect("deadline clock overflow");
+                        next.deadline_replenish_at_ns = self
+                            .deadline_now_ns
+                            .checked_add(config.period_ns)
+                            .expect("deadline clock overflow");
+                        next.deadline_throttled = false;
+                    } else {
+                        next.deadline_remaining_ns = 0;
+                        next.deadline_absolute_ns = 0;
+                        next.deadline_replenish_at_ns = 0;
+                        next.deadline_throttled = false;
+                    }
                     if clear_fraction {
                         Self::clear_runtime_fraction(&mut next);
                     }
