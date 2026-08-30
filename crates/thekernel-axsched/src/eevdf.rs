@@ -2854,6 +2854,75 @@ impl<T> EEVDFScheduler<T> {
         self.set_task_params_impl(task, params, true)
     }
 
+    /// Change a CBS reservation while holding its owning scheduler lock.
+    /// Unlike `configure_deadline`, this is valid for runnable and current
+    /// tasks and publishes the budget/deadline state with the new immutable
+    /// task configuration before the task can be selected again.
+    pub fn set_task_deadline_config_with_runtime(
+        &mut self,
+        task: &Arc<EEVDFTask<T>>,
+        config: DeadlineConfig,
+    ) -> Result<EevdfParamUpdate<T>, SchedulerError> {
+        if !config.is_valid() || !is_deadline_class(task.sched_params().class) {
+            return Err(SchedulerError::InvalidParameters);
+        }
+        match task.owner() {
+            UNOWNED => {
+                let claim = task.value().claim_reconfiguration()?;
+                task.value().publish_deadline_config(config);
+                claim.finish()?;
+                Ok(EevdfParamUpdate::NoPreemption)
+            }
+            owner if owner != self.id || self.id == UNOWNED => Err(SchedulerError::ForeignQueue),
+            _ => {
+                let running = self
+                    .running
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, task));
+                let old_config = task.deadline_config();
+                let old_state = unsafe { *task.owned_state() };
+                let absolute = self
+                    .deadline_now_ns
+                    .checked_add(config.deadline_ns)
+                    .ok_or(SchedulerError::ArithmeticExhausted)?;
+                let replenish = self
+                    .deadline_now_ns
+                    .checked_add(config.period_ns)
+                    .ok_or(SchedulerError::ArithmeticExhausted)?;
+                if !running {
+                    let old_key = unsafe { task.key() };
+                    let old_eligible = unsafe { task.eligible_at() };
+                    let removed = self.ready_tree.remove(task).map_err(tree_error)?;
+                    let sequence = self.peek_rt_sequence(false)?;
+                    if let Err(error) = self.insert_staged(
+                        task,
+                        Self::deadline_key(absolute, sequence),
+                        0,
+                        old_key,
+                        old_eligible,
+                    ) {
+                        self.ready_tree
+                            .insert(removed)
+                            .expect("deadline config rollback failed");
+                        return Err(error);
+                    }
+                    self.commit_rt_sequence(false);
+                }
+                task.value().publish_deadline_config(config);
+                unsafe {
+                    let mut state = task.owned_state_mut();
+                    state.deadline_remaining_ns = config.runtime_ns;
+                    state.deadline_absolute_ns = absolute;
+                    state.deadline_replenish_at_ns = replenish;
+                    state.deadline_throttled = false;
+                }
+                let _ = old_config;
+                let _ = old_state;
+                Ok(self.post_update_outcome())
+            }
+        }
+    }
+
     /// Atomically change a fair task's Linux `sched_runtime` request.  The
     /// request is stored on the task and, for an admitted fair entity, is
     /// immediately rebound into the EEVDF deadline calculation under this
