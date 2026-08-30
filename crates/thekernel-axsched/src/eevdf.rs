@@ -3940,11 +3940,6 @@ impl<T> EEVDFScheduler<T> {
         current: &Arc<EEVDFTask<T>>,
         elapsed_ns: u64,
     ) -> Result<bool, SchedulerError> {
-        self.deadline_now_ns = self
-            .deadline_now_ns
-            .checked_add(elapsed_ns)
-            .ok_or(SchedulerError::ArithmeticExhausted)?;
-        self.replenish_deadlines();
         let state = unsafe { *current.owned_state() };
         if state.deadline_throttled || state.deadline_remaining_ns == 0 {
             return Err(SchedulerError::InconsistentState);
@@ -3971,6 +3966,11 @@ impl<T> EEVDFScheduler<T> {
         if period == 0 {
             return Err(SchedulerError::InconsistentState);
         }
+        self.deadline_now_ns = self
+            .deadline_now_ns
+            .checked_add(delta.elapsed_ns())
+            .ok_or(SchedulerError::ArithmeticExhausted)?;
+        self.replenish_deadlines();
         if is_deadline_class(current.sched_params().class) {
             return self.account_deadline_runtime(current, delta.elapsed_ns());
         }
@@ -4221,6 +4221,8 @@ impl<T> BaseScheduler for EEVDFScheduler<T> {
             .expect("EEVDF task_tick current validation failed");
         let params = current.sched_params();
         if is_deadline_class(params.class) {
+            self.deadline_now_ns = self.deadline_now_ns.saturating_add(1);
+            self.replenish_deadlines();
             self.account_deadline_runtime(current, 1)
                 .expect("deadline tick accounting failed")
         } else if is_rt_class(params.class) {
