@@ -460,6 +460,12 @@ pub(crate) struct EevdfOwnedState {
     /// Explicit RT sleep anchor; fair entities retain the same anchor in the
     /// model itself, while RT tasks have no Entity to carry it.
     pub(crate) sleep_v: Option<i128>,
+    /// CBS state, owned by the run queue.  `absolute_deadline_ns` and
+    /// `replenish_at_ns` are in the monotonic domain supplied by axtask.
+    pub(crate) deadline_remaining_ns: u64,
+    pub(crate) deadline_absolute_ns: u64,
+    pub(crate) deadline_replenish_at_ns: u64,
+    pub(crate) deadline_throttled: bool,
 }
 
 /// A mutable view of task-owned scheduler state.
@@ -524,6 +530,10 @@ impl<T> EevdfTaskPayload<T> {
                 rt_sleeping: false,
                 fork_seed: None,
                 sleep_v: None,
+                deadline_remaining_ns: 0,
+                deadline_absolute_ns: 0,
+                deadline_replenish_at_ns: 0,
+                deadline_throttled: false,
             }),
         }
     }
