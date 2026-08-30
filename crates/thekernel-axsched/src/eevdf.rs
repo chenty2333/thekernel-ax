@@ -3666,6 +3666,9 @@ impl<T> EEVDFScheduler<T> {
         } else {
             self.ready_tree.remove(task).map_err(tree_error)?
         };
+        if is_deadline_class(task.sched_params().class) {
+            self.release_deadline(task.deadline_config());
+        }
         if let Some(next_clock) = next_clock {
             self.clock = next_clock;
         }
@@ -4248,6 +4251,9 @@ impl<T> BaseScheduler for EEVDFScheduler<T> {
             }
             DeactivateReason::Exit => {
                 let params = task.sched_params();
+                if is_deadline_class(params.class) {
+                    self.release_deadline(task.deadline_config());
+                }
                 let next_clock = if is_rt_class(params.class) {
                     self.clock
                 } else {
