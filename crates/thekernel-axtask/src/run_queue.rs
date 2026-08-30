@@ -23,6 +23,8 @@ use kernel_guard::BaseGuard;
 use kspin::SpinRaw;
 use lazyinit::LazyInit;
 
+#[cfg(feature = "sched-eevdf")]
+use crate::api::TaskSchedCommit;
 #[cfg(feature = "idle-steal")]
 use crate::task::IdleStealMutation;
 #[cfg(feature = "smp")]
@@ -35,9 +37,6 @@ use crate::{
         TaskCreateError, TaskExitQueueFault, TaskStack, TaskState, TaskWakeFault,
     },
 };
-#[cfg(feature = "sched-eevdf")]
-use crate::api::TaskSchedCommit;
-
 
 #[cfg(all(feature = "remote-resched", feature = "smp", target_os = "none"))]
 use axhal::irq::{IpiReason, IpiTarget};
@@ -939,9 +938,10 @@ pub(crate) fn set_task_sched_state_stable(
 ) -> Result<TaskSchedCommit, TaskSchedError> {
     #[cfg(not(feature = "smp"))]
     {
-        let TaskSchedUpdate::Complete(result) =
-            task_run_queue::<kernel_guard::NoPreemptIrqSave>(task)
-                .set_task_sched_state_once(task, sched_state, None);
+        let TaskSchedUpdate::Complete(result) = task_run_queue::<kernel_guard::NoPreemptIrqSave>(
+            task,
+        )
+        .set_task_sched_state_once(task, sched_state, None, None);
         result
     }
 
@@ -949,9 +949,44 @@ pub(crate) fn set_task_sched_state_stable(
     {
         let attempts = axconfig::plat::MAX_CPU_NUM.saturating_add(1).max(2);
         for _ in 0..attempts {
-            match task_run_queue::<kernel_guard::NoPreemptIrqSave>(task)
-                .set_task_sched_state_once(task, sched_state, None)
-            {
+            match task_run_queue::<kernel_guard::NoPreemptIrqSave>(task).set_task_sched_state_once(
+                task,
+                sched_state,
+                None,
+                None,
+            ) {
+                TaskSchedUpdate::Complete(result) => return result,
+                TaskSchedUpdate::Redirect => {}
+            }
+        }
+        Err(TaskSchedError::Scheduler(SchedulerError::TaskBusy))
+    }
+}
+
+#[cfg(feature = "sched-eevdf")]
+pub(crate) fn set_task_sched_state_with_reset_stable(
+    task: &AxTaskRef,
+    sched_state: axsched::EevdfTaskParams,
+    reset_on_fork: bool,
+) -> Result<TaskSchedCommit, TaskSchedError> {
+    #[cfg(not(feature = "smp"))]
+    {
+        let TaskSchedUpdate::Complete(result) = task_run_queue::<kernel_guard::NoPreemptIrqSave>(
+            task,
+        )
+        .set_task_sched_state_once(task, sched_state, None, Some(reset_on_fork));
+        result
+    }
+    #[cfg(feature = "smp")]
+    {
+        let attempts = axconfig::plat::MAX_CPU_NUM.saturating_add(1).max(2);
+        for _ in 0..attempts {
+            match task_run_queue::<kernel_guard::NoPreemptIrqSave>(task).set_task_sched_state_once(
+                task,
+                sched_state,
+                None,
+                Some(reset_on_fork),
+            ) {
                 TaskSchedUpdate::Complete(result) => return result,
                 TaskSchedUpdate::Redirect => {}
             }
@@ -971,17 +1006,24 @@ pub(crate) fn set_task_nice_stable(
     #[cfg(not(feature = "smp"))]
     {
         let TaskSchedUpdate::Complete(result) =
-            task_run_queue::<kernel_guard::NoPreemptIrqSave>(task)
-                .set_task_sched_state_once(task, axsched::EevdfTaskParams::default(), Some(nice));
+            task_run_queue::<kernel_guard::NoPreemptIrqSave>(task).set_task_sched_state_once(
+                task,
+                axsched::EevdfTaskParams::default(),
+                Some(nice),
+                None,
+            );
         result
     }
     #[cfg(feature = "smp")]
     {
         let attempts = axconfig::plat::MAX_CPU_NUM.saturating_add(1).max(2);
         for _ in 0..attempts {
-            match task_run_queue::<kernel_guard::NoPreemptIrqSave>(task)
-                .set_task_sched_state_once(task, axsched::EevdfTaskParams::default(), Some(nice))
-            {
+            match task_run_queue::<kernel_guard::NoPreemptIrqSave>(task).set_task_sched_state_once(
+                task,
+                axsched::EevdfTaskParams::default(),
+                Some(nice),
+                None,
+            ) {
                 TaskSchedUpdate::Complete(result) => return result,
                 TaskSchedUpdate::Redirect => {}
             }
@@ -1699,6 +1741,7 @@ impl<G: BaseGuard> AxRunQueueRef<'_, G> {
         task: &AxTaskRef,
         sched_state: axsched::EevdfTaskParams,
         nice: Option<i8>,
+        reset_on_fork: Option<bool>,
     ) -> TaskSchedUpdate {
         if task.is_terminalizing() || matches!(task.state(), TaskState::Exited) {
             return TaskSchedUpdate::Complete(Err(TaskSchedError::TaskExited));
@@ -1708,7 +1751,7 @@ impl<G: BaseGuard> AxRunQueueRef<'_, G> {
                 self.selected_cpu,
             )));
         };
-        run_queue.set_task_sched_state(task, sched_state, nice)
+        run_queue.set_task_sched_state(task, sched_state, nice, reset_on_fork)
     }
 
     #[cfg(feature = "sched-eevdf")]
@@ -2752,6 +2795,7 @@ impl AxRunQueue {
         task: &AxTaskRef,
         mut sched_state: axsched::EevdfTaskParams,
         nice: Option<i8>,
+        reset_on_fork: Option<bool>,
     ) -> TaskSchedUpdate {
         if task.is_terminalizing() || matches!(task.state(), TaskState::Exited) {
             return TaskSchedUpdate::Complete(Err(TaskSchedError::TaskExited));
@@ -2800,6 +2844,9 @@ impl AxRunQueue {
             .set_task_params_with_runtime(task, sched_state, Self::scheduler_period_ns())
             .map_err(TaskSchedError::from)
             .map(|outcome| {
+                if let Some(reset_on_fork) = reset_on_fork {
+                    task.set_sched_reset_on_fork(reset_on_fork);
+                }
                 if let Some(current) = outcome.into_preempt_current() {
                     // The outcome can refer to a task currently executing on
                     // another CPU.  Publish the task-local bit and kick that
@@ -2808,6 +2855,7 @@ impl AxRunQueue {
                 }
                 TaskSchedCommit {
                     state: sched_state,
+                    reset_on_fork: task.sched_reset_on_fork(),
                     version: task.next_sched_commit_version(),
                 }
             });
@@ -2829,6 +2877,7 @@ impl AxRunQueue {
         }
         TaskSchedSnapshot::Complete(Ok(TaskSchedCommit {
             state: task.sched_params(),
+            reset_on_fork: task.sched_reset_on_fork(),
             version: task.sched_commit_version(),
         }))
     }
@@ -4257,8 +4306,8 @@ mod exited_queue_tests {
             load: RunQueueLoad::new(0, false),
         };
         assert!(matches!(
-            run_queue.set_task_sched_state(&selected, axsched::EevdfTaskParams::default(), None),
-            TaskSchedUpdate::Complete(Ok(TaskSchedCommit { state, version }))
+            run_queue.set_task_sched_state(&selected, axsched::EevdfTaskParams::default(), None, None),
+            TaskSchedUpdate::Complete(Ok(TaskSchedCommit { state, reset_on_fork: _, version }))
                 if state == axsched::EevdfTaskParams::default() && version != 0
         ));
         assert_eq!(
@@ -4311,7 +4360,8 @@ mod exited_queue_tests {
         assert!(task.is_terminalizing());
         assert!(!run_queue.scheduler.lock().is_running_task(&task));
 
-        let result = run_queue.set_task_sched_state(&task, axsched::EevdfTaskParams::default(), None);
+        let result =
+            run_queue.set_task_sched_state(&task, axsched::EevdfTaskParams::default(), None, None);
         assert!(matches!(
             result,
             TaskSchedUpdate::Complete(Err(TaskSchedError::TaskExited))

@@ -595,6 +595,7 @@ pub fn scheduler_commit_version(task: &AxTaskRef) -> u64 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TaskSchedCommit {
     pub state: SchedState,
+    pub reset_on_fork: bool,
     pub version: u64,
 }
 
@@ -619,6 +620,24 @@ pub fn set_sched_state_versioned(
     sched_state: SchedState,
 ) -> Result<TaskSchedCommit, TaskSchedError> {
     crate::run_queue::set_task_sched_state_stable(task, sched_state)
+}
+
+#[cfg(feature = "sched-eevdf")]
+pub fn set_sched_state_versioned_with_reset(
+    task: &AxTaskRef,
+    sched_state: SchedState,
+    reset_on_fork: bool,
+) -> Result<TaskSchedCommit, TaskSchedError> {
+    crate::run_queue::set_task_sched_state_with_reset_stable(task, sched_state, reset_on_fork)
+}
+
+/// Initializes the ABI policy flag before a prepared task is published.  No
+/// scheduler owner exists yet, therefore no concurrent snapshot can observe
+/// the initialization separately from first publication.
+#[cfg(feature = "sched-eevdf")]
+pub fn set_prepared_task_sched_reset_on_fork(task: &AxTaskRef, reset_on_fork: bool) {
+    debug_assert!(!task.is_running());
+    task.set_sched_reset_on_fork(reset_on_fork);
 }
 
 /// Changes only a task's nice value while its owning scheduler lock is held.
