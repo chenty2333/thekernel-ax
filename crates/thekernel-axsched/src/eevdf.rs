@@ -3732,6 +3732,7 @@ impl<T> EEVDFScheduler<T> {
         let old_entity = unsafe { task.owned_state().entity };
         let old_dormant_fair = unsafe { task.owned_state().dormant_fair };
         let old_rt_sleeping = unsafe { task.owned_state().rt_sleeping };
+        let mut throttle_deadline = false;
         let (next_clock, entity, dormant_fair, key, eligible_at, reset_rr, renewed_deadline) =
             if let Some(entity) = old_entity {
                 if !entity.is_sleeping() || old_rt_sleeping {
@@ -3828,13 +3829,19 @@ impl<T> EEVDFScheduler<T> {
                     // absolute deadline. Linux wakeup does not create a fresh
                     // reservation: admission is retained for the complete
                     // lifetime of the deadline policy.
-                    if unsafe { task.owned_state().deadline_remaining_ns } == 0 {
-                        self.release_claim(&task);
-                        return Err(SchedulerError::InconsistentState);
-                    }
                     let config = task.deadline_config();
                     let state = unsafe { task.owned_state() };
-                    let renewed = if state.deadline_absolute_ns <= self.deadline_now_ns {
+                    // A server can block precisely as it consumes its final
+                    // budget unit.  It is no longer linked in the throttle
+                    // tree while asleep, but its CBS replenishment remains
+                    // due at the original instant.  Recreate that structural
+                    // state on wake instead of treating zero residual budget
+                    // as an impossible sleeper.
+                    let exhausted = state.deadline_remaining_ns == 0;
+                    let renewed = if (exhausted
+                        && state.deadline_replenish_at_ns <= self.deadline_now_ns)
+                        || (!exhausted && state.deadline_absolute_ns <= self.deadline_now_ns)
+                    {
                         let absolute = match self.deadline_now_ns.checked_add(config.deadline_ns) {
                             Some(value) => value,
                             None => {
@@ -3853,9 +3860,15 @@ impl<T> EEVDFScheduler<T> {
                     } else {
                         None
                     };
-                    let absolute =
-                        renewed.map_or(state.deadline_absolute_ns, |(_, absolute, _)| absolute);
-                    (Self::deadline_key(absolute, sequence), renewed)
+                    throttle_deadline = exhausted && renewed.is_none();
+                    let key = if throttle_deadline {
+                        Self::throttled_deadline_key(state.deadline_replenish_at_ns, sequence)
+                    } else {
+                        let absolute =
+                            renewed.map_or(state.deadline_absolute_ns, |(_, absolute, _)| absolute);
+                        Self::deadline_key(absolute, sequence)
+                    };
+                    (key, renewed)
                 } else {
                     (Self::rt_key(params, sequence), None)
                 };
@@ -3873,7 +3886,18 @@ impl<T> EEVDFScheduler<T> {
                 return Err(SchedulerError::InconsistentState);
             };
 
-        if let Err(error) = self.insert_staged(&task, key, eligible_at, old_key, old_eligible_at) {
+        if throttle_deadline {
+            Self::stage_key(&task, key, eligible_at);
+            if let Err(error) = self.deadline_throttled.insert(Arc::clone(&task)) {
+                Self::stage_key(&task, old_key, old_eligible_at);
+                let kind = error.kind();
+                drop(error.into_node());
+                self.release_claim(&task);
+                return Err(tree_error(kind));
+            }
+        } else if let Err(error) =
+            self.insert_staged(&task, key, eligible_at, old_key, old_eligible_at)
+        {
             self.release_claim(&task);
             return Err(error);
         }
@@ -3892,6 +3916,8 @@ impl<T> EEVDFScheduler<T> {
                 task.owned_state_mut().deadline_absolute_ns = absolute;
                 task.owned_state_mut().deadline_replenish_at_ns = replenish;
                 task.owned_state_mut().deadline_throttled = false;
+            } else if throttle_deadline {
+                task.owned_state_mut().deadline_throttled = true;
             }
         }
         if matches!(params.class, EevdfTaskClass::RoundRobin) {
@@ -7022,6 +7048,65 @@ mod tests {
         assert_eq!(state.deadline_remaining_ns, config.runtime_ns);
         assert_eq!(state.deadline_absolute_ns, 201);
         assert_eq!(state.deadline_replenish_at_ns, 221);
+    }
+
+    #[test]
+    fn exhausted_sleeping_deadline_server_wakes_throttled_or_renewed() {
+        let domain = Arc::new(DeadlineAdmissionDomain::new());
+        let mut scheduler = EEVDFScheduler::new();
+        scheduler
+            .set_deadline_admission_domain(Arc::clone(&domain))
+            .unwrap();
+        let task = Arc::new(EEVDFTask::new(1));
+        let config = DeadlineConfig {
+            runtime_ns: 25,
+            deadline_ns: 100,
+            period_ns: 120,
+        };
+        scheduler.stage_task_deadline_config(&task, config).unwrap();
+        let _ = scheduler
+            .set_task_params(&task, rt(EevdfTaskClass::Deadline, 0))
+            .unwrap();
+        scheduler.add_task(Arc::clone(&task)).unwrap();
+        let admitted = domain.utilization.load(Ordering::Acquire);
+
+        let current = scheduler.pick_next_task().unwrap();
+        assert!(scheduler.account_runtime(&current, RuntimeDelta::new(25, 1)));
+        scheduler.deactivate_task(&current, DeactivateReason::Sleep);
+        assert_eq!(unsafe { task.owned_state().deadline_remaining_ns }, 0);
+
+        // Before its CBS replenishment instant, the sleeping server must be
+        // structurally throttled rather than rejected as an invalid wakeup.
+        scheduler
+            .enqueue_task(Arc::clone(&task), EnqueueReason::Wakeup)
+            .unwrap();
+        assert_eq!(scheduler.ready_len(), 0);
+        assert!(task.is_linked());
+        assert!(unsafe { task.owned_state().deadline_throttled });
+        assert_eq!(domain.utilization.load(Ordering::Acquire), admitted);
+
+        scheduler.advance_deadline_clock(120);
+        let current = scheduler.pick_next_task().unwrap();
+        assert_eq!(
+            unsafe { current.owned_state().deadline_remaining_ns },
+            config.runtime_ns
+        );
+        assert!(scheduler.account_runtime(&current, RuntimeDelta::new(25, 1)));
+        scheduler.deactivate_task(&current, DeactivateReason::Sleep);
+
+        // Once due, a direct wake renews the same lifetime reservation and
+        // makes the server runnable immediately.
+        scheduler.advance_deadline_clock(240);
+        scheduler
+            .enqueue_task(Arc::clone(&task), EnqueueReason::Wakeup)
+            .unwrap();
+        let state = unsafe { task.owned_state() };
+        assert_eq!(scheduler.ready_len(), 1);
+        assert_eq!(state.deadline_remaining_ns, config.runtime_ns);
+        assert_eq!(state.deadline_absolute_ns, 340);
+        assert_eq!(state.deadline_replenish_at_ns, 360);
+        assert!(!state.deadline_throttled);
+        assert_eq!(domain.utilization.load(Ordering::Acquire), admitted);
     }
 
     #[test]
