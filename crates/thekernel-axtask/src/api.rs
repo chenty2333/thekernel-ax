@@ -252,6 +252,39 @@ pub fn current() -> CurrentTask {
     CurrentTask::get()
 }
 
+/// Returns the scheduler-saved PKRU value for the current task.
+///
+/// The value is refreshed from hardware first, so a user-mode WRPKRU executed
+/// before entering the kernel is visible to fork and signal code.
+#[cfg(feature = "pkeys")]
+pub fn current_task_pkru() -> u32 {
+    let _guard = NoPreemptIrqSave::new();
+    let task = current();
+    // SAFETY: the guard pins the current task to this CPU while its context is
+    // refreshed. The scheduler is the only other mutator of this field.
+    unsafe {
+        let ctx = &mut *task.ctx_mut_ptr();
+        ctx.save_current_pkru();
+        ctx.saved_pkru()
+    }
+}
+
+/// Replaces the current task's saved and live PKRU value.
+#[cfg(feature = "pkeys")]
+pub fn set_current_task_pkru(pkru: u32) {
+    let _guard = NoPreemptIrqSave::new();
+    let task = current();
+    // SAFETY: the guard pins the current task to this CPU while its context is
+    // changed, matching the scheduler's context-switch discipline.
+    unsafe { (*task.ctx_mut_ptr()).set_current_pkru(pkru) };
+}
+
+/// Resets the current task's saved and live PKRU value to the default.
+#[cfg(feature = "pkeys")]
+pub fn reset_current_task_pkru() {
+    set_current_task_pkru(axhal::context::PKRU_DEFAULT);
+}
+
 /// Returns whether the current context may block the running task.
 ///
 /// Blocking through [`WaitQueue`] requires a non-idle running task, no extra
