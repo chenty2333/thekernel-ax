@@ -86,7 +86,9 @@ pub struct DeadlineConfig {
 
 impl DeadlineConfig {
     pub const fn is_valid(self) -> bool {
-        self.runtime_ns != 0 && self.runtime_ns <= self.deadline_ns && self.deadline_ns <= self.period_ns
+        self.runtime_ns != 0
+            && self.runtime_ns <= self.deadline_ns
+            && self.deadline_ns <= self.period_ns
     }
 }
 
@@ -252,7 +254,9 @@ pub(crate) fn eevdf_weight_for(params: EevdfTaskParams) -> Option<u128> {
     match params.class {
         EevdfTaskClass::Idle => eevdf_weight_for_nice(NICE_RANGE_POS),
         EevdfTaskClass::Normal | EevdfTaskClass::Batch => eevdf_weight_for_nice(params.nice),
-        EevdfTaskClass::RoundRobin | EevdfTaskClass::Fifo | EevdfTaskClass::Deadline => eevdf_weight_for_nice(0),
+        EevdfTaskClass::RoundRobin | EevdfTaskClass::Fifo | EevdfTaskClass::Deadline => {
+            eevdf_weight_for_nice(0)
+        }
     }
 }
 
@@ -555,13 +559,19 @@ impl<T> EevdfTaskPayload<T> {
     }
 
     fn deadline_config(&self) -> DeadlineConfig {
-        DeadlineConfig { runtime_ns: self.deadline_runtime_ns.load(Ordering::Acquire), deadline_ns: self.deadline_ns.load(Ordering::Acquire), period_ns: self.deadline_period_ns.load(Ordering::Acquire) }
+        DeadlineConfig {
+            runtime_ns: self.deadline_runtime_ns.load(Ordering::Acquire),
+            deadline_ns: self.deadline_ns.load(Ordering::Acquire),
+            period_ns: self.deadline_period_ns.load(Ordering::Acquire),
+        }
     }
 
     fn publish_deadline_config(&self, value: DeadlineConfig) {
-        self.deadline_runtime_ns.store(value.runtime_ns, Ordering::Release);
+        self.deadline_runtime_ns
+            .store(value.runtime_ns, Ordering::Release);
         self.deadline_ns.store(value.deadline_ns, Ordering::Release);
-        self.deadline_period_ns.store(value.period_ns, Ordering::Release);
+        self.deadline_period_ns
+            .store(value.period_ns, Ordering::Release);
     }
 
     fn apply_validated(&self, params: EevdfTaskParams) {
@@ -807,10 +817,14 @@ impl<T> EevdfNode<EevdfReadyKey, EevdfTaskPayload<T>> {
         self.value().fair_runtime_ns()
     }
 
-    pub fn deadline_config(&self) -> DeadlineConfig { self.value().deadline_config() }
+    pub fn deadline_config(&self) -> DeadlineConfig {
+        self.value().deadline_config()
+    }
 
     pub fn configure_deadline(&self, value: DeadlineConfig) -> Result<(), SchedulerError> {
-        if !value.is_valid() { return Err(SchedulerError::InvalidParameters); }
+        if !value.is_valid() {
+            return Err(SchedulerError::InvalidParameters);
+        }
         let claim = self.value().claim_configuration()?;
         self.value().publish_deadline_config(value);
         claim.finish()
@@ -1086,11 +1100,19 @@ impl<T> fmt::Debug for EevdfMigrationCommitError<T> {
     }
 }
 
-const FAIR_CLASS_RANK: u8 = 1;
-const RT_CLASS_RANK: u8 = 0;
+const DEADLINE_CLASS_RANK: u8 = 0;
+const RT_CLASS_RANK: u8 = 1;
+const FAIR_CLASS_RANK: u8 = 2;
 
 fn is_rt_class(class: EevdfTaskClass) -> bool {
-    matches!(class, EevdfTaskClass::RoundRobin | EevdfTaskClass::Fifo | EevdfTaskClass::Deadline)
+    matches!(
+        class,
+        EevdfTaskClass::RoundRobin | EevdfTaskClass::Fifo | EevdfTaskClass::Deadline
+    )
+}
+
+fn is_deadline_class(class: EevdfTaskClass) -> bool {
+    matches!(class, EevdfTaskClass::Deadline)
 }
 
 fn fair_class(class: EevdfTaskClass) -> Option<crate::eevdf_model::RequestClass> {
@@ -1142,12 +1164,14 @@ fn rt_order(priority: u8) -> u128 {
 /// `UnsafeCell` state slot stable across pick/put transitions.
 pub struct EEVDFScheduler<T> {
     ready_tree: EevdfTree<EevdfReadyKey, EevdfTaskPayload<T>>,
+    deadline_throttled: EevdfTree<EevdfReadyKey, EevdfTaskPayload<T>>,
     running: Option<Arc<EEVDFTask<T>>>,
     clock: Clock,
     id: usize,
     fair_sequence: i128,
     rt_front_sequence: i128,
     rt_back_sequence: i128,
+    deadline_now_ns: u64,
 }
 
 impl<T> EEVDFScheduler<T> {
@@ -1155,12 +1179,14 @@ impl<T> EEVDFScheduler<T> {
     pub const fn new() -> Self {
         Self {
             ready_tree: EevdfTree::new(),
+            deadline_throttled: EevdfTree::new(),
             running: None,
             clock: Clock::new(0),
             id: UNOWNED,
             fair_sequence: 0,
             rt_front_sequence: 0,
             rt_back_sequence: 0,
+            deadline_now_ns: 0,
         }
     }
 
@@ -1526,6 +1552,81 @@ impl<T> EEVDFScheduler<T> {
         EevdfReadyKey::new(RT_CLASS_RANK, rt_order(params.rt_priority), sequence)
     }
 
+    fn deadline_key(absolute_ns: u64, sequence: i128) -> EevdfReadyKey {
+        EevdfReadyKey::new(DEADLINE_CLASS_RANK, u128::from(absolute_ns), sequence)
+    }
+
+    fn throttled_deadline_key(replenish_ns: u64, sequence: i128) -> EevdfReadyKey {
+        EevdfReadyKey::new(DEADLINE_CLASS_RANK, u128::from(replenish_ns), sequence)
+    }
+
+    fn initialize_deadline_state(&self, task: &Arc<EEVDFTask<T>>) -> Result<(), SchedulerError> {
+        let config = task.deadline_config();
+        if !config.is_valid() {
+            return Err(SchedulerError::InvalidParameters);
+        }
+        let absolute = self
+            .deadline_now_ns
+            .checked_add(config.deadline_ns)
+            .ok_or(SchedulerError::ArithmeticExhausted)?;
+        unsafe {
+            let mut state = task.owned_state_mut();
+            state.deadline_remaining_ns = config.runtime_ns;
+            state.deadline_absolute_ns = absolute;
+            state.deadline_replenish_at_ns = self
+                .deadline_now_ns
+                .checked_add(config.period_ns)
+                .ok_or(SchedulerError::ArithmeticExhausted)?;
+            state.deadline_throttled = false;
+        }
+        Ok(())
+    }
+
+    /// Move every expired CBS server back to the runnable EDF tree.  The
+    /// separate intrusive tree makes throttling structural: pick_next cannot
+    /// accidentally run a server before its replenishment instant.
+    fn replenish_deadlines(&mut self) {
+        loop {
+            let Some(front) = self.deadline_throttled.front() else {
+                break;
+            };
+            if unsafe { front.eligible_at() } > u128::from(self.deadline_now_ns) {
+                break;
+            }
+            let task = self
+                .deadline_throttled
+                .remove(unsafe { &*(front as *const _) })
+                .expect("deadline throttle queue lost its front server");
+            let config = task.deadline_config();
+            assert!(
+                config.is_valid(),
+                "configured deadline server became invalid"
+            );
+            let absolute = self
+                .deadline_now_ns
+                .checked_add(config.deadline_ns)
+                .expect("deadline clock overflow during replenishment");
+            let replenish = self
+                .deadline_now_ns
+                .checked_add(config.period_ns)
+                .expect("deadline clock overflow during replenishment");
+            let sequence = self
+                .next_rt_sequence(false)
+                .expect("deadline sequence exhausted");
+            unsafe {
+                let mut state = task.owned_state_mut();
+                state.deadline_remaining_ns = config.runtime_ns;
+                state.deadline_absolute_ns = absolute;
+                state.deadline_replenish_at_ns = replenish;
+                state.deadline_throttled = false;
+            }
+            Self::stage_key(&task, Self::deadline_key(absolute, sequence), 0);
+            self.ready_tree
+                .insert(task)
+                .expect("deadline replenish key collision");
+        }
+    }
+
     /// Renew the integer and Q32 portions of an RR slice as one scheduler
     /// state transition.  A slice boundary must never leave fractional
     /// progress from the previous slice attached to the new budget.
@@ -1591,8 +1692,16 @@ impl<T> EEVDFScheduler<T> {
             return Err(SchedulerError::IncompatibleClass);
         }
         let (next_clock, entity, key, eligible_at) = if is_rt_class(params.class) {
+            if is_deadline_class(params.class) {
+                if let Err(error) = self.initialize_deadline_state(&task) {
+                    self.release_claim(&task);
+                    return Err(error);
+                }
+            }
             let sequence = match params.class {
-                EevdfTaskClass::Fifo | EevdfTaskClass::RoundRobin | EevdfTaskClass::Deadline => self.next_rt_sequence(false),
+                EevdfTaskClass::Fifo | EevdfTaskClass::RoundRobin | EevdfTaskClass::Deadline => {
+                    self.next_rt_sequence(false)
+                }
                 EevdfTaskClass::Normal | EevdfTaskClass::Batch | EevdfTaskClass::Idle => {
                     unreachable!("validated realtime class mismatch")
                 }
@@ -1604,7 +1713,12 @@ impl<T> EEVDFScheduler<T> {
                     return Err(error);
                 }
             };
-            (self.clock, None, Self::rt_key(params, sequence), 0)
+            let key = if is_deadline_class(params.class) {
+                Self::deadline_key(unsafe { task.owned_state().deadline_absolute_ns }, sequence)
+            } else {
+                Self::rt_key(params, sequence)
+            };
+            (self.clock, None, key, 0)
         } else {
             let weight = match Self::fair_weight(params) {
                 Ok(weight) => weight,
@@ -1634,7 +1748,12 @@ impl<T> EEVDFScheduler<T> {
                     return Err(error);
                 }
             };
-            if let Err(error) = Self::rebind_fair_runtime(&mut entity, task.fair_runtime_ns(), next_clock.total_weight, 10_000_000) {
+            if let Err(error) = Self::rebind_fair_runtime(
+                &mut entity,
+                task.fair_runtime_ns(),
+                next_clock.total_weight,
+                10_000_000,
+            ) {
                 self.release_claim(&task);
                 return Err(error);
             }
@@ -1780,7 +1899,12 @@ impl<T> EEVDFScheduler<T> {
                 Ok(entity) => entity,
                 Err(kind) => return Err(EevdfReservationCommitError { kind, reservation }),
             };
-            if let Err(kind) = Self::rebind_fair_runtime(&mut entity, task.fair_runtime_ns(), next_clock.total_weight, 10_000_000) {
+            if let Err(kind) = Self::rebind_fair_runtime(
+                &mut entity,
+                task.fair_runtime_ns(),
+                next_clock.total_weight,
+                10_000_000,
+            ) {
                 return Err(EevdfReservationCommitError { kind, reservation });
             }
             let (key, eligible_at) = match Self::fair_key(&entity, reservation.sequence) {
@@ -2300,7 +2424,12 @@ impl<T> EEVDFScheduler<T> {
                         clock_v,
                     )
                     .map_err(model_error)?;
-                Self::rebind_fair_runtime(&mut entity, fair_runtime_ns, next_total_weight, 10_000_000)?;
+                Self::rebind_fair_runtime(
+                    &mut entity,
+                    fair_runtime_ns,
+                    next_total_weight,
+                    10_000_000,
+                )?;
                 Ok((Some(entity), None))
             }
             (true, false) => {
@@ -2330,7 +2459,12 @@ impl<T> EEVDFScheduler<T> {
                     .map_err(model_error)?
                 };
                 let mut entity = entity;
-                Self::rebind_fair_runtime(&mut entity, fair_runtime_ns, next_total_weight, 10_000_000)?;
+                Self::rebind_fair_runtime(
+                    &mut entity,
+                    fair_runtime_ns,
+                    next_total_weight,
+                    10_000_000,
+                )?;
                 Ok((Some(entity), None))
             }
             (false, false) => Ok((None, old_state.dormant_fair)),
@@ -2486,8 +2620,12 @@ impl<T> EEVDFScheduler<T> {
                     task.value().apply_validated(params);
                     return claim.finish().map(|_| EevdfParamUpdate::NoPreemption);
                 }
-                let (entity, dormant, rt_sleeping) =
-                    self.sleeping_reconfigured_state(state, old_params, params, task.fair_runtime_ns())?;
+                let (entity, dormant, rt_sleeping) = self.sleeping_reconfigured_state(
+                    state,
+                    old_params,
+                    params,
+                    task.fair_runtime_ns(),
+                )?;
                 // SAFETY: CONFIGURING claim excludes all task-state access.
                 unsafe {
                     let mut next = task.owned_state_mut();
@@ -2729,7 +2867,12 @@ impl<T> EEVDFScheduler<T> {
                     return Err(SchedulerError::TaskBusy);
                 }
                 if let Some(mut entity) = state.entity {
-                    Self::rebind_fair_runtime(&mut entity, runtime_ns, self.clock.total_weight, period_ns)?;
+                    Self::rebind_fair_runtime(
+                        &mut entity,
+                        runtime_ns,
+                        self.clock.total_weight,
+                        period_ns,
+                    )?;
                     unsafe { task.owned_state_mut().entity = Some(entity) };
                 }
                 task.value().set_fair_runtime_ns(runtime_ns);
@@ -2737,7 +2880,10 @@ impl<T> EEVDFScheduler<T> {
             }
             owner if owner != self.id || self.id == UNOWNED => Err(SchedulerError::ForeignQueue),
             _ => {
-                let running = self.running.as_ref().is_some_and(|current| Arc::ptr_eq(current, task));
+                let running = self
+                    .running
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, task));
                 if running {
                     let before_clock = self.clock;
                     let before_state = unsafe { *task.owned_state() };
@@ -2746,7 +2892,12 @@ impl<T> EEVDFScheduler<T> {
                     let result = (|| {
                         let mut entity = unsafe { task.owned_state().entity }
                             .ok_or(SchedulerError::InconsistentState)?;
-                        Self::rebind_fair_runtime(&mut entity, runtime_ns, self.clock.total_weight, period_ns)?;
+                        Self::rebind_fair_runtime(
+                            &mut entity,
+                            runtime_ns,
+                            self.clock.total_weight,
+                            period_ns,
+                        )?;
                         unsafe { task.owned_state_mut().entity = Some(entity) };
                         task.value().set_fair_runtime_ns(runtime_ns);
                         Ok(EevdfParamUpdate::NoPreemption)
@@ -2763,13 +2914,20 @@ impl<T> EEVDFScheduler<T> {
                 }
                 let old_state = unsafe { *task.owned_state() };
                 let mut entity = old_state.entity.ok_or(SchedulerError::InconsistentState)?;
-                Self::rebind_fair_runtime(&mut entity, runtime_ns, self.clock.total_weight, period_ns)?;
+                Self::rebind_fair_runtime(
+                    &mut entity,
+                    runtime_ns,
+                    self.clock.total_weight,
+                    period_ns,
+                )?;
                 let sequence = self.peek_fair_sequence()?;
                 let (key, eligible_at) = Self::fair_key(&entity, sequence)?;
                 let old_key = unsafe { task.key() };
                 let old_eligible_at = unsafe { task.eligible_at() };
                 let removed = self.ready_tree.remove(task).map_err(tree_error)?;
-                if let Err(error) = self.insert_staged(task, key, eligible_at, old_key, old_eligible_at) {
+                if let Err(error) =
+                    self.insert_staged(task, key, eligible_at, old_key, old_eligible_at)
+                {
                     if self.ready_tree.insert(removed).is_err() {
                         return Err(SchedulerError::InconsistentState);
                     }
@@ -3050,6 +3208,9 @@ impl<T> EEVDFScheduler<T> {
             return Err(SchedulerError::IncompatibleClass);
         }
         let (next_clock, entity) = if is_rt_class(params.class) {
+            if is_deadline_class(params.class) {
+                self.initialize_deadline_state(task)?;
+            }
             (self.clock, None)
         } else {
             let weight = match Self::fair_weight(params) {
@@ -3116,6 +3277,36 @@ impl<T> EEVDFScheduler<T> {
         // service into the next request or RR slice.
         self.settle_before_lifecycle(&prev)?;
         let params = prev.sched_params();
+        if is_deadline_class(params.class) {
+            let state = unsafe { *prev.owned_state() };
+            let sequence = self.next_rt_sequence(false)?;
+            if state.deadline_throttled {
+                Self::stage_key(
+                    &prev,
+                    Self::throttled_deadline_key(state.deadline_replenish_at_ns, sequence),
+                    u128::from(state.deadline_replenish_at_ns),
+                );
+                self.deadline_throttled
+                    .insert(Arc::clone(&prev))
+                    .map_err(|error| {
+                        let kind = error.kind();
+                        drop(error.into_node());
+                        tree_error(kind)
+                    })?;
+            } else {
+                let old_key = unsafe { prev.key() };
+                let old_eligible = unsafe { prev.eligible_at() };
+                self.insert_staged(
+                    &prev,
+                    Self::deadline_key(state.deadline_absolute_ns, sequence),
+                    0,
+                    old_key,
+                    old_eligible,
+                )?;
+            }
+            self.running = None;
+            return Ok(());
+        }
         let old_key = unsafe { prev.key() };
         let old_eligible_at = unsafe { prev.eligible_at() };
         let (next_entity, key, eligible_at, reset_rr) = if let Some(entity) =
@@ -3306,6 +3497,7 @@ impl<T> EEVDFScheduler<T> {
     }
 
     fn pick_ready(&mut self) -> Option<Arc<EEVDFTask<T>>> {
+        self.replenish_deadlines();
         if self.has_ready_rt() {
             return self.pick_rt_front();
         }
@@ -3579,6 +3771,33 @@ impl<T> EEVDFScheduler<T> {
             .expect("EEVDF runtime accounting exhausted arithmetic")
     }
 
+    fn account_deadline_runtime(
+        &mut self,
+        current: &Arc<EEVDFTask<T>>,
+        elapsed_ns: u64,
+    ) -> Result<bool, SchedulerError> {
+        self.deadline_now_ns = self
+            .deadline_now_ns
+            .checked_add(elapsed_ns)
+            .ok_or(SchedulerError::ArithmeticExhausted)?;
+        self.replenish_deadlines();
+        let state = unsafe { *current.owned_state() };
+        if state.deadline_throttled || state.deadline_remaining_ns == 0 {
+            return Err(SchedulerError::InconsistentState);
+        }
+        let exhausted = elapsed_ns >= state.deadline_remaining_ns;
+        unsafe {
+            let mut next = current.owned_state_mut();
+            next.deadline_remaining_ns = state.deadline_remaining_ns.saturating_sub(elapsed_ns);
+            next.deadline_throttled = exhausted;
+        }
+        Ok(exhausted
+            || self.ready_tree.front().is_some_and(|task| unsafe {
+                task.key().class_rank() == DEADLINE_CLASS_RANK
+                    && task.key().order() < u128::from(state.deadline_absolute_ns)
+            }))
+    }
+
     fn account_runtime_transaction(
         &mut self,
         current: &Arc<EEVDFTask<T>>,
@@ -3587,6 +3806,9 @@ impl<T> EEVDFScheduler<T> {
         let period = delta.period_ns();
         if period == 0 {
             return Err(SchedulerError::InconsistentState);
+        }
+        if is_deadline_class(current.sched_params().class) {
+            return self.account_deadline_runtime(current, delta.elapsed_ns());
         }
         let state = unsafe { *current.owned_state() };
         if state.runtime_remainder_ns >= period
@@ -3830,7 +4052,10 @@ impl<T> BaseScheduler for EEVDFScheduler<T> {
         self.ensure_running(current)
             .expect("EEVDF task_tick current validation failed");
         let params = current.sched_params();
-        if is_rt_class(params.class) {
+        if is_deadline_class(params.class) {
+            self.account_deadline_runtime(current, 1)
+                .expect("deadline tick accounting failed")
+        } else if is_rt_class(params.class) {
             self.tick_rt(current)
         } else {
             self.tick_fair(current)
