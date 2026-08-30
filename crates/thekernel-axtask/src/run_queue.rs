@@ -1154,7 +1154,21 @@ pub(crate) fn scheduler_attr_snapshot_stable(
         commit.state.class,
         axsched::EevdfTaskClass::Normal | axsched::EevdfTaskClass::Batch | axsched::EevdfTaskClass::Idle
     ) {
-        task.fair_runtime_ns()
+        if commit.fair_runtime_ns != 0 {
+            commit.fair_runtime_ns
+        } else {
+            let target_ticks = match commit.state.class {
+                axsched::EevdfTaskClass::Normal => axsched::EEVDF_PROFILE.normal_target_ticks,
+                axsched::EevdfTaskClass::Batch => axsched::EEVDF_PROFILE.batch_target_ticks,
+                axsched::EevdfTaskClass::Idle => axsched::EEVDF_PROFILE.idle_target_ticks,
+                _ => 0,
+            };
+            target_ticks
+                .saturating_mul(u128::from(NANOS_PER_SEC))
+                .checked_div(axconfig::TICKS_PER_SEC as u128)
+                .unwrap_or(0)
+                .min(u128::from(u64::MAX)) as u64
+        }
     } else {
         0
     };
@@ -3021,6 +3035,7 @@ impl AxRunQueue {
                     reset_on_fork: task.sched_reset_on_fork(),
                     util_min: task.sched_util_clamp().0,
                     util_max: task.sched_util_clamp().1,
+                    fair_runtime_ns: task.fair_runtime_ns(),
                     version: task.next_sched_commit_version(),
                 }
             });
@@ -3045,6 +3060,7 @@ impl AxRunQueue {
             reset_on_fork: task.sched_reset_on_fork(),
             util_min: task.sched_util_clamp().0,
             util_max: task.sched_util_clamp().1,
+            fair_runtime_ns: task.fair_runtime_ns(),
             version: task.sched_commit_version(),
         }))
     }
@@ -3075,6 +3091,7 @@ impl AxRunQueue {
             reset_on_fork: task.sched_reset_on_fork(),
             util_min: task.sched_util_clamp().0,
             util_max: task.sched_util_clamp().1,
+            fair_runtime_ns: task.fair_runtime_ns(),
             version: task.sched_commit_version(),
         };
         let (sched_state, reset_on_fork) = match update(old) {
@@ -3108,6 +3125,7 @@ impl AxRunQueue {
                     reset_on_fork,
                     util_min: old.util_min,
                     util_max: old.util_max,
+                    fair_runtime_ns: old.fair_runtime_ns,
                     version: task.next_sched_commit_version(),
                 }
             });
@@ -3139,6 +3157,7 @@ impl AxRunQueue {
             reset_on_fork: task.sched_reset_on_fork(),
             util_min: task.sched_util_clamp().0,
             util_max: task.sched_util_clamp().1,
+            fair_runtime_ns: task.fair_runtime_ns(),
             version: task.sched_commit_version(),
         };
         let request = match update(old) {
@@ -3153,6 +3172,13 @@ impl AxRunQueue {
         if request.fair_runtime_ns != 0
             && !(axsched::FAIR_RUNTIME_MIN_NS..=axsched::FAIR_RUNTIME_MAX_NS)
                 .contains(&request.fair_runtime_ns)
+        {
+            return TaskSchedAttrTransaction::Complete(Err(TaskSchedError::Scheduler(
+                SchedulerError::InvalidParameters,
+            )));
+        }
+        if request.fair_runtime_ns != 0
+            && !matches!(request.state.class, axsched::EevdfTaskClass::Normal)
         {
             return TaskSchedAttrTransaction::Complete(Err(TaskSchedError::Scheduler(
                 SchedulerError::InvalidParameters,
@@ -3199,6 +3225,7 @@ impl AxRunQueue {
                     reset_on_fork: request.reset_on_fork,
                     util_min: request.util_min,
                     util_max: request.util_max,
+                    fair_runtime_ns: request.fair_runtime_ns,
                     version: task.next_sched_commit_version(),
                 }
             });
@@ -4635,6 +4662,7 @@ mod exited_queue_tests {
                 reset_on_fork: _,
                 util_min: _,
                 util_max: _,
+                fair_runtime_ns: _,
                 version,
             }))
                 if state == axsched::EevdfTaskParams::default() && version != 0

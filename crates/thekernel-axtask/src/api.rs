@@ -493,7 +493,11 @@ pub fn spawn_task_with_sched_from(
         .configure(sched_state)
         .map_err(map_scheduler_error)?;
     task_ref
-        .configure_fair_runtime_ns(parent.fair_runtime_ns())
+        .configure_fair_runtime_ns(if parent.sched_reset_on_fork() {
+            0
+        } else {
+            parent.fair_runtime_ns()
+        })
         .map_err(map_scheduler_error)?;
     let (util_min, util_max) = parent.sched_util_clamp();
     task_ref.set_sched_util_clamp(util_min, util_max);
@@ -516,7 +520,11 @@ pub fn prepare_task_with_sched_from(
         .configure(sched_state)
         .map_err(map_scheduler_error)?;
     task_ref
-        .configure_fair_runtime_ns(parent.fair_runtime_ns())
+        .configure_fair_runtime_ns(if parent.sched_reset_on_fork() {
+            0
+        } else {
+            parent.fair_runtime_ns()
+        })
         .map_err(map_scheduler_error)?;
     // The child is still private here. A fork inherits the parent's effective
     // clamp; exec retains the existing task and consequently needs no action.
@@ -645,6 +653,8 @@ pub struct TaskSchedCommit {
     /// composition in the same transaction domain.
     pub util_min: u32,
     pub util_max: u32,
+    /// Scheduler-owned requested fair slice sampled with this commit.
+    pub fair_runtime_ns: u64,
     pub version: u64,
 }
 

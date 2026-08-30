@@ -772,6 +772,10 @@ impl<T> EevdfNode<EevdfReadyKey, EevdfTaskPayload<T>> {
             return Err(SchedulerError::InvalidParameters);
         }
         let claim = self.value().claim_configuration()?;
+        if runtime_ns != 0 && !matches!(self.sched_params().class, EevdfTaskClass::Normal) {
+            drop(claim);
+            return Err(SchedulerError::InvalidParameters);
+        }
         self.value().set_fair_runtime_ns(runtime_ns);
         claim.finish()
     }
@@ -1291,14 +1295,26 @@ impl<T> EEVDFScheduler<T> {
     /// The EEVDF model's smallest service unit is 100us.  This matches the
     /// Linux fair-runtime clamp floor and preserves all requested values up
     /// to the 100ms ceiling as distinct scheduler requests.
-    fn fair_runtime_quantum(runtime_ns: u64) -> u128 {
-        u128::from(runtime_ns.saturating_add(FAIR_RUNTIME_MIN_NS - 1) / FAIR_RUNTIME_MIN_NS)
+    fn fair_runtime_quantum(runtime_ns: u64, period_ns: u64) -> Result<u128, SchedulerError> {
+        if period_ns == 0 {
+            return Err(SchedulerError::InvalidParameters);
+        }
+        Ok(u128::from(runtime_ns.saturating_add(period_ns - 1) / period_ns).max(1))
     }
 
-    fn rebind_fair_runtime(entity: &mut Entity, runtime_ns: u64) -> Result<(), SchedulerError> {
-        if runtime_ns != 0 {
+    fn rebind_fair_runtime(
+        entity: &mut Entity,
+        runtime_ns: u64,
+        total_weight: u128,
+        period_ns: u64,
+    ) -> Result<(), SchedulerError> {
+        if runtime_ns == 0 {
             entity
-                .rebind_request_quantum(Self::fair_runtime_quantum(runtime_ns))
+                .rebind_default_request_quantum(total_weight)
+                .map_err(model_error)?;
+        } else {
+            entity
+                .rebind_request_quantum(Self::fair_runtime_quantum(runtime_ns, period_ns)?)
                 .map_err(model_error)?;
         }
         Ok(())
@@ -1500,7 +1516,7 @@ impl<T> EEVDFScheduler<T> {
                     return Err(error);
                 }
             };
-            if let Err(error) = Self::rebind_fair_runtime(&mut entity, task.fair_runtime_ns()) {
+            if let Err(error) = Self::rebind_fair_runtime(&mut entity, task.fair_runtime_ns(), next_clock.total_weight, 1_000_000) {
                 self.release_claim(&task);
                 return Err(error);
             }
@@ -1646,7 +1662,7 @@ impl<T> EEVDFScheduler<T> {
                 Ok(entity) => entity,
                 Err(kind) => return Err(EevdfReservationCommitError { kind, reservation }),
             };
-            if let Err(kind) = Self::rebind_fair_runtime(&mut entity, task.fair_runtime_ns()) {
+            if let Err(kind) = Self::rebind_fair_runtime(&mut entity, task.fair_runtime_ns(), next_clock.total_weight, 1_000_000) {
                 return Err(EevdfReservationCommitError { kind, reservation });
             }
             let (key, eligible_at) = match Self::fair_key(&entity, reservation.sequence) {
@@ -2166,7 +2182,7 @@ impl<T> EEVDFScheduler<T> {
                         clock_v,
                     )
                     .map_err(model_error)?;
-                Self::rebind_fair_runtime(&mut entity, fair_runtime_ns)?;
+                Self::rebind_fair_runtime(&mut entity, fair_runtime_ns, next_total_weight, 1_000_000)?;
                 Ok((Some(entity), None))
             }
             (true, false) => {
@@ -2196,7 +2212,7 @@ impl<T> EEVDFScheduler<T> {
                     .map_err(model_error)?
                 };
                 let mut entity = entity;
-                Self::rebind_fair_runtime(&mut entity, fair_runtime_ns)?;
+                Self::rebind_fair_runtime(&mut entity, fair_runtime_ns, next_total_weight, 1_000_000)?;
                 Ok((Some(entity), None))
             }
             (false, false) => Ok((None, old_state.dormant_fair)),
@@ -2229,7 +2245,7 @@ impl<T> EEVDFScheduler<T> {
                         total_weight,
                     )
                     .map_err(model_error)?;
-                Self::rebind_fair_runtime(&mut entity, fair_runtime_ns)?;
+                Self::rebind_fair_runtime(&mut entity, fair_runtime_ns, total_weight, 1_000_000)?;
                 Ok((Some(entity), None, false))
             }
             (true, false) => Ok((None, old_state.entity, true)),
@@ -2266,7 +2282,7 @@ impl<T> EEVDFScheduler<T> {
                 if !entity.is_sleeping() {
                     entity.begin_sleep(anchor).map_err(model_error)?;
                 }
-                Self::rebind_fair_runtime(&mut entity, fair_runtime_ns)?;
+                Self::rebind_fair_runtime(&mut entity, fair_runtime_ns, total_weight, 1_000_000)?;
                 Ok((Some(entity), None, false))
             }
             (false, false) => Ok((None, old_state.dormant_fair, true)),
@@ -2577,10 +2593,14 @@ impl<T> EEVDFScheduler<T> {
             return Err(SchedulerError::InvalidParameters);
         }
         let params = task.sched_params();
+        if runtime_ns != 0 && !matches!(params.class, EevdfTaskClass::Normal) {
+            return Err(SchedulerError::InvalidParameters);
+        }
         if is_rt_class(params.class) {
-            // Preserve the requested value for a later fair-class transition;
-            // RT selection itself has no EEVDF request.
-            task.value().set_fair_runtime_ns(runtime_ns);
+            if runtime_ns != 0 {
+                return Err(SchedulerError::InvalidParameters);
+            }
+            task.value().set_fair_runtime_ns(0);
             return Ok(EevdfParamUpdate::NoPreemption);
         }
         match task.owner() {
@@ -2593,7 +2613,7 @@ impl<T> EEVDFScheduler<T> {
                     return Err(SchedulerError::TaskBusy);
                 }
                 if let Some(mut entity) = state.entity {
-                    Self::rebind_fair_runtime(&mut entity, runtime_ns)?;
+                    Self::rebind_fair_runtime(&mut entity, runtime_ns, self.clock.total_weight, period_ns)?;
                     unsafe { task.owned_state_mut().entity = Some(entity) };
                 }
                 task.value().set_fair_runtime_ns(runtime_ns);
@@ -2610,7 +2630,7 @@ impl<T> EEVDFScheduler<T> {
                     let result = (|| {
                         let mut entity = unsafe { task.owned_state().entity }
                             .ok_or(SchedulerError::InconsistentState)?;
-                        Self::rebind_fair_runtime(&mut entity, runtime_ns)?;
+                        Self::rebind_fair_runtime(&mut entity, runtime_ns, self.clock.total_weight, period_ns)?;
                         unsafe { task.owned_state_mut().entity = Some(entity) };
                         task.value().set_fair_runtime_ns(runtime_ns);
                         Ok(EevdfParamUpdate::NoPreemption)
@@ -2627,7 +2647,7 @@ impl<T> EEVDFScheduler<T> {
                 }
                 let old_state = unsafe { *task.owned_state() };
                 let mut entity = old_state.entity.ok_or(SchedulerError::InconsistentState)?;
-                Self::rebind_fair_runtime(&mut entity, runtime_ns)?;
+                Self::rebind_fair_runtime(&mut entity, runtime_ns, self.clock.total_weight, period_ns)?;
                 let sequence = self.peek_fair_sequence()?;
                 let (key, eligible_at) = Self::fair_key(&entity, sequence)?;
                 let old_key = unsafe { task.key() };
@@ -5615,7 +5635,7 @@ mod tests {
             .unwrap();
         let long_q = unsafe { task.owned_state().entity.unwrap().request.q };
         assert_eq!(task.fair_runtime_ns(), FAIR_RUNTIME_MAX_NS);
-        assert_eq!(long_q, FAIR_RUNTIME_MAX_NS as u128 / FAIR_RUNTIME_MIN_NS as u128);
+        assert_eq!(long_q, FAIR_RUNTIME_MAX_NS as u128 / 10_000_000u128);
         assert!(long_q > short_q);
     }
 }

@@ -1261,6 +1261,13 @@ impl Entity {
         Ok(())
     }
 
+    /// Restore the class/weight-derived request quantum while retaining the
+    /// exact completed fraction of the active request.
+    pub fn rebind_default_request_quantum(&mut self, total_weight: u128) -> Result<(), ModelError> {
+        let quantum = request_quantum(self.class, self.weight, total_weight)?;
+        self.rebind_request_quantum(quantum)
+    }
+
     pub fn new(
         class: RequestClass,
         weight: u128,
