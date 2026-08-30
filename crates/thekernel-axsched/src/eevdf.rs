@@ -235,9 +235,10 @@ impl EevdfTaskParams {
             }
         }
         let valid = match self.class {
-            EevdfTaskClass::RoundRobin | EevdfTaskClass::Fifo | EevdfTaskClass::Deadline => {
+            EevdfTaskClass::RoundRobin | EevdfTaskClass::Fifo => {
                 (RT_PRIORITY_MIN..=RT_PRIORITY_MAX).contains(&self.rt_priority)
             }
+            EevdfTaskClass::Deadline => self.rt_priority == 0,
             EevdfTaskClass::Normal | EevdfTaskClass::Batch | EevdfTaskClass::Idle => {
                 (NICE_MIN..=NICE_MAX).contains(&self.nice)
             }
@@ -1284,6 +1285,7 @@ pub struct EEVDFScheduler<T> {
     rt_back_sequence: i128,
     deadline_now_ns: u64,
     deadline_utilization: u128,
+    deadline_domain: Option<Arc<DeadlineAdmissionDomain>>,
 }
 
 impl<T> EEVDFScheduler<T> {
@@ -1300,6 +1302,7 @@ impl<T> EEVDFScheduler<T> {
             rt_back_sequence: 0,
             deadline_now_ns: 0,
             deadline_utilization: 0,
+            deadline_domain: None,
         }
     }
 
@@ -1491,7 +1494,7 @@ impl<T> EEVDFScheduler<T> {
         }
         let interval_ticks = match class {
             EevdfTaskClass::RoundRobin => rr_timeslice_ticks(),
-            EevdfTaskClass::Fifo | EevdfTaskClass::Idle => 0,
+            EevdfTaskClass::Fifo | EevdfTaskClass::Idle | EevdfTaskClass::Deadline => 0,
             EevdfTaskClass::Normal | EevdfTaskClass::Batch => {
                 if self.clock.total_weight == 0 {
                     return Ok((class, 0));
@@ -3187,6 +3190,13 @@ impl<T> EEVDFScheduler<T> {
                     task.fair_runtime_ns(),
                 )?;
                 let next_rr = Self::next_rr_budget(old_params, params, task.rr_remaining());
+                let next_deadline_utilization = self.replaced_deadline_utilization(
+                    is_deadline_class(old_params.class).then(|| task.deadline_config()),
+                    is_deadline_class(params.class).then(|| task.deadline_config()),
+                )?;
+                let old_deadline =
+                    is_deadline_class(old_params.class).then(|| task.deadline_config());
+                let new_deadline = is_deadline_class(params.class).then(|| task.deadline_config());
                 // Reserve the replacement key before unlinking.  Every
                 // fallible sequence, deadline, and eligibility calculation
                 // belongs to this staged phase so an arithmetic failure
@@ -3219,6 +3229,7 @@ impl<T> EEVDFScheduler<T> {
                 } else {
                     None
                 };
+                self.replace_deadline_domain(old_deadline, new_deadline)?;
                 let (removed, old_key, old_eligible_at, sequence_kind) = if running {
                     (
                         None,
@@ -3315,6 +3326,7 @@ impl<T> EEVDFScheduler<T> {
                 }
                 task.value().publish_validated(params, next_rr);
                 self.clock = next_clock;
+                self.deadline_utilization = next_deadline_utilization;
                 drop(removed);
                 Ok(self.post_update_outcome())
             }
@@ -3436,6 +3448,7 @@ impl<T> EEVDFScheduler<T> {
                 let old_state = unsafe { task.owned_state().clone() };
                 let next_utilization =
                     self.replaced_deadline_utilization(Some(old_config), Some(config))?;
+                self.replace_deadline_domain(Some(old_config), Some(config))?;
                 let absolute = self
                     .deadline_now_ns
                     .checked_add(config.deadline_ns)
@@ -3492,6 +3505,7 @@ impl<T> EEVDFScheduler<T> {
                 }
                 let _ = old_config;
                 let _ = old_state;
+                self.deadline_utilization = next_utilization;
                 Ok(self.post_update_outcome())
             }
         }
