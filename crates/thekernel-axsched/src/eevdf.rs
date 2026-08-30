@@ -2660,6 +2660,28 @@ impl<T> EEVDFScheduler<T> {
                     next.dormant_fair = dormant;
                     next.rt_sleeping = rt_sleeping;
                     next.sleep_v = state.sleep_v;
+                    if is_deadline_class(params.class) {
+                        let config = task.deadline_config();
+                        if !config.is_valid() {
+                            drop(claim);
+                            return Err(SchedulerError::InvalidParameters);
+                        }
+                        next.deadline_remaining_ns = config.runtime_ns;
+                        next.deadline_absolute_ns = self
+                            .deadline_now_ns
+                            .checked_add(config.deadline_ns)
+                            .ok_or(SchedulerError::ArithmeticExhausted)?;
+                        next.deadline_replenish_at_ns = self
+                            .deadline_now_ns
+                            .checked_add(config.period_ns)
+                            .ok_or(SchedulerError::ArithmeticExhausted)?;
+                        next.deadline_throttled = false;
+                    } else {
+                        next.deadline_remaining_ns = 0;
+                        next.deadline_absolute_ns = 0;
+                        next.deadline_replenish_at_ns = 0;
+                        next.deadline_throttled = false;
+                    }
                     if clear_fraction {
                         Self::clear_runtime_fraction(&mut next);
                     }
