@@ -70,6 +70,22 @@ impl Drop for DeferredWorkGuard<'_> {
 /// The wrapper type for [`cpumask::CpuMask`] with SMP configuration.
 pub type AxCpuMask = cpumask::CpuMask<{ axconfig::plat::MAX_CPU_NUM }>;
 
+/// Number of CPU bits supported by the task-affinity ABI.
+///
+/// This is the configured x86_64 run-queue capacity (`nr_cpu_ids`), rather
+/// than the number of run queues initialized at one instant.
+pub const fn task_affinity_nr_cpu_ids() -> usize {
+    axconfig::plat::MAX_CPU_NUM
+}
+
+/// Linux `cpumask_size()` for the configured task-affinity ABI.
+///
+/// Linux rounds the bitmap up to whole `unsigned long` words.  TheKernel is
+/// x86_64-only, where this is an eight-byte ABI word.
+pub const fn task_affinity_mask_bytes() -> usize {
+    task_affinity_nr_cpu_ids().div_ceil(usize::BITS as usize) * core::mem::size_of::<usize>()
+}
+
 cfg_if::cfg_if! {
     if #[cfg(feature = "sched-rr")] {
         const MAX_TIME_SLICE: usize = 5;
@@ -577,6 +593,19 @@ where
 /// [EEVDF]: https://en.wikipedia.org/wiki/Eligible_virtual_deadline_first
 pub fn set_priority(prio: isize) -> Result<(), TaskSchedError> {
     current_run_queue::<NoPreemptIrqSave>().set_current_priority(prio)
+}
+
+/// Returns a stable snapshot of the CPUs on which `task` may currently run.
+///
+/// The result is the task's affinity mask intersected with initialized run
+/// queues. It is sampled under the task affinity lock, so a concurrent
+/// affinity update cannot yield an old mask after publication of a newer one.
+/// A terminal task has no usable affinity and returns
+/// [`TaskSchedError::TaskExited`]. An empty successful mask instead means no
+/// run queue is initialized for an otherwise live task.
+pub fn task_allowed_active_cpus(task: &AxTaskRef) -> Result<AxCpuMask, TaskSchedError> {
+    task.allowed_active_cpus(crate::run_queue::active_cpu_mask())
+        .ok_or(TaskSchedError::TaskExited)
 }
 
 /// Returns the runtime scheduling state of a task.

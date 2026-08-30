@@ -1057,6 +1057,25 @@ impl TaskInner {
         self.affinity.lock().mask
     }
 
+    /// Snapshots the task's affinity while excluding CPUs without an
+    /// initialized run queue.
+    ///
+    /// The affinity lock is the publication domain for both the mask and its
+    /// paired migration helper, so this cannot observe an affinity update half
+    /// way through publication.  A terminal task has no usable scheduler
+    /// affinity and is reported separately from an empty active topology.
+    pub(crate) fn allowed_active_cpus(&self, active_cpus: AxCpuMask) -> Option<AxCpuMask> {
+        if self.is_terminalizing() || matches!(self.state(), TaskState::Exited) {
+            return None;
+        }
+
+        let affinity = self.affinity.lock();
+        if self.is_terminalizing() || matches!(self.state(), TaskState::Exited) {
+            return None;
+        }
+        Some(affinity.mask & active_cpus)
+    }
+
     #[cfg(feature = "sched-eevdf")]
     pub(crate) fn try_reserve_publication_mutation(&self) -> bool {
         self.mutation

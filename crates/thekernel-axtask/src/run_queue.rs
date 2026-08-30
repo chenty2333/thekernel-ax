@@ -1378,6 +1378,21 @@ pub(crate) fn affinity_has_online_cpu(cpumask: AxCpuMask) -> bool {
         .any(|index| cpumask.get(index) && !RUN_QUEUES[index].load(Ordering::Acquire).is_null())
 }
 
+/// Snapshots CPUs whose run queues have been initialized.
+///
+/// Run queues are published once from permanent per-CPU storage and never
+/// removed, so an Acquire observation is sufficient for a caller to use this
+/// as the active part of an affinity snapshot.
+pub(crate) fn active_cpu_mask() -> AxCpuMask {
+    let mut active = AxCpuMask::new();
+    for index in 0..axconfig::plat::MAX_CPU_NUM {
+        if !RUN_QUEUES[index].load(Ordering::Acquire).is_null() {
+            active.set(index, true);
+        }
+    }
+    active
+}
+
 /// Retrieves the initialized shared run queue for a CPU.
 #[inline]
 fn get_run_queue(index: usize) -> Option<&'static AxRunQueue> {

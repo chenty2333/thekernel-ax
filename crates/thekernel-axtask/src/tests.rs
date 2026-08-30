@@ -1061,6 +1061,36 @@ fn failed_publication_reservation_returns_the_exact_task_owner() {
     );
 }
 
+#[test]
+fn task_allowed_active_cpus_snapshots_initialized_cpus_and_rejects_exit() {
+    let _lock = SERIAL.lock();
+    init_for_test();
+
+    let current = current().clone();
+    assert_eq!(
+        axtask::task_allowed_active_cpus(&current).unwrap(),
+        current.cpumask() & crate::run_queue::active_cpu_mask()
+    );
+    assert_eq!(
+        axtask::task_affinity_nr_cpu_ids(),
+        axconfig::plat::MAX_CPU_NUM
+    );
+    assert_eq!(
+        axtask::task_affinity_mask_bytes(),
+        axconfig::plat::MAX_CPU_NUM.div_ceil(usize::BITS as usize) * core::mem::size_of::<usize>()
+    );
+
+    let exited = crate::TaskInner::new_init("affinity-exited".into())
+        .unwrap()
+        .into_arc()
+        .unwrap();
+    exited.notify_exit(0);
+    assert_eq!(
+        axtask::task_allowed_active_cpus(&exited),
+        Err(crate::TaskSchedError::TaskExited)
+    );
+}
+
 #[cfg(feature = "sched-eevdf")]
 #[test]
 fn publication_reservation_cancel_returns_the_unpublished_task() {
