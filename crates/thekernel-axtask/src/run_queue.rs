@@ -1157,7 +1157,9 @@ pub(crate) fn scheduler_attr_snapshot_stable(
     let commit = scheduler_state_snapshot_stable(task)?;
     let fair_runtime_ns = if matches!(
         commit.state.class,
-        axsched::EevdfTaskClass::Normal | axsched::EevdfTaskClass::Batch | axsched::EevdfTaskClass::Idle
+        axsched::EevdfTaskClass::Normal
+            | axsched::EevdfTaskClass::Batch
+            | axsched::EevdfTaskClass::Idle
     ) {
         if commit.fair_runtime_ns != 0 {
             commit.fair_runtime_ns
@@ -1180,8 +1182,9 @@ pub(crate) fn scheduler_attr_snapshot_stable(
     Ok(TaskSchedAttrSnapshot {
         commit,
         fair_runtime_ns,
-        deadline_ns: 0,
-        period_ns: 0,
+        deadline_runtime_ns: commit.deadline.runtime_ns,
+        deadline_ns: commit.deadline.deadline_ns,
+        period_ns: commit.deadline.period_ns,
         util_min: commit.util_min,
         util_max: commit.util_max,
     })
@@ -3081,6 +3084,7 @@ impl AxRunQueue {
                     util_min: task.sched_util_clamp().0,
                     util_max: task.sched_util_clamp().1,
                     fair_runtime_ns: task.fair_runtime_ns(),
+                    deadline: task.deadline_config(),
                     version: task.next_sched_commit_version(),
                 }
             });
@@ -3106,6 +3110,7 @@ impl AxRunQueue {
             util_min: task.sched_util_clamp().0,
             util_max: task.sched_util_clamp().1,
             fair_runtime_ns: task.fair_runtime_ns(),
+            deadline: task.deadline_config(),
             version: task.sched_commit_version(),
         }))
     }
@@ -3160,6 +3165,7 @@ impl AxRunQueue {
             util_min: task.sched_util_clamp().0,
             util_max: task.sched_util_clamp().1,
             fair_runtime_ns: task.fair_runtime_ns(),
+            deadline: task.deadline_config(),
             version: task.sched_commit_version(),
         };
         let (sched_state, reset_on_fork) = match update(old) {
@@ -3194,6 +3200,7 @@ impl AxRunQueue {
                     util_min: old.util_min,
                     util_max: old.util_max,
                     fair_runtime_ns: old.fair_runtime_ns,
+                    deadline: old.deadline,
                     version: task.next_sched_commit_version(),
                 }
             });
@@ -3226,6 +3233,7 @@ impl AxRunQueue {
             util_min: task.sched_util_clamp().0,
             util_max: task.sched_util_clamp().1,
             fair_runtime_ns: task.fair_runtime_ns(),
+            deadline: task.deadline_config(),
             version: task.sched_commit_version(),
         };
         let request = match update(old) {
@@ -3238,7 +3246,25 @@ impl AxRunQueue {
             )));
         }
         if request.fair_runtime_ns != 0
-            && !matches!(request.state.class, axsched::EevdfTaskClass::Normal | axsched::EevdfTaskClass::Batch)
+            && !(axsched::FAIR_RUNTIME_MIN_NS..=axsched::FAIR_RUNTIME_MAX_NS)
+                .contains(&request.fair_runtime_ns)
+        {
+            return TaskSchedAttrTransaction::Complete(Err(TaskSchedError::Scheduler(
+                SchedulerError::InvalidParameters,
+            )));
+        }
+        if matches!(request.state.class, axsched::EevdfTaskClass::Deadline)
+            && !request.deadline.is_valid()
+        {
+            return TaskSchedAttrTransaction::Complete(Err(TaskSchedError::Scheduler(
+                SchedulerError::InvalidParameters,
+            )));
+        }
+        if request.fair_runtime_ns != 0
+            && !matches!(
+                request.state.class,
+                axsched::EevdfTaskClass::Normal | axsched::EevdfTaskClass::Batch
+            )
         {
             return TaskSchedAttrTransaction::Complete(Err(TaskSchedError::Scheduler(
                 SchedulerError::InvalidParameters,
@@ -3258,37 +3284,45 @@ impl AxRunQueue {
                 }
             }
         }
-        let result = scheduler
-            .set_task_params_with_runtime(task, request.state, Self::scheduler_period_ns())
-            .and_then(|outcome| {
-                scheduler
-                    .set_task_fair_runtime_with_runtime(
-                        task,
-                        request.fair_runtime_ns,
-                        Self::scheduler_period_ns(),
-                    )
-                    .map(|runtime_outcome| match (outcome, runtime_outcome) {
-                        (axsched::EevdfParamUpdate::PreemptCurrent(task), _) =>
-                            axsched::EevdfParamUpdate::PreemptCurrent(task),
-                        (_, outcome) => outcome,
-                    })
-            })
-            .map_err(TaskSchedError::from)
-            .map(|outcome| {
-                task.set_sched_reset_on_fork(request.reset_on_fork);
-                task.set_sched_util_clamp(request.util_min, request.util_max);
-                if let Some(current) = outcome.into_preempt_current() {
-                    request_reschedule_cpu(self.cpu_id, &current);
-                }
-                TaskSchedCommit {
-                    state: request.state,
-                    reset_on_fork: request.reset_on_fork,
-                    util_min: request.util_min,
-                    util_max: request.util_max,
-                    fair_runtime_ns: task.fair_runtime_ns(),
-                    version: task.next_sched_commit_version(),
-                }
-            });
+        let result = (if matches!(request.state.class, axsched::EevdfTaskClass::Deadline) {
+            scheduler.stage_task_deadline_config(task, request.deadline)
+        } else {
+            Ok(())
+        })
+        .and_then(|_| {
+            scheduler.set_task_params_with_runtime(task, request.state, Self::scheduler_period_ns())
+        })
+        .and_then(|outcome| {
+            scheduler
+                .set_task_fair_runtime_with_runtime(
+                    task,
+                    request.fair_runtime_ns,
+                    Self::scheduler_period_ns(),
+                )
+                .map(|runtime_outcome| match (outcome, runtime_outcome) {
+                    (axsched::EevdfParamUpdate::PreemptCurrent(task), _) => {
+                        axsched::EevdfParamUpdate::PreemptCurrent(task)
+                    }
+                    (_, outcome) => outcome,
+                })
+        })
+        .map_err(TaskSchedError::from)
+        .map(|outcome| {
+            task.set_sched_reset_on_fork(request.reset_on_fork);
+            task.set_sched_util_clamp(request.util_min, request.util_max);
+            if let Some(current) = outcome.into_preempt_current() {
+                request_reschedule_cpu(self.cpu_id, &current);
+            }
+            TaskSchedCommit {
+                state: request.state,
+                reset_on_fork: request.reset_on_fork,
+                util_min: request.util_min,
+                util_max: request.util_max,
+                fair_runtime_ns: request.fair_runtime_ns,
+                deadline: request.deadline,
+                version: task.next_sched_commit_version(),
+            }
+        });
         TaskSchedAttrTransaction::Complete(result.map(Ok))
     }
 
@@ -3455,12 +3489,7 @@ impl AxRunQueue {
         self.switch_to(crate::current(), next, reason);
     }
 
-    fn switch_to(
-        &self,
-        prev_task: CurrentTask,
-        next_task: AxTaskRef,
-        reason: SwitchReason,
-    ) {
+    fn switch_to(&self, prev_task: CurrentTask, next_task: AxTaskRef, reason: SwitchReason) {
         // Make sure that IRQs are disabled by kernel guard or other means.
         #[cfg(all(target_os = "none", feature = "irq"))] // Note: irq is faked under unit tests.
         assert!(

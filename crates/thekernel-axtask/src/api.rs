@@ -10,8 +10,9 @@ use axerrno::{AxError, AxResult};
 use core::sync::atomic::{AtomicU32, Ordering};
 #[cfg(feature = "sched-eevdf")]
 pub use axsched::{
-    EEVDF_PROFILE, EevdfProfile, EevdfTaskClass as SchedClass, EevdfTaskParams as SchedState,
-    RR_TIMESLICE_TICKS, RT_PRIORITY_MAX, RT_PRIORITY_MIN, eevdf_profile, rr_timeslice_ticks,
+    DeadlineConfig, EEVDF_PROFILE, EevdfProfile, EevdfTaskClass as SchedClass,
+    EevdfTaskParams as SchedState, RR_TIMESLICE_TICKS, RT_PRIORITY_MAX, RT_PRIORITY_MIN,
+    eevdf_profile, rr_timeslice_ticks,
 };
 #[cfg(feature = "sched-eevdf")]
 use axsched::set_rr_timeslice_ticks;
@@ -715,6 +716,7 @@ pub struct TaskSchedCommit {
     pub util_max: u32,
     /// Scheduler-owned requested fair slice sampled with this commit.
     pub fair_runtime_ns: u64,
+    pub deadline: DeadlineConfig,
     pub version: u64,
 }
 
@@ -731,6 +733,7 @@ pub struct TaskSchedAttrSnapshot {
     /// The configured fair-class request slice in nanoseconds, or zero for
     /// real-time classes.
     pub fair_runtime_ns: u64,
+    pub deadline_runtime_ns: u64,
     pub deadline_ns: u64,
     pub period_ns: u64,
     pub util_min: u32,
@@ -750,6 +753,7 @@ pub struct TaskSchedAttrUpdate {
     pub reset_on_fork: bool,
     /// Requested fair runtime in ns; zero selects the scheduler profile.
     pub fair_runtime_ns: u64,
+    pub deadline: DeadlineConfig,
     pub util_min: u32,
     pub util_max: u32,
 }
@@ -872,7 +876,6 @@ pub fn set_prepared_task_sched_fair_runtime(
     task.configure_fair_runtime_ns(fair_runtime_ns)
         .map_err(TaskSchedError::from)
 }
-
 /// Changes only a task's nice value while its owning scheduler lock is held.
 /// This preserves a concurrent policy/class update instead of publishing a
 /// stale whole-state snapshot.
@@ -986,18 +989,16 @@ impl<'a> AffinityMutation<'a> {
         // leaking an implementation-only EBUSY to an ordinary concurrent
         // sched_setaffinity caller.
         while !task.try_begin_affinity_mutation() {
-            if matches!(task.state(), TaskState::Exited)
-                || {
-                    #[cfg(feature = "sched-eevdf")]
-                    {
-                        task.affinity_mutation_is_publication_reservation()
-                    }
-                    #[cfg(not(feature = "sched-eevdf"))]
-                    {
-                        false
-                    }
+            if matches!(task.state(), TaskState::Exited) || {
+                #[cfg(feature = "sched-eevdf")]
+                {
+                    task.affinity_mutation_is_publication_reservation()
                 }
-            {
+                #[cfg(not(feature = "sched-eevdf"))]
+                {
+                    false
+                }
+            } {
                 return Err(AxError::NoSuchProcess);
             }
             // A mutation owner may be completing a wake or block handoff on

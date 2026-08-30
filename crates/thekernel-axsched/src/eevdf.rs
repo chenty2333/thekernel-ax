@@ -2923,6 +2923,26 @@ impl<T> EEVDFScheduler<T> {
         }
     }
 
+    /// Stage validated CBS parameters for a same-transaction class change.
+    /// The caller already owns this run queue and immediately follows with
+    /// `set_task_params_with_runtime`; no external observer can interleave.
+    pub fn stage_task_deadline_config(
+        &mut self,
+        task: &Arc<EEVDFTask<T>>,
+        config: DeadlineConfig,
+    ) -> Result<(), SchedulerError> {
+        if !config.is_valid() {
+            return Err(SchedulerError::InvalidParameters);
+        }
+        let owner = task.owner();
+        if owner == UNOWNED || (owner == self.id && self.id != UNOWNED) {
+            task.value().publish_deadline_config(config);
+            Ok(())
+        } else {
+            Err(SchedulerError::ForeignQueue)
+        }
+    }
+
     /// Atomically change a fair task's Linux `sched_runtime` request.  The
     /// request is stored on the task and, for an admitted fair entity, is
     /// immediately rebound into the EEVDF deadline calculation under this
