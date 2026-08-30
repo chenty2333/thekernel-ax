@@ -257,6 +257,7 @@ mod cfs_rt {
 
     #[test]
     fn rr_rotates_between_equal_priority_tasks() {
+        let _quantum = crate::test_utils::read_rr_timeslice();
         let mut scheduler = CFScheduler::<usize>::new();
         let a = Arc::new(CFSTask::new(1));
         let b = Arc::new(CFSTask::new(2));
@@ -283,6 +284,7 @@ mod cfs_rt {
 
     #[test]
     fn rr_timer_preemption_rotates_between_equal_priority_tasks() {
+        let _quantum = crate::test_utils::read_rr_timeslice();
         let mut scheduler = CFScheduler::<usize>::new();
         let a = Arc::new(CFSTask::new(1));
         let b = Arc::new(CFSTask::new(2));
@@ -313,6 +315,7 @@ mod cfs_rt {
 
     #[test]
     fn fifo_same_priority_peers_do_not_time_slice() {
+        let _quantum = crate::test_utils::read_rr_timeslice();
         let mut scheduler = CFScheduler::<usize>::new();
         let a = Arc::new(CFSTask::new(1));
         let b = Arc::new(CFSTask::new(2));
@@ -346,6 +349,7 @@ mod cfs_rt {
 
     #[test]
     fn fifo_rt_keeps_precedence_over_fair_task() {
+        let _quantum = crate::test_utils::read_rr_timeslice();
         let mut scheduler = CFScheduler::<usize>::new();
         let fair = Arc::new(CFSTask::new(1));
         let rt = Arc::new(CFSTask::new(2));
@@ -378,6 +382,7 @@ mod cfs_rt {
 
     #[test]
     fn fifo_rt_peers_do_not_yield_to_fair_control_task() {
+        let _quantum = crate::test_utils::read_rr_timeslice();
         let mut scheduler = CFScheduler::<usize>::new();
         let fair = Arc::new(CFSTask::new(1));
         let rt_a = Arc::new(CFSTask::new(2));
@@ -493,6 +498,7 @@ mod cfs_child_spawn {
 
     #[test]
     fn new_fair_child_does_not_immediately_preempt_parent() {
+        let _quantum = crate::test_utils::read_rr_timeslice();
         let mut scheduler = CFScheduler::<usize>::new();
         let parent = Arc::new(CFSTask::new(1));
 
@@ -541,6 +547,7 @@ mod cfs_child_spawn {
 
     #[test]
     fn waking_fair_peer_does_not_immediately_preempt_current() {
+        let _quantum = crate::test_utils::read_rr_timeslice();
         let mut scheduler = CFScheduler::<usize>::new();
         let current = Arc::new(CFSTask::new(1));
         let sleeper = Arc::new(CFSTask::new(2));

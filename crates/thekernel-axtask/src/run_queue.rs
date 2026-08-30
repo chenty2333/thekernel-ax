@@ -24,7 +24,7 @@ use kspin::SpinRaw;
 use lazyinit::LazyInit;
 
 #[cfg(feature = "sched-eevdf")]
-use crate::api::{TaskSchedAttrSnapshot, TaskSchedCommit};
+use crate::api::{TaskSchedAttrSnapshot, TaskSchedCommit, TaskTimeslice};
 #[cfg(feature = "idle-steal")]
 use crate::task::IdleStealMutation;
 #[cfg(feature = "smp")]
@@ -37,7 +37,6 @@ use crate::{
         TaskCreateError, TaskExitQueueFault, TaskStack, TaskState, TaskWakeFault,
     },
 };
-
 #[cfg(all(feature = "remote-resched", feature = "smp", target_os = "none"))]
 use axhal::irq::{IpiReason, IpiTarget};
 
@@ -931,6 +930,12 @@ enum TaskSchedAttrTransaction<E> {
     Redirect,
 }
 
+#[cfg(feature = "sched-eevdf")]
+enum TaskTimesliceQuery {
+    Complete(Result<TaskTimeslice, TaskSchedError>),
+    Retry,
+}
+
 impl From<SchedulerError> for TaskSchedError {
     fn from(error: SchedulerError) -> Self {
         match error {
@@ -1180,6 +1185,33 @@ pub(crate) fn scheduler_attr_snapshot_stable(
         util_min: commit.util_min,
         util_max: commit.util_max,
     })
+}
+
+/// Reads a task's class and scheduler-owned interval through its stable
+/// run-queue owner. The run-queue lock protects the entity and clock used by
+/// EEVDF.
+#[cfg(feature = "sched-eevdf")]
+pub(crate) fn task_timeslice_stable(task: &AxTaskRef) -> Result<TaskTimeslice, TaskSchedError> {
+    #[cfg(not(feature = "smp"))]
+    {
+        match task_run_queue::<kernel_guard::NoPreemptIrqSave>(task).task_timeslice_once(task) {
+            TaskTimesliceQuery::Complete(result) => result,
+            TaskTimesliceQuery::Retry => Err(TaskSchedError::Scheduler(SchedulerError::TaskBusy)),
+        }
+    }
+    #[cfg(feature = "smp")]
+    {
+        let attempts = axconfig::plat::MAX_CPU_NUM.saturating_add(1).max(2);
+        for _ in 0..attempts {
+            match task_run_queue::<kernel_guard::NoPreemptIrqSave>(task)
+                .task_timeslice_once(task)
+            {
+                TaskTimesliceQuery::Complete(result) => return result,
+                TaskTimesliceQuery::Retry => {}
+            }
+        }
+        Err(TaskSchedError::Scheduler(SchedulerError::TaskBusy))
+    }
 }
 
 /// Materialize a running parent's pending runtime before taking a fork
@@ -1902,6 +1934,19 @@ impl<G: BaseGuard> AxRunQueueRef<'_, G> {
             )));
         };
         run_queue.scheduler_state_snapshot(task)
+    }
+
+    #[cfg(feature = "sched-eevdf")]
+    fn task_timeslice_once(&mut self, task: &AxTaskRef) -> TaskTimesliceQuery {
+        if task.is_terminalizing() || matches!(task.state(), TaskState::Exited) {
+            return TaskTimesliceQuery::Complete(Err(TaskSchedError::TaskExited));
+        }
+        let Some(run_queue) = self.inner else {
+            return TaskTimesliceQuery::Complete(Err(TaskSchedError::RunQueueUnavailable(
+                self.selected_cpu,
+            )));
+        };
+        run_queue.task_timeslice(task)
     }
 
     #[cfg(feature = "sched-eevdf")]
@@ -3063,6 +3108,29 @@ impl AxRunQueue {
             fair_runtime_ns: task.fair_runtime_ns(),
             version: task.sched_commit_version(),
         }))
+    }
+
+    #[cfg(feature = "sched-eevdf")]
+    fn task_timeslice(&self, task: &AxTaskRef) -> TaskTimesliceQuery {
+        if task.is_terminalizing() || matches!(task.state(), TaskState::Exited) {
+            return TaskTimesliceQuery::Complete(Err(TaskSchedError::TaskExited));
+        }
+        let scheduler = self.scheduler.lock();
+        if task.is_terminalizing() || matches!(task.state(), TaskState::Exited) {
+            return TaskTimesliceQuery::Complete(Err(TaskSchedError::TaskExited));
+        }
+        #[cfg(feature = "smp")]
+        if task.cpu_id() as usize != self.cpu_id {
+            return TaskTimesliceQuery::Retry;
+        }
+        let allow_unowned_sleeping_fair = matches!(task.state(), TaskState::Blocked);
+        match scheduler.task_timeslice(task, allow_unowned_sleeping_fair) {
+            Ok((class, interval_ticks)) => {
+                TaskTimesliceQuery::Complete(Ok(TaskTimeslice { class, interval_ticks }))
+            }
+            Err(SchedulerError::TaskBusy) => TaskTimesliceQuery::Retry,
+            Err(error) => TaskTimesliceQuery::Complete(Err(TaskSchedError::Scheduler(error))),
+        }
     }
 
     #[cfg(feature = "sched-eevdf")]

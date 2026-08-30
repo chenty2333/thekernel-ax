@@ -14,7 +14,7 @@ use core::{
 
 use crate::{
     allocate_scheduler_id,
-    cfs::{RR_TIMESLICE_TICKS, RT_PRIORITY_MAX, RT_PRIORITY_MIN},
+    cfs::{RT_PRIORITY_MAX, RT_PRIORITY_MIN, rr_timeslice_ticks},
     eevdf_model::{bias_i128, credit_cap, Clock, Entity, MigrationSnapshot, ModelError, ONE},
     eevdf_tree::{EevdfNode, EevdfTree, EevdfTreeError},
     BaseScheduler, DeactivateReason, EnqueueReason, RuntimeDelta, SchedulerError, CONFIGURING,
@@ -22,6 +22,9 @@ use crate::{
 };
 
 use alloc::sync::Arc;
+
+#[cfg(test)]
+use crate::cfs::RR_TIMESLICE_TICKS;
 
 const NICE_RANGE_POS: i8 = 19;
 const NICE_MIN: i8 = -20;
@@ -520,7 +523,7 @@ impl<T> EevdfTaskPayload<T> {
 
     fn apply_validated(&self, params: EevdfTaskParams) {
         let rr_remaining = match params.class {
-            EevdfTaskClass::RoundRobin => RR_TIMESLICE_TICKS,
+            EevdfTaskClass::RoundRobin => rr_timeslice_ticks(),
             EevdfTaskClass::Fifo
             | EevdfTaskClass::Normal
             | EevdfTaskClass::Batch
@@ -1135,6 +1138,57 @@ impl<T> EEVDFScheduler<T> {
             .is_some_and(|running| Arc::ptr_eq(running, task))
     }
 
+    /// Returns a task's scheduling class and current scheduler-owned interval.
+    ///
+    /// The caller must hold this scheduler's run-queue lock. A sleeping fair
+    /// task retains its request in `dormant_fair`, so its interval remains
+    /// observable even though it no longer contributes to `total_weight`.
+    pub fn task_timeslice(
+        &self,
+        task: &Arc<EEVDFTask<T>>,
+        allow_unowned_sleeping_fair: bool,
+    ) -> Result<(EevdfTaskClass, usize), SchedulerError> {
+        if self.id == UNOWNED {
+            return Err(SchedulerError::TaskBusy);
+        }
+        let class = task.sched_params().class;
+        let owner = task.owner();
+        let sleeping_fair = allow_unowned_sleeping_fair
+            && owner == UNOWNED
+            && matches!(class, EevdfTaskClass::Normal | EevdfTaskClass::Batch)
+            // SAFETY: the caller holds this run queue's lock. A blocked fair
+            // task remains associated with this queue until wakeup, while a
+            // migration retains its explicit marker below.
+            && unsafe {
+                let state = task.owned_state();
+                state.migration.is_none()
+                    && state.entity.is_some_and(|entity| entity.request.q != 0)
+            };
+        if owner != self.id && !sleeping_fair {
+            return Err(SchedulerError::TaskBusy);
+        }
+        let interval_ticks = match class {
+            EevdfTaskClass::RoundRobin => rr_timeslice_ticks(),
+            EevdfTaskClass::Fifo | EevdfTaskClass::Idle => 0,
+            EevdfTaskClass::Normal | EevdfTaskClass::Batch => {
+                if self.clock.total_weight == 0 {
+                    return Ok((class, 0));
+                }
+                // SAFETY: the task layer calls this while holding this scheduler's
+                // run-queue lock, which serializes all entity-state access.
+                unsafe {
+                    task.owned_state()
+                        .entity
+                        .or(task.owned_state().dormant_fair)
+                        .map_or(0, |entity| {
+                            entity.request.q.min(usize::MAX as u128) as usize
+                        })
+                }
+            }
+        };
+        Ok((class, interval_ticks))
+    }
+
     /// Select the first ready task accepted by `predicate` in structural key
     /// order, inspecting at most `limit` tasks.
     ///
@@ -1423,7 +1477,7 @@ impl<T> EEVDFScheduler<T> {
     /// state transition.  A slice boundary must never leave fractional
     /// progress from the previous slice attached to the new budget.
     fn reset_rr_slice(task: &Arc<EEVDFTask<T>>) {
-        task.set_rr_remaining(RR_TIMESLICE_TICKS);
+        task.set_rr_remaining(rr_timeslice_ticks());
         // SAFETY: every caller owns the task under the scheduler exclusion.
         unsafe { task.owned_state_mut().rr_fraction_q = 0 };
     }
@@ -2122,7 +2176,7 @@ impl<T> EEVDFScheduler<T> {
             && matches!(metadata.origin, EevdfMigrationOrigin::Running)
             && metadata.rr_remaining == 0;
         task.set_rr_remaining(if renew_rr {
-            RR_TIMESLICE_TICKS
+            rr_timeslice_ticks()
         } else {
             metadata.rr_remaining
         });
@@ -2310,7 +2364,7 @@ impl<T> EEVDFScheduler<T> {
         } else if matches!(old_params.class, EevdfTaskClass::RoundRobin) {
             old_remaining
         } else {
-            RR_TIMESLICE_TICKS
+            rr_timeslice_ticks()
         }
     }
 
@@ -3350,7 +3404,7 @@ impl<T> EEVDFScheduler<T> {
                 (0, 0)
             } else {
                 let consumed_after_renewal = service_ticks.saturating_sub(1);
-                let slice = RR_TIMESLICE_TICKS as u128;
+                let slice = rr_timeslice_ticks() as u128;
                 let within = consumed_after_renewal % slice;
                 let remaining = if within == 0 { slice } else { slice - within };
                 (remaining as usize, next_fraction)
@@ -3367,7 +3421,7 @@ impl<T> EEVDFScheduler<T> {
             // constant time; the fractional part belongs to that fresh slice
             // and is not stale progress from the exhausted one.
             let after_boundary = service_ticks - before;
-            let slice = RR_TIMESLICE_TICKS as u128;
+            let slice = rr_timeslice_ticks() as u128;
             let within = after_boundary % slice;
             let remaining = if within == 0 { slice } else { slice - within };
             (remaining as usize, next_fraction)
@@ -4013,6 +4067,7 @@ mod tests {
 
     #[test]
     fn runtime_remainder_class_transition_charges_old_class_first() {
+        let _quantum = crate::test_utils::read_rr_timeslice();
         let mut fair_to_rt = EEVDFScheduler::new();
         let fair_task = Arc::new(EEVDFTask::new(20usize));
         fair_to_rt.add_task(fair_task).unwrap();
@@ -4240,6 +4295,7 @@ mod tests {
 
     #[test]
     fn fair_reweight_and_rr_fifo_transitions_clear_old_residue_atomically() {
+        let _quantum = crate::test_utils::read_rr_timeslice();
         let mut fair_scheduler = EEVDFScheduler::new();
         let fair = Arc::new(EEVDFTask::new(235usize));
         fair_scheduler.add_task(fair).unwrap();
@@ -4344,6 +4400,7 @@ mod tests {
 
     #[test]
     fn rr_yield_and_exhausted_preempt_reset_fractional_budget() {
+        let _quantum = crate::test_utils::read_rr_timeslice();
         let mut scheduler = EEVDFScheduler::new();
         let first = Arc::new(EEVDFTask::new(27usize));
         let second = Arc::new(EEVDFTask::new(28usize));
@@ -4369,6 +4426,7 @@ mod tests {
 
     #[test]
     fn rr_whole_service_after_fractional_progress_carries_new_slice_progress() {
+        let _quantum = crate::test_utils::read_rr_timeslice();
         let mut scheduler = EEVDFScheduler::new();
         let task = Arc::new(EEVDFTask::new(280usize));
         task.configure(rt(EevdfTaskClass::RoundRobin, 10)).unwrap();
@@ -4652,6 +4710,7 @@ mod tests {
 
     #[test]
     fn runtime_accounting_bulk_round_robin_uses_constant_time_modulo() {
+        let _quantum = crate::test_utils::read_rr_timeslice();
         let mut scheduler = EEVDFScheduler::new();
         let task = Arc::new(EEVDFTask::new(6usize));
         task.configure(rt(EevdfTaskClass::RoundRobin, 20)).unwrap();
@@ -4689,6 +4748,7 @@ mod tests {
 
     #[test]
     fn scheduler_realtime_priority_fifo_and_rr_rotation() {
+        let _quantum = crate::test_utils::read_rr_timeslice();
         let mut fifo = EEVDFScheduler::new();
         let low = Arc::new(EEVDFTask::new(1));
         low.configure(rt(EevdfTaskClass::Fifo, 10)).unwrap();
@@ -4886,6 +4946,7 @@ mod tests {
 
     #[test]
     fn scheduler_drop_clears_ready_and_running_state_for_re_admission() {
+        let _quantum = crate::test_utils::read_rr_timeslice();
         let ready = Arc::new(EEVDFTask::new(1));
         let running = Arc::new(EEVDFTask::new(2));
         running
@@ -4960,6 +5021,7 @@ mod tests {
 
     #[test]
     fn scheduler_new_round_robin_restarts_slice_after_successful_admission() {
+        let _quantum = crate::test_utils::read_rr_timeslice();
         let mut scheduler = EEVDFScheduler::new();
         let task = Arc::new(EEVDFTask::new(1));
         task.configure(rt(EevdfTaskClass::RoundRobin, 20)).unwrap();
@@ -5360,6 +5422,7 @@ mod tests {
 
     #[test]
     fn eevdf_seeded_virgin_reconfiguration_to_rt_is_admissible() {
+        let _quantum = crate::test_utils::read_rr_timeslice();
         let mut scheduler = EEVDFScheduler::new();
         let parent = Arc::new(EEVDFTask::new(1));
         scheduler.add_task(parent.clone()).unwrap();
@@ -5377,6 +5440,7 @@ mod tests {
 
     #[test]
     fn eevdf_running_virgin_round_robin_adopts_full_slice() {
+        let _quantum = crate::test_utils::read_rr_timeslice();
         let mut scheduler = EEVDFScheduler::new();
         let task = Arc::new(EEVDFTask::new(1));
         task.configure(rt(EevdfTaskClass::RoundRobin, 20)).unwrap();
@@ -5538,6 +5602,7 @@ mod tests {
 
     #[test]
     fn eevdf_running_rr_migration_restarts_an_exhausted_slice_as_ready() {
+        let _quantum = crate::test_utils::read_rr_timeslice();
         let mut source = EEVDFScheduler::new();
         let task = Arc::new(EEVDFTask::new(1));
         task.configure(rt(EevdfTaskClass::RoundRobin, 20)).unwrap();
@@ -5664,5 +5729,75 @@ mod tests {
         let idle = EEVDFTask::new(3usize);
         idle.configure(EevdfTaskParams { class: EevdfTaskClass::Idle, ..EevdfTaskParams::default() }).unwrap();
         assert_eq!(idle.configure_fair_runtime_ns(FAIR_RUNTIME_MIN_NS), Err(SchedulerError::InvalidParameters));
+    }
+
+    #[test]
+    fn rr_slice_renewal_uses_runtime_quantum() {
+        let _quantum = crate::test_utils::override_rr_timeslice(2);
+
+        let task = Arc::new(EEVDFTask::new(()));
+        task.configure(rt(EevdfTaskClass::RoundRobin, 1)).unwrap();
+        assert_eq!(task.rr_remaining(), 2);
+
+        let mut scheduler = EEVDFScheduler::new();
+        scheduler.add_task(task.clone()).unwrap();
+        let running = scheduler.pick_next_task().unwrap();
+        EEVDFScheduler::reset_rr_slice(&running);
+        assert_eq!(running.rr_remaining(), 2);
+
+    }
+
+    #[test]
+    fn task_timeslice_is_scheduler_owned_and_excludes_idle() {
+        let mut scheduler = EEVDFScheduler::new();
+        let normal = Arc::new(EEVDFTask::new(()));
+        scheduler.add_task(normal.clone()).unwrap();
+        assert!(scheduler.task_timeslice(&normal, false).unwrap().1 > 0);
+
+        let idle = Arc::new(EEVDFTask::new(()));
+        idle.configure(EevdfTaskParams {
+            class: EevdfTaskClass::Idle,
+            nice: 0,
+            rt_priority: 0,
+        })
+        .unwrap();
+        scheduler.add_task(idle.clone()).unwrap();
+        assert_eq!(scheduler.task_timeslice(&idle, false).unwrap().1, 0);
+    }
+
+    #[test]
+    fn sleeping_fair_task_preserves_its_request_quantum() {
+        let mut scheduler = EEVDFScheduler::new();
+        let task = Arc::new(EEVDFTask::new(()));
+        scheduler.add_task(task.clone()).unwrap();
+        let running = scheduler.pick_next_task().unwrap();
+        let expected = scheduler.task_timeslice(&running, false).unwrap().1;
+        scheduler.deactivate_task(&running, DeactivateReason::Sleep);
+
+        assert_eq!(scheduler.clock().total_weight, 0);
+        assert!(expected > 0);
+        assert_eq!(scheduler.task_timeslice(&task, true).unwrap().1, 0);
+        assert_eq!(
+            scheduler.task_timeslice(&task, false),
+            Err(SchedulerError::TaskBusy)
+        );
+    }
+
+    #[test]
+    fn task_timeslice_rejects_pre_admission_and_migration_states() {
+        let mut scheduler = EEVDFScheduler::new();
+        let task = Arc::new(EEVDFTask::new(()));
+        assert_eq!(
+            scheduler.task_timeslice(&task, false),
+            Err(SchedulerError::TaskBusy)
+        );
+
+        scheduler.add_task(task.clone()).unwrap();
+        let migration = scheduler.begin_ready_migration(&task).unwrap();
+        assert_eq!(
+            scheduler.task_timeslice(&task, false),
+            Err(SchedulerError::TaskBusy)
+        );
+        scheduler.rollback_migration(migration).unwrap();
     }
 }

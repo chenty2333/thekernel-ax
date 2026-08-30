@@ -21,13 +21,138 @@ mod round_robin;
 #[cfg(test)]
 mod tests;
 
+/// Test support for process-global scheduler configuration.
+///
+/// The runtime RR quantum is intentionally global. Tests which consume its
+/// default value must hold a shared guard for their full duration; tests which
+/// change it must hold the exclusive guard.
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub mod test_utils {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    const WRITER: usize = 1 << (usize::BITS - 1);
+    static RR_TIMESLICE_TEST_LOCK: AtomicUsize = AtomicUsize::new(0);
+
+    /// Acquires the exclusive process-wide RR quantum test guard.
+    pub fn lock_rr_timeslice() -> RrTimesliceGuard {
+        while RR_TIMESLICE_TEST_LOCK
+            .compare_exchange(0, WRITER, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        RrTimesliceGuard(())
+    }
+
+    /// Temporarily overrides the process-wide RR quantum for one test.
+    ///
+    /// The previous quantum is restored before the exclusive guard is
+    /// released, including while unwinding from a panic.
+    pub fn override_rr_timeslice(ticks: usize) -> RrTimesliceOverride {
+        let lock = lock_rr_timeslice();
+        let saved = super::rr_timeslice_ticks();
+        assert!(super::set_rr_timeslice_ticks(ticks));
+        RrTimesliceOverride { saved, _lock: lock }
+    }
+
+    /// Acquires a shared guard for a test that consumes the default RR quantum.
+    pub fn read_rr_timeslice() -> RrTimesliceReadGuard {
+        loop {
+            let state = RR_TIMESLICE_TEST_LOCK.load(Ordering::Acquire);
+            if state & WRITER != 0 {
+                core::hint::spin_loop();
+                continue;
+            }
+            if RR_TIMESLICE_TEST_LOCK
+                .compare_exchange_weak(state, state + 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return RrTimesliceReadGuard(());
+            }
+        }
+    }
+
+    /// An exclusive RR quantum test guard.
+    pub struct RrTimesliceGuard(());
+
+    impl Drop for RrTimesliceGuard {
+        fn drop(&mut self) {
+            RR_TIMESLICE_TEST_LOCK.store(0, Ordering::Release);
+        }
+    }
+
+    /// An exclusive scoped RR quantum override for tests.
+    pub struct RrTimesliceOverride {
+        saved: usize,
+        _lock: RrTimesliceGuard,
+    }
+
+    impl Drop for RrTimesliceOverride {
+        fn drop(&mut self) {
+            assert!(super::set_rr_timeslice_ticks(self.saved));
+            // `_lock` drops after this method returns, releasing exclusivity
+            // only after the original quantum is restored.
+        }
+    }
+
+    /// A shared RR quantum test guard.
+    pub struct RrTimesliceReadGuard(());
+
+    impl Drop for RrTimesliceReadGuard {
+        fn drop(&mut self) {
+            RR_TIMESLICE_TEST_LOCK.fetch_sub(1, Ordering::Release);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::{sync::mpsc, thread, time::Duration};
+
+        #[test]
+        fn rr_timeslice_readers_exclude_mutators() {
+            let reader = read_rr_timeslice();
+            let (started_tx, started_rx) = mpsc::channel();
+            let (acquired_tx, acquired_rx) = mpsc::channel();
+            let writer = thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let _writer = lock_rr_timeslice();
+                acquired_tx.send(()).unwrap();
+            });
+
+            started_rx.recv().unwrap();
+            assert!(acquired_rx.recv_timeout(Duration::from_millis(50)).is_err());
+            drop(reader);
+            acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            writer.join().unwrap();
+        }
+
+        #[test]
+        fn rr_timeslice_override_restores_after_unwind() {
+            let saved = super::super::rr_timeslice_ticks();
+            let replacement = if saved == 1 { 2 } else { 1 };
+
+            let result = std::panic::catch_unwind(|| {
+                let _override = override_rr_timeslice(replacement);
+                assert_eq!(super::super::rr_timeslice_ticks(), replacement);
+                panic!("test unwind");
+            });
+
+            assert!(result.is_err());
+            assert_eq!(super::super::rr_timeslice_ticks(), saved);
+        }
+    }
+}
+
 extern crate alloc;
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub use cfs::{
     CFSTask, CFScheduler, CfsReservationCommitError, CfsTaskClass, CfsTaskParams,
-    CfsTaskReservation, RR_TIMESLICE_TICKS, RT_PRIORITY_MAX, RT_PRIORITY_MIN,
+    CfsTaskReservation, RR_TIMESLICE_TICKS, RT_PRIORITY_MAX, RT_PRIORITY_MIN, rr_timeslice_ticks,
+    set_rr_timeslice_ticks,
 };
 pub use eevdf::{
     EEVDFScheduler, EEVDFTask, EevdfForkSeed, EevdfMigration, EevdfMigrationCommitError,

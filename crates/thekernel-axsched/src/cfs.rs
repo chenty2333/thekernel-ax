@@ -14,6 +14,31 @@ use crate::{
 
 /// Default tick budget assigned to a round-robin task.
 pub const RR_TIMESLICE_TICKS: usize = 5;
+
+// This is intentionally scheduler-global: Linux exposes one RR interval, not
+// a per-runqueue or per-task knob. Existing tasks retain their current budget;
+// the value is sampled whenever a fresh RR slice is assigned.
+static RR_TIMESLICE_TICKS_RUNTIME: AtomicUsize = AtomicUsize::new(RR_TIMESLICE_TICKS);
+
+/// Returns the tick budget assigned to newly renewed round-robin slices.
+#[inline]
+pub fn rr_timeslice_ticks() -> usize {
+    RR_TIMESLICE_TICKS_RUNTIME.load(Ordering::Relaxed)
+}
+
+/// Updates the tick budget assigned to newly renewed round-robin slices.
+///
+/// A zero-length RR slice has no useful scheduling meaning and is rejected.
+/// Tasks which already hold a slice keep that remaining budget until their
+/// next renewal.
+#[inline]
+pub fn set_rr_timeslice_ticks(ticks: usize) -> bool {
+    if ticks == 0 {
+        return false;
+    }
+    RR_TIMESLICE_TICKS_RUNTIME.store(ticks, Ordering::Relaxed);
+    true
+}
 /// Lowest valid real-time priority in the generic scheduler domain.
 pub const RT_PRIORITY_MIN: u8 = 1;
 /// Highest valid real-time priority in the generic scheduler domain.
@@ -327,7 +352,7 @@ impl<T> CFSTask<T> {
 
     fn reset_rr_time_slice(&self) {
         self.rr_time_slice
-            .store(RR_TIMESLICE_TICKS as isize, Ordering::Release);
+            .store(rr_timeslice_ticks() as isize, Ordering::Release);
     }
 
     fn task_tick_rr(&self) -> isize {
@@ -1375,6 +1400,7 @@ mod sequence_tests {
 
     #[test]
     fn rejected_foreign_enqueue_preserves_rr_slice_and_ready_key() {
+        let _quantum = crate::test_utils::read_rr_timeslice();
         let mut owner = CFScheduler::new();
         let mut foreign = CFScheduler::new();
         let task = Arc::new(CFSTask::new(1));
@@ -1405,6 +1431,7 @@ mod sequence_tests {
 
     #[test]
     fn failed_ready_reconfiguration_restores_exact_state_and_order() {
+        let _quantum = crate::test_utils::read_rr_timeslice();
         let mut scheduler = CFScheduler::new();
         let task = Arc::new(CFSTask::new(1));
         let peer = Arc::new(CFSTask::new(2));
@@ -1663,6 +1690,7 @@ mod sequence_tests {
 
     #[test]
     fn rr_migration_retry_preserves_positive_remaining_slice() {
+        let _quantum = crate::test_utils::read_rr_timeslice();
         let mut source = CFScheduler::new();
         let migrating = Arc::new(CFSTask::new("migrating"));
         let peer = Arc::new(CFSTask::new("peer"));
@@ -1705,6 +1733,7 @@ mod sequence_tests {
 
     #[test]
     fn rr_migration_resets_an_exhausted_slice_at_destination_tail() {
+        let _quantum = crate::test_utils::read_rr_timeslice();
         let mut source = CFScheduler::new();
         let migrating = Arc::new(CFSTask::new(()));
         migrating.configure(rr_params(42)).unwrap();
@@ -1722,6 +1751,18 @@ mod sequence_tests {
 
         assert_eq!(migrating.rr_time_slice(), RR_TIMESLICE_TICKS as isize);
         assert_eq!(migrating.owner(), destination.id);
+    }
+
+    #[test]
+    fn rr_slice_renewal_uses_runtime_quantum() {
+        let _quantum = crate::test_utils::override_rr_timeslice(2);
+
+        let task = CFSTask::new(());
+        task.configure(rr_params(1)).unwrap();
+        assert_eq!(task.rr_time_slice(), 2);
+        assert!(!set_rr_timeslice_ticks(0));
+        assert_eq!(rr_timeslice_ticks(), 2);
+
     }
 
     #[test]

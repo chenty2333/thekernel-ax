@@ -7,10 +7,14 @@ use alloc::{
 
 use axerrno::{AxError, AxResult};
 #[cfg(feature = "sched-eevdf")]
+use core::sync::atomic::{AtomicU32, Ordering};
+#[cfg(feature = "sched-eevdf")]
 pub use axsched::{
     EEVDF_PROFILE, EevdfProfile, EevdfTaskClass as SchedClass, EevdfTaskParams as SchedState,
-    RR_TIMESLICE_TICKS, RT_PRIORITY_MAX, RT_PRIORITY_MIN, eevdf_profile,
+    RR_TIMESLICE_TICKS, RT_PRIORITY_MAX, RT_PRIORITY_MIN, eevdf_profile, rr_timeslice_ticks,
 };
+#[cfg(feature = "sched-eevdf")]
+use axsched::set_rr_timeslice_ticks;
 use kernel_guard::NoPreemptIrqSave;
 use spin::Once;
 
@@ -56,6 +60,62 @@ pub type AxTaskRef = Arc<AxTask>;
 
 /// The weak reference type of a task.
 pub type WeakAxTaskRef = Weak<AxTask>;
+
+/// Default userspace-visible round-robin interval in milliseconds.
+#[cfg(feature = "sched-eevdf")]
+pub const RR_TIMESLICE_MS_DEFAULT: u32 = {
+    let numerator = RR_TIMESLICE_TICKS.saturating_mul(1_000);
+    let ticks_per_sec = if axconfig::TICKS_PER_SEC == 0 {
+        1
+    } else {
+        axconfig::TICKS_PER_SEC
+    };
+    numerator.div_ceil(ticks_per_sec) as u32
+};
+
+#[cfg(feature = "sched-eevdf")]
+static RR_TIMESLICE_MS: AtomicU32 = AtomicU32::new(RR_TIMESLICE_MS_DEFAULT);
+
+/// Returns the configured round-robin interval in milliseconds.
+///
+/// This is the value requested through the task API, whereas the scheduler
+/// consumes the corresponding whole-tick budget from [`rr_timeslice_ticks`].
+#[cfg(feature = "sched-eevdf")]
+pub fn rr_timeslice_ms() -> u32 {
+    RR_TIMESLICE_MS.load(Ordering::Relaxed)
+}
+
+/// Returns the effective round-robin quantum consumed by the scheduler.
+///
+/// This is the whole-tick value obtained by rounding the requested
+/// [`rr_timeslice_ms`] up to the platform tick period.
+#[cfg(feature = "sched-eevdf")]
+pub fn rr_timeslice_effective_ticks() -> usize {
+    rr_timeslice_ticks()
+}
+
+/// Updates the round-robin interval in milliseconds.
+///
+/// Non-positive values restore the default. The effective scheduler quantum
+/// is rounded up to a whole tick, while this API retains the requested
+/// millisecond value for userspace reporting.
+#[cfg(feature = "sched-eevdf")]
+pub fn set_rr_timeslice_ms(value: i32) {
+    let milliseconds = if value <= 0 {
+        RR_TIMESLICE_MS_DEFAULT
+    } else {
+        value as u32
+    };
+    let ticks = (u64::from(milliseconds)
+        .saturating_mul(axconfig::TICKS_PER_SEC.max(1) as u64)
+        .saturating_add(999)
+        / 1_000)
+        .max(1)
+        .min(usize::MAX as u64) as usize;
+    let accepted = set_rr_timeslice_ticks(ticks);
+    debug_assert!(accepted);
+    RR_TIMESLICE_MS.store(milliseconds, Ordering::Relaxed);
+}
 
 static DEFERRED_WORK_DISPATCHER: Once<fn()> = Once::new();
 
@@ -693,6 +753,13 @@ pub struct TaskSchedAttrUpdate {
     pub util_min: u32,
     pub util_max: u32,
 }
+/// Scheduler-owned interval for one task, read under its owner run-queue lock.
+#[cfg(feature = "sched-eevdf")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskTimeslice {
+    pub class: SchedClass,
+    pub interval_ticks: usize,
+}
 
 /// Snapshots a task's scheduler state and commit version under the scheduler
 /// lock of the run queue that currently owns the task.  Callers that need to
@@ -708,6 +775,15 @@ pub fn scheduler_state_snapshot(task: &AxTaskRef) -> Result<TaskSchedCommit, Tas
 #[cfg(feature = "sched-eevdf")]
 pub fn scheduler_attr_snapshot(task: &AxTaskRef) -> Result<TaskSchedAttrSnapshot, TaskSchedError> {
     crate::run_queue::scheduler_attr_snapshot_stable(task)
+}
+
+/// Returns the target's class and scheduler-owned interval in ticks.
+///
+/// The value is read while holding the target run queue's scheduler lock, so
+/// it is never assembled from independently sampled task and run-queue state.
+#[cfg(feature = "sched-eevdf")]
+pub fn task_timeslice(task: &AxTaskRef) -> Result<TaskTimeslice, TaskSchedError> {
+    crate::run_queue::task_timeslice_stable(task)
 }
 
 /// Applies the runtime scheduling state of a task.
@@ -1251,5 +1327,33 @@ pub fn run_idle() -> ! {
         trace!("idle task: waiting for IRQs...");
         #[cfg(feature = "irq")]
         axhal::asm::wait_for_irqs();
+    }
+}
+
+#[cfg(all(test, feature = "sched-eevdf"))]
+mod rr_timeslice_tests {
+    use super::*;
+
+    struct RestoreRequestedMs(u32);
+
+    impl Drop for RestoreRequestedMs {
+        fn drop(&mut self) {
+            set_rr_timeslice_ms(self.0 as i32);
+        }
+    }
+
+    #[test]
+    fn rr_timeslice_preserves_requested_ms_and_reports_effective_ticks() {
+        let _quantum = axsched::test_utils::lock_rr_timeslice();
+        let _restore = RestoreRequestedMs(rr_timeslice_ms());
+        set_rr_timeslice_ms(1);
+
+        assert_eq!(rr_timeslice_ms(), 1);
+        let expected = ((axconfig::TICKS_PER_SEC.max(1) as u64).saturating_add(999) / 1_000)
+            .max(1) as usize;
+        assert_eq!(rr_timeslice_effective_ticks(), expected);
+
+        set_rr_timeslice_ms(0);
+        assert_eq!(rr_timeslice_ms(), RR_TIMESLICE_MS_DEFAULT);
     }
 }

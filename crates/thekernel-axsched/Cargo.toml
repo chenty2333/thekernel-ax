@@ -26,6 +26,9 @@ default = []
 eevdf-balanced = []
 eevdf-latency = []
 eevdf-throughput = []
+# Test-only synchronization for callers that exercise the process-global RR
+# quantum. Kept opt-in so production users do not acquire a test API.
+test-utils = []
 
 [dependencies]
 intrusive-collections = "0.9"
