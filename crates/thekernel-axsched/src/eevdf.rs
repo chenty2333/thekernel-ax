@@ -3443,13 +3443,14 @@ impl<T> EEVDFScheduler<T> {
     fn has_ready_rt(&self) -> bool {
         self.ready_tree
             .front()
-            .is_some_and(|task| unsafe { task.key().class_rank() == RT_CLASS_RANK })
+            .is_some_and(|task| unsafe { task.key().class_rank() <= RT_CLASS_RANK })
     }
 
     fn has_higher_rt(&self, priority: u8) -> bool {
         self.ready_tree.front().is_some_and(|task| unsafe {
             let key = task.key();
-            key.class_rank() == RT_CLASS_RANK && key.order() < rt_order(priority)
+            key.class_rank() == DEADLINE_CLASS_RANK
+                || (key.class_rank() == RT_CLASS_RANK && key.order() < rt_order(priority))
         })
     }
 
