@@ -2213,16 +2213,17 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
             }
             let mut scheduler = self.inner.scheduler.lock();
             let now = monotonic_time_nanos();
-            #[cfg(feature = "sched-eevdf")]
-            scheduler.rebase_deadline_clock(now);
             // The CBS clock and charged service use one timestamp sample.
-            // Sampling them independently can advance a replenishment boundary
-            // past work which the per-CPU runtime ledger has not yet charged.
+            // A nonzero runtime delta advances the scheduler clock itself;
+            // rebasing before accounting would add that interval twice.
             let runtime =
                 self.inner
                     .runtime_delta_at(now, curr.is_idle(), curr.is_migration_helper());
             if !runtime.is_zero() {
                 let _ = scheduler.account_runtime(curr, runtime);
+            } else {
+                #[cfg(feature = "sched-eevdf")]
+                scheduler.rebase_deadline_clock(now);
             }
             drop(scheduler);
             #[cfg(feature = "preempt")]

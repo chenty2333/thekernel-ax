@@ -84,6 +84,11 @@ pub struct DeadlineConfig {
     pub period_ns: u64,
 }
 
+/// Linux's minimum representable SCHED_DEADLINE runtime and deadline.
+pub const DEADLINE_MIN_NS: u64 = 1_024;
+/// Linux's minimum SCHED_DEADLINE period.
+pub const DEADLINE_MIN_PERIOD_NS: u64 = 100_000;
+
 /// Shared admission ledger for run queues in one CPU-affinity domain.
 ///
 /// Reservations use an optimistic CAS so admission never needs to take one
@@ -148,6 +153,42 @@ impl DeadlineConfig {
         self.runtime_ns != 0
             && self.runtime_ns <= self.deadline_ns
             && self.deadline_ns <= self.period_ns
+    }
+
+    /// Validate and canonicalize a Linux `sched_attr` deadline tuple.
+    ///
+    /// Linux treats a zero period as the relative deadline, rejects values
+    /// with the ABI's reserved high bit set, and applies stricter lower
+    /// bounds than the scheduler's internal representation.  Keeping this at
+    /// the scheduler boundary lets personalities preserve the normalized
+    /// tuple through their one-shot commit transaction.
+    pub const fn normalized_linux(self) -> Option<Self> {
+        const RESERVED: u64 = 1 << 63;
+        if self.runtime_ns & RESERVED != 0
+            || self.deadline_ns & RESERVED != 0
+            || self.period_ns & RESERVED != 0
+        {
+            return None;
+        }
+        let period_ns = if self.period_ns == 0 {
+            self.deadline_ns
+        } else {
+            self.period_ns
+        };
+        let value = Self {
+            runtime_ns: self.runtime_ns,
+            deadline_ns: self.deadline_ns,
+            period_ns,
+        };
+        if value.runtime_ns < DEADLINE_MIN_NS
+            || value.deadline_ns < DEADLINE_MIN_NS
+            || value.period_ns < DEADLINE_MIN_PERIOD_NS
+            || !value.is_valid()
+        {
+            None
+        } else {
+            Some(value)
+        }
     }
 }
 
@@ -494,6 +535,11 @@ struct MigrationState {
     deadline_absolute_ns: u64,
     deadline_replenish_at_ns: u64,
     deadline_throttled: bool,
+    /// A nonzero identity means source detachment retained its reservation in
+    /// this shared domain.  Same-domain commit/rollback moves only the local
+    /// per-runqueue utilization, so no capacity is briefly visible to a
+    /// competing admission.
+    deadline_domain_identity: usize,
     origin: EevdfMigrationOrigin,
 }
 
@@ -1304,6 +1350,17 @@ impl<T> EEVDFScheduler<T> {
     }
 
     fn admit_deadline(&mut self, config: DeadlineConfig) -> Result<(), SchedulerError> {
+        self.admit_deadline_local(config)?;
+        if let Some(domain) = self.deadline_domain.as_ref() {
+            if let Err(error) = domain.replace(0, Self::deadline_utilization(config)?) {
+                self.release_deadline_local(config);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn admit_deadline_local(&mut self, config: DeadlineConfig) -> Result<(), SchedulerError> {
         let util = Self::deadline_utilization(config)?;
         let total = self
             .deadline_utilization
@@ -1318,9 +1375,71 @@ impl<T> EEVDFScheduler<T> {
 
     fn release_deadline(&mut self, config: DeadlineConfig) {
         let util = Self::deadline_utilization(config).unwrap_or(0);
+        if let Some(domain) = self.deadline_domain.as_ref() {
+            domain
+                .replace(util, 0)
+                .expect("deadline domain ledger lost an admitted reservation");
+        }
+        self.release_deadline_local(config);
+    }
+
+    fn release_deadline_local(&mut self, config: DeadlineConfig) {
+        let util = Self::deadline_utilization(config).unwrap_or(0);
         self.deadline_utilization = self.deadline_utilization.saturating_sub(util);
     }
 
+    fn deadline_domain_identity(&self) -> usize {
+        self.deadline_domain
+            .as_ref()
+            .map_or(0, |domain| Arc::as_ptr(domain) as usize)
+    }
+
+    fn replace_deadline_domain(
+        &self,
+        old: Option<DeadlineConfig>,
+        new: Option<DeadlineConfig>,
+    ) -> Result<(), SchedulerError> {
+        if let Some(domain) = self.deadline_domain.as_ref() {
+            let old = old
+                .map(Self::deadline_utilization)
+                .transpose()?
+                .unwrap_or(0);
+            let new = new
+                .map(Self::deadline_utilization)
+                .transpose()?
+                .unwrap_or(0);
+            domain.replace(old, new)?;
+        }
+        Ok(())
+    }
+
+    /// Calculate a reservation replacement without publishing it.  The
+    /// caller performs all potentially fallible tree work first, then commits
+    /// this value together with the new task representation.
+    fn replaced_deadline_utilization(
+        &self,
+        old: Option<DeadlineConfig>,
+        new: Option<DeadlineConfig>,
+    ) -> Result<u128, SchedulerError> {
+        let old = old
+            .map(Self::deadline_utilization)
+            .transpose()?
+            .unwrap_or(0);
+        let new = new
+            .map(Self::deadline_utilization)
+            .transpose()?
+            .unwrap_or(0);
+        let total = self
+            .deadline_utilization
+            .checked_sub(old)
+            .ok_or(SchedulerError::InconsistentState)?
+            .checked_add(new)
+            .ok_or(SchedulerError::ArithmeticExhausted)?;
+        if total > DEADLINE_UTIL_SCALE {
+            return Err(SchedulerError::TaskBusy);
+        }
+        Ok(total)
+    }
     /// Rebase CBS time from the globally monotonic task-layer clock before a
     /// migration destination admits a reservation.
     pub fn rebase_deadline_clock(&mut self, now_ns: u64) {
@@ -2207,12 +2326,20 @@ impl<T> EEVDFScheduler<T> {
                     deadline_absolute_ns: old_state.deadline_absolute_ns,
                     deadline_replenish_at_ns: old_state.deadline_replenish_at_ns,
                     deadline_throttled: old_state.deadline_throttled,
+                    deadline_domain_identity: self.deadline_domain_identity(),
                     origin: EevdfMigrationOrigin::Ready,
                 },
             );
         }
         if is_deadline_class(params.class) {
-            self.release_deadline(removed.deadline_config());
+            // Retain a shared-domain reservation through the handoff.  The
+            // destination will transfer only its local ledger when it shares
+            // this exact domain, leaving no admission window in between.
+            if self.deadline_domain.is_some() {
+                self.release_deadline_local(removed.deadline_config());
+            } else {
+                self.release_deadline(removed.deadline_config());
+            }
         }
         self.clock = detached_clock;
         Self::migration_token_from_task(removed, false).ok_or(SchedulerError::InconsistentState)
@@ -2273,12 +2400,17 @@ impl<T> EEVDFScheduler<T> {
                     deadline_absolute_ns: old_state.deadline_absolute_ns,
                     deadline_replenish_at_ns: old_state.deadline_replenish_at_ns,
                     deadline_throttled: old_state.deadline_throttled,
+                    deadline_domain_identity: self.deadline_domain_identity(),
                     origin: EevdfMigrationOrigin::Running,
                 },
             );
         }
         if is_deadline_class(params.class) {
-            self.release_deadline(task.deadline_config());
+            if self.deadline_domain.is_some() {
+                self.release_deadline_local(task.deadline_config());
+            } else {
+                self.release_deadline(task.deadline_config());
+            }
         }
         self.clock = detached_clock;
         self.running = None;
@@ -2399,8 +2531,24 @@ impl<T> EEVDFScheduler<T> {
             )
         };
         let admitted_deadline = is_deadline_class(metadata.params.class);
+        let retained_domain = metadata.deadline_domain_identity != 0;
+        if retained_domain && metadata.deadline_domain_identity != self.deadline_domain_identity() {
+            // A retained reservation can only move within the domain which
+            // owns it.  Leave the token intact so its source can roll back;
+            // admitting it here would either leak the old ledger entry or
+            // create a window for a competing reservation.
+            return Err(Self::migration_error(
+                SchedulerError::ForeignQueue,
+                migration,
+            ));
+        }
         if admitted_deadline {
-            if let Err(kind) = self.admit_deadline(task.deadline_config()) {
+            let admission = if retained_domain {
+                self.admit_deadline_local(task.deadline_config())
+            } else {
+                self.admit_deadline(task.deadline_config())
+            };
+            if let Err(kind) = admission {
                 return Err(Self::migration_error(kind, migration));
             }
         }
@@ -2429,7 +2577,11 @@ impl<T> EEVDFScheduler<T> {
         };
         if let Err(kind) = inserted {
             if admitted_deadline {
-                self.release_deadline(task.deadline_config());
+                if retained_domain {
+                    self.release_deadline_local(task.deadline_config());
+                } else {
+                    self.release_deadline(task.deadline_config());
+                }
             }
             return Err(Self::migration_error(kind, migration));
         }
@@ -2566,6 +2718,27 @@ impl<T> EEVDFScheduler<T> {
                 metadata.source_eligible_at,
             )
         };
+        // `begin_*_migration` released the source reservation before
+        // parking. Reacquire it before publishing the task back on this run
+        // queue; failure leaves the token intact for the caller to resolve.
+        let admitted_deadline = is_deadline_class(metadata.params.class);
+        let retained_domain = metadata.deadline_domain_identity != 0;
+        if retained_domain && metadata.deadline_domain_identity != self.deadline_domain_identity() {
+            return Err(Self::migration_error(
+                SchedulerError::InconsistentState,
+                migration,
+            ));
+        }
+        if admitted_deadline {
+            let admission = if retained_domain {
+                self.admit_deadline_local(task.deadline_config())
+            } else {
+                self.admit_deadline(task.deadline_config())
+            };
+            if let Err(kind) = admission {
+                return Err(Self::migration_error(kind, migration));
+            }
+        }
         let inserted = if metadata.deadline_throttled {
             let key = Self::throttled_deadline_key(
                 metadata.deadline_replenish_at_ns,
@@ -2589,6 +2762,13 @@ impl<T> EEVDFScheduler<T> {
             )
         };
         if let Err(kind) = inserted {
+            if admitted_deadline {
+                if retained_domain {
+                    self.release_deadline_local(task.deadline_config());
+                } else {
+                    self.release_deadline(task.deadline_config());
+                }
+            }
             return Err(Self::migration_error(kind, migration));
         }
         let renew_rr = matches!(metadata.params.class, EevdfTaskClass::RoundRobin)
@@ -6553,5 +6733,95 @@ mod tests {
             Err(SchedulerError::TaskBusy)
         );
         scheduler.rollback_migration(migration).unwrap();
+    }
+
+    #[test]
+    fn deadline_migration_keeps_shared_domain_reservation_continuous() {
+        let domain = Arc::new(DeadlineAdmissionDomain::new());
+        let config = DeadlineConfig {
+            runtime_ns: 60,
+            deadline_ns: 100,
+            period_ns: 100,
+        };
+        let mut source = EEVDFScheduler::new();
+        let mut destination = EEVDFScheduler::new();
+        source
+            .set_deadline_admission_domain(Arc::clone(&domain))
+            .unwrap();
+        destination
+            .set_deadline_admission_domain(domain.clone())
+            .unwrap();
+        let task = Arc::new(EEVDFTask::new(1));
+        source.stage_task_deadline_config(&task, config).unwrap();
+        let _ = source
+            .set_task_params(&task, rt(EevdfTaskClass::Deadline, 0))
+            .unwrap();
+        source.add_task(Arc::clone(&task)).unwrap();
+        let admitted = domain.utilization.load(Ordering::Acquire);
+
+        let migration = source.begin_ready_migration(&task).unwrap();
+        assert_eq!(source.deadline_utilization, 0);
+        assert_eq!(domain.utilization.load(Ordering::Acquire), admitted);
+        destination.commit_migration(migration).unwrap();
+        assert_eq!(destination.deadline_utilization, admitted as u128);
+        assert_eq!(domain.utilization.load(Ordering::Acquire), admitted);
+    }
+
+    #[test]
+    fn linux_deadline_tuple_normalization_matches_abi_rules() {
+        let valid = DeadlineConfig {
+            runtime_ns: DEADLINE_MIN_NS,
+            deadline_ns: DEADLINE_MIN_PERIOD_NS,
+            period_ns: 0,
+        }
+        .normalized_linux()
+        .unwrap();
+        assert_eq!(valid.period_ns, valid.deadline_ns);
+        assert!(DeadlineConfig {
+            runtime_ns: DEADLINE_MIN_NS - 1,
+            deadline_ns: DEADLINE_MIN_PERIOD_NS,
+            period_ns: DEADLINE_MIN_PERIOD_NS,
+        }
+        .normalized_linux()
+        .is_none());
+        assert!(DeadlineConfig {
+            runtime_ns: DEADLINE_MIN_NS,
+            deadline_ns: DEADLINE_MIN_PERIOD_NS,
+            period_ns: DEADLINE_MIN_PERIOD_NS - 1,
+        }
+        .normalized_linux()
+        .is_none());
+        assert!(DeadlineConfig {
+            runtime_ns: 1 << 63,
+            deadline_ns: DEADLINE_MIN_PERIOD_NS,
+            period_ns: DEADLINE_MIN_PERIOD_NS,
+        }
+        .normalized_linux()
+        .is_none());
+    }
+
+    #[test]
+    fn deadline_domain_caps_affinity_aggregate_across_runqueues() {
+        let domain = Arc::new(DeadlineAdmissionDomain::new());
+        let config = DeadlineConfig {
+            runtime_ns: 60,
+            deadline_ns: 100,
+            period_ns: 100,
+        };
+        let mut first = EEVDFScheduler::new();
+        let mut second = EEVDFScheduler::new();
+        first.set_deadline_admission_domain(domain.clone()).unwrap();
+        second.set_deadline_admission_domain(domain).unwrap();
+        let a = Arc::new(EEVDFTask::new(1));
+        let b = Arc::new(EEVDFTask::new(2));
+        for (scheduler, task) in [(&mut first, &a), (&mut second, &b)] {
+            scheduler.stage_task_deadline_config(task, config).unwrap();
+            let _ = scheduler
+                .set_task_params(task, rt(EevdfTaskClass::Deadline, 0))
+                .unwrap();
+        }
+        first.add_task(a).unwrap();
+        assert_eq!(second.add_task(b.clone()), Err(SchedulerError::TaskBusy));
+        assert_eq!(b.owner(), UNOWNED);
     }
 }
