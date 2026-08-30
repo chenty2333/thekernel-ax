@@ -24,7 +24,7 @@ use kspin::SpinRaw;
 use lazyinit::LazyInit;
 
 #[cfg(feature = "sched-eevdf")]
-use crate::api::TaskSchedCommit;
+use crate::api::{TaskSchedAttrSnapshot, TaskSchedCommit};
 #[cfg(feature = "idle-steal")]
 use crate::task::IdleStealMutation;
 #[cfg(feature = "smp")]
@@ -1101,6 +1101,37 @@ pub(crate) fn scheduler_state_snapshot_stable(
         }
         Err(TaskSchedError::Scheduler(SchedulerError::TaskBusy))
     }
+}
+
+/// Returns all scheduler attributes from one stable owner transaction.
+///
+/// The fair slice is selected by the scheduler profile rather than by a
+/// per-task atom; deriving it from the already-locked class therefore cannot
+/// combine values from different scheduler commits.
+#[cfg(feature = "sched-eevdf")]
+pub(crate) fn scheduler_attr_snapshot_stable(
+    task: &AxTaskRef,
+) -> Result<TaskSchedAttrSnapshot, TaskSchedError> {
+    let commit = scheduler_state_snapshot_stable(task)?;
+    let target_ticks = match commit.state.class {
+        axsched::EevdfTaskClass::Normal => axsched::EEVDF_PROFILE.normal_target_ticks,
+        axsched::EevdfTaskClass::Batch => axsched::EEVDF_PROFILE.batch_target_ticks,
+        axsched::EevdfTaskClass::Idle => axsched::EEVDF_PROFILE.idle_target_ticks,
+        axsched::EevdfTaskClass::RoundRobin | axsched::EevdfTaskClass::Fifo => 0,
+    };
+    let fair_runtime_ns = target_ticks
+        .saturating_mul(u128::from(NANOS_PER_SEC))
+        .checked_div(axconfig::TICKS_PER_SEC as u128)
+        .unwrap_or(0)
+        .min(u128::from(u64::MAX)) as u64;
+    Ok(TaskSchedAttrSnapshot {
+        commit,
+        fair_runtime_ns,
+        deadline_ns: 0,
+        period_ns: 0,
+        util_min: 0,
+        util_max: 0,
+    })
 }
 
 /// Materialize a running parent's pending runtime before taking a fork

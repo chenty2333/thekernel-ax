@@ -1041,6 +1041,14 @@ fn versioned_sched_transaction_keeps_policy_rejection_and_commit_atomic() {
     assert_eq!(committed.reset_on_fork, !original.reset_on_fork);
     assert_eq!(committed.version, original.version.wrapping_add(1));
 
+    let attr = axtask::scheduler_attr_snapshot(&task).unwrap();
+    assert_eq!(attr.commit, committed);
+    assert!(attr.fair_runtime_ns > 0);
+    assert_eq!(attr.deadline_ns, 0);
+    assert_eq!(attr.period_ns, 0);
+    assert_eq!(attr.util_min, 0);
+    assert_eq!(attr.util_max, 0);
+
     axtask::set_sched_state_versioned_with_reset(&task, original.state, original.reset_on_fork)
         .unwrap();
 }

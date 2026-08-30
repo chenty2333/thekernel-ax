@@ -628,6 +628,26 @@ pub struct TaskSchedCommit {
     pub version: u64,
 }
 
+/// Complete scheduler-owned data exported by Linux `sched_getattr`.
+///
+/// The tuple is produced under the same stable run-queue ownership check as
+/// [`TaskSchedCommit`].  Deadline and utilization-clamp fields are reserved
+/// for scheduler classes which do not exist in this build and consequently
+/// remain zero; keeping them here prevents an ABI reader from combining the
+/// committed class with independently sampled future fields.
+#[cfg(feature = "sched-eevdf")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskSchedAttrSnapshot {
+    pub commit: TaskSchedCommit,
+    /// The configured fair-class request slice in nanoseconds, or zero for
+    /// real-time classes.
+    pub fair_runtime_ns: u64,
+    pub deadline_ns: u64,
+    pub period_ns: u64,
+    pub util_min: u32,
+    pub util_max: u32,
+}
+
 /// Snapshots a task's scheduler state and commit version under the scheduler
 /// lock of the run queue that currently owns the task.  Callers that need to
 /// carry scheduler state across another synchronization domain must use this
@@ -635,6 +655,13 @@ pub struct TaskSchedCommit {
 #[cfg(feature = "sched-eevdf")]
 pub fn scheduler_state_snapshot(task: &AxTaskRef) -> Result<TaskSchedCommit, TaskSchedError> {
     crate::run_queue::scheduler_state_snapshot_stable(task)
+}
+
+/// Returns one complete Linux scheduler-attribute snapshot while resolving
+/// run-queue migration and terminal task races.
+#[cfg(feature = "sched-eevdf")]
+pub fn scheduler_attr_snapshot(task: &AxTaskRef) -> Result<TaskSchedAttrSnapshot, TaskSchedError> {
+    crate::run_queue::scheduler_attr_snapshot_stable(task)
 }
 
 /// Applies the runtime scheduling state of a task.
